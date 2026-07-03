@@ -1139,6 +1139,40 @@ def open_kobo_records_from_payload(payload):
     return records, mapping
 
 
+def copy_column_by_suffix(frame, target_column):
+    """Map Kobo group-prefixed columns to the dashboard's expected names."""
+    if target_column in frame.columns:
+        return
+
+    suffix = f"_{target_column}"
+    candidates = [column for column in frame.columns if column.endswith(suffix)]
+    if not candidates:
+        return
+
+    candidates = sorted(
+        candidates,
+        key=lambda column: (frame[column].notna().sum(), -len(column)),
+        reverse=True,
+    )
+    frame[target_column] = frame[candidates[0]]
+
+
+def expose_prefixed_select_multiple_columns(frame):
+    """Expose group-prefixed select_multiple fields with expected prefixes."""
+    expected_prefixes = ("concern_", "info_", "ref_partner_")
+    existing = set(frame.columns)
+
+    for column in list(frame.columns):
+        for prefix in expected_prefixes:
+            marker = f"_{prefix}"
+            if marker not in column:
+                continue
+            exposed_name = column[column.index(marker) + 1 :]
+            if exposed_name and exposed_name not in existing:
+                frame[exposed_name] = frame[column]
+                existing.add(exposed_name)
+
+
 def build_label_map(mapping, prefix):
     if mapping is None or mapping.empty or "cleaned_column_name" not in mapping.columns:
         return {}
@@ -1185,12 +1219,8 @@ def load_data(source_signature):
     records.columns = [str(column).replace("/", "_").strip() for column in records.columns]
     records.columns = [re.sub(r"[^A-Za-z0-9_]+", "_", column).strip("_") for column in records.columns]
     records.columns = [re.sub(r"_+", "_", column).lower() for column in records.columns]
-    if "interview_date" not in records.columns and "_submission_time" in records.columns:
-        records["interview_date"] = records["_submission_time"]
-    if "record_id" not in records.columns:
-        records["record_id"] = records.get("_id", records.index.astype(str))
 
-    required_columns = [
+    expected_source_columns = [
         "interview_date",
         "staff_name",
         "gps_latitude",
@@ -1209,9 +1239,18 @@ def load_data(source_signature):
         "child_disability_type",
         "child_disability_type_other",
     ]
-    required_columns.extend(WGQ_DISABILITY_DOMAINS.keys())
-    required_columns.extend(ADULT_DISABILITY_CATEGORY_COLUMNS)
-    for column in required_columns:
+    expected_source_columns.extend(WGQ_DISABILITY_DOMAINS.keys())
+    expected_source_columns.extend(ADULT_DISABILITY_CATEGORY_COLUMNS)
+    for column in expected_source_columns:
+        copy_column_by_suffix(records, column)
+    expose_prefixed_select_multiple_columns(records)
+
+    if "interview_date" not in records.columns and "submission_time" in records.columns:
+        records["interview_date"] = records["submission_time"]
+    if "record_id" not in records.columns:
+        records["record_id"] = records.get("id", records.index.astype(str))
+
+    for column in expected_source_columns:
         if column not in records.columns:
             records[column] = pd.NA
 
@@ -1281,7 +1320,19 @@ def load_data(source_signature):
     for col in core_fields:
         if col not in records.columns:
             records[col] = pd.NA
-    records = records[records[core_fields].notna().all(axis=1)].copy()
+    valid_core_mask = records[core_fields].notna().all(axis=1)
+    if not valid_core_mask.any():
+        missing_summary = records[core_fields].isna().sum().reset_index()
+        missing_summary.columns = ["Required field", "Missing rows"]
+        st.error(
+            "Kobo data was received, but no rows had all required dashboard fields. "
+            "This usually means the Kobo field names differ from the dashboard's expected names."
+        )
+        st.dataframe(missing_summary, use_container_width=True, hide_index=True)
+        with st.expander("Available Kobo columns"):
+            st.write(sorted(records.columns.tolist()))
+        st.stop()
+    records = records[valid_core_mask].copy()
 
     id_cols = [col for col in CORE_RECORD_COLUMNS if col in records.columns]
     protection_cols = [col for col in records.columns if col.startswith("concern_") and not col.endswith("_specify")]
