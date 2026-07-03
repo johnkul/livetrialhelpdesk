@@ -87,8 +87,9 @@ WGQ_DISABILITY_DOMAINS = {
 ADULT_DISABILITY_CATEGORY_COLUMNS = ["information_seeker_disability_type_other"]
 
 PROTECTION_SELECT_ALIASES = [
-    ("no_access_to_non_food_items", "concern_no_access_nf"),
-    ("no_access_nf", "concern_no_access_nf"),
+    ("no_access_to_non_food_items", "concern_no_access_nfi"),
+    ("no_access_nf", "concern_no_access_nfi"),
+    ("no_access_nfi", "concern_no_access_nfi"),
     ("medical_assistive_devices", "concern_child_needs_assistive_devices"),
     ("no_access_food", "concern_no_access_food"),
     ("parental_neglect", "concern_parental_neglect"),
@@ -148,7 +149,7 @@ SELECT_MULTIPLE_ALIASES = PROTECTION_SELECT_ALIASES + INFORMATION_SELECT_ALIASES
 KNOWN_SELECT_MULTIPLE_COLUMNS = {target for _, target in SELECT_MULTIPLE_ALIASES}
 
 DEFAULT_LABEL_MAP = {
-    "concern_no_access_nf": "No access to non-food items",
+    "concern_no_access_nfi": "No Access Nfi",
     "concern_child_needs_assistive_devices": "Child/family needs assistive devices",
     "concern_no_access_food": "No access to food",
     "concern_parental_neglect": "Parental neglect",
