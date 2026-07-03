@@ -144,6 +144,95 @@ REFERRAL_SELECT_ALIASES = [
 SELECT_MULTIPLE_ALIASES = PROTECTION_SELECT_ALIASES + INFORMATION_SELECT_ALIASES + REFERRAL_SELECT_ALIASES
 KNOWN_SELECT_MULTIPLE_COLUMNS = {target for _, target in SELECT_MULTIPLE_ALIASES}
 
+FIELD_ALIASES = {
+    "staff_name": ["staff_name", "name_of_staff_filling_form"],
+    "interview_date": ["interview_date", "enter_a_date"],
+    "information_seeker_type": ["information_seeker_type", "who_is_the_information_seeker"],
+    "information_seeker_name": ["information_seeker_name", "name_of_the_information_seeker_at_the_help_desk"],
+    "child_unaccompanied_minor": ["child_unaccompanied_minor", "is_the_child_unaccompanied_minor"],
+    "respondent_relationship_to_child": ["respondent_relationship_to_child", "relationship_of_the_respondent_to_the_child"],
+    "respondent_relationship_other": [
+        "respondent_relationship_other",
+        "if_relationship_is_not_listed_please_specify_the_relationship_to_child",
+    ],
+    "household_type": ["household_type"],
+    "camp_location": ["camp_location"],
+    "helpdesk_camp_location": ["helpdesk_camp_location", "specific_camp_location_hosting_the_helpdesk"],
+    "helpdesk_section_block": ["helpdesk_section_block", "section_block_hosting_the_helpdesk"],
+    "helpdesk_village": ["helpdesk_village", "village_location_hosting_the_helpdesk"],
+    "residence_neighborhood_compound_house": [
+        "residence_neighborhood_compound_house",
+        "in_which_neighborhood_compound_and_house_do_you_come_from",
+    ],
+    "information_seeker_gender": ["information_seeker_gender", "gender_of_the_information_seeker"],
+    "information_seeker_age": ["information_seeker_age", "age_of_the_information_seeker"],
+    "information_seeker_nationality": ["information_seeker_nationality", "nationality_of_the_information_seeker"],
+    "information_seeker_nationality_other": [
+        "information_seeker_nationality_other",
+        "if_nationality_not_listed_above_please_specify_the_nationality",
+    ],
+    "has_operational_phone": ["has_operational_phone", "do_you_have_a_phone_number_that_is_in_operation"],
+    "information_seeker_phone": ["information_seeker_phone", "phone_number_of_the_information_seeker"],
+    "alternative_phone": ["alternative_phone", "alternative_phone_number"],
+    "registered_with_unhcr": ["registered_with_unhcr", "are_you_registered_with_the_unhcr"],
+    "information_seeker_individual_number": [
+        "information_seeker_individual_number",
+        "individual_number_of_the_information_seeker",
+    ],
+    "information_seeker_ration_or_wristband_number": [
+        "information_seeker_ration_or_wristband_number",
+        "ration_card_number_wrist_band_number_of_the_information_seeker",
+    ],
+    "has_disability": ["has_disability", "do_you_have_any_disability"],
+    "child_disability_type": ["child_disability_type", "what_is_the_child_s_type_of_disability"],
+    "child_disability_type_other": [
+        "child_disability_type_other",
+        "if_other_disability_please_specify_the_type_of_disability_for_the_child",
+    ],
+    "difficulty_seeing": ["difficulty_seeing"],
+    "difficulty_hearing": ["difficulty_hearing"],
+    "difficulty_walking_or_climbing": ["difficulty_walking_or_climbing", "difficulty_walking_or_climbing_steps"],
+    "difficulty_self_care": ["difficulty_self_care"],
+    "difficulty_remembering_or_concentrating": ["difficulty_remembering_or_concentrating"],
+    "difficulty_communicating": ["difficulty_communicating"],
+    "information_seeker_disability_type_other": [
+        "information_seeker_disability_type_other",
+        "other_disability_type_of_the_information_seeker_if_not_answered_by_the_questions_provided",
+    ],
+    "visited_tdh_helpdesk_before": ["visited_tdh_helpdesk_before", "have_you_been_to_any_of_tdh_s_helpdesks_before"],
+    "last_visit_within_current_month": [
+        "last_visit_within_current_month",
+        "was_your_last_visit_made_within_the_month_we_are_in",
+    ],
+    "request_type_protection_or_information": [
+        "request_type_protection_or_information",
+        "is_the_individual_reporting_a_protection_concern_or_seeking_general_protection_information",
+    ],
+    "main_protection_concern": ["main_protection_concern", "main_protection_concern_presented_at_the_helpdesk"],
+    "concern_other_specify": [
+        "concern_other_specify",
+        "if_protection_concerns_not_listed_specify_the_protection_concerns_presented",
+    ],
+    "general_information_type": ["general_information_type", "type_of_general_protection_information_sought"],
+    "info_other_specify": [
+        "info_other_specify",
+        "if_general_protection_not_in_the_list_please_specify_the_general_protection_information_sought",
+    ],
+    "action_taken": ["action_taken"],
+    "action_taken_other_specify": ["action_taken_other_specify", "if_action_taken_is_other_please_specify"],
+    "referral_date": ["referral_date", "on_what_date_was_the_case_referred"],
+    "referred_partner": ["referred_partner", "which_partner_has_the_case_been_referred_to"],
+    "referred_department": ["referred_department", "which_department_has_the_case_been_referred_to"],
+    "external_agency_specify": [
+        "external_agency_specify",
+        "if_external_please_specify_the_name_of_the_agency_referred_to",
+    ],
+    "follow_up_required": ["follow_up_required", "any_follow_up_action_required"],
+    "follow_up_action": ["follow_up_action", "if_yes_what_is_the_follow_up_action"],
+    "gps_latitude": ["gps_latitude", "gps_location_latitude", "_gps_location_latitude"],
+    "gps_longitude": ["gps_longitude", "gps_location_longitude", "_gps_location_longitude"],
+}
+
 DISABILITY_TYPE_STANDARD_MAP = {
     "visual impairment": "Visual Impairment",
     "visual disability": "Visual Impairment",
@@ -1311,162 +1400,61 @@ def assign_or_fill_column(frame, target_column, source_column):
             frame[target_column] = source_values
 
 
-def copy_column_by_suffix(frame, target_column):
-    """Map Kobo group-prefixed columns to the dashboard's expected names."""
-    suffixes = (
-        f"_{target_column}",
-        f"_{target_column}_label",
-        f"_{target_column}_labels",
-    )
+def normalized_slug(value):
+    value = str(value).replace("/", "_").replace(".", "_").strip()
+    value = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
+    return re.sub(r"_+", "_", value).lower()
+
+
+def column_matches_alias(column, alias):
+    column = normalized_slug(column)
+    alias = normalized_slug(alias)
+    if not alias:
+        return False
+    return column == alias or column.endswith(f"_{alias}")
+
+
+def best_matching_column(frame, aliases, exclude=None):
+    exclude = set(exclude or [])
     candidates = [
         column
         for column in frame.columns
-        if column != target_column and any(column.endswith(suffix) for suffix in suffixes)
+        if column not in exclude and any(column_matches_alias(column, alias) for alias in aliases)
     ]
-
     if not candidates:
-        return
-
+        return None
     candidates = sorted(
         candidates,
         key=lambda column: (populated_count(frame[column]), -len(column)),
         reverse=True,
     )
-    assign_or_fill_column(frame, target_column, candidates[0])
+    return candidates[0] if populated_count(frame[candidates[0]]) else None
 
 
-def expose_prefixed_select_multiple_columns(frame):
-    """Expose group-prefixed select_multiple fields with expected prefixes."""
-    expected_prefixes = ("concern_", "info_", "ref_partner_")
-    existing = set(frame.columns)
-
-    for column in list(frame.columns):
-        for prefix in expected_prefixes:
-            marker = f"_{prefix}"
-            if marker not in column:
-                continue
-            exposed_name = column[column.index(marker) + 1 :]
-            if not exposed_name or exposed_name not in KNOWN_SELECT_MULTIPLE_COLUMNS:
-                continue
-            assign_or_fill_column(frame, exposed_name, column)
-            if exposed_name not in existing:
-                existing.add(exposed_name)
+def map_standard_fields(frame):
+    for target_column, aliases in FIELD_ALIASES.items():
+        source_column = best_matching_column(frame, aliases, exclude={target_column})
+        if source_column:
+            assign_or_fill_column(frame, target_column, source_column)
 
 
-def apply_known_kobo_column_aliases(frame):
-    """Map Kobo export/question-label columns to the dashboard's cleaned names."""
-    exact_aliases = {
-        "name_of_staff_filling_form": "staff_name",
-        "enter_a_date": "interview_date",
-        "who_is_the_information_seeker": "information_seeker_type",
-        "name_of_the_information_seeker_at_the_help_desk": "information_seeker_name",
-        "is_the_child_unaccompanied_minor": "child_unaccompanied_minor",
-        "relationship_of_the_respondent_to_the_child": "respondent_relationship_to_child",
-        "if_relationship_is_not_listed_please_specify_the_relationship_to_child": "respondent_relationship_other",
-        "camp_location": "camp_location",
-        "specific_camp_location_hosting_the_helpdesk": "helpdesk_camp_location",
-        "section_block_hosting_the_helpdesk": "helpdesk_section_block",
-        "village_location_hosting_the_helpdesk": "helpdesk_village",
-        "in_which_neighborhood_compound_and_house_do_you_come_from": "residence_neighborhood_compound_house",
-        "gender_of_the_information_seeker": "information_seeker_gender",
-        "age_of_the_information_seeker": "information_seeker_age",
-        "nationality_of_the_information_seeker": "information_seeker_nationality",
-        "if_nationality_not_listed_above_please_specify_the_nationality": "information_seeker_nationality_other",
-        "do_you_have_a_phone_number_that_is_in_operation": "has_operational_phone",
-        "phone_number_of_the_information_seeker": "information_seeker_phone",
-        "alternative_phone_number": "alternative_phone",
-        "are_you_registered_with_the_unhcr": "registered_with_unhcr",
-        "individual_number_of_the_information_seeker": "information_seeker_individual_number",
-        "ration_card_number_wrist_band_number_of_the_information_seeker": "information_seeker_ration_or_wristband_number",
-        "do_you_have_any_disability": "has_disability",
-        "what_is_the_child_s_type_of_disability": "child_disability_type",
-        "if_other_disability_please_specify_the_type_of_disability_for_the_child": "child_disability_type_other",
-        "do_you_have_have_difficulty_seeing_even_if_wearing_glasses_would_you_say": "difficulty_seeing",
-        "do_you_have_have_difficulty_hearing_even_if_using_a_hearing_aid_would_you_say": "difficulty_hearing",
-        "do_you_have_have_difficulty_walking_or_climbing_steps_would_you_say": "difficulty_walking_or_climbing",
-        "do_you_have_have_difficulty_with_self_care_such_as_washing_all_over_or_dressing_would_you_say": "difficulty_self_care",
-        "do_you_have_have_difficulty_remembering_or_concentrating_would_you_say": "difficulty_remembering_or_concentrating",
-        "using_your_his_her_usual_language_do_you_you_he_she_have_difficulty_communicating_for_example_understanding_or_being_understood_would_you_say": "difficulty_communicating",
-        "other_disability_type_of_the_information_seeker_if_not_answered_by_the_questions_provided": "information_seeker_disability_type_other",
-        "have_you_been_to_any_of_tdh_s_helpdesks_before": "visited_tdh_helpdesk_before",
-        "was_your_last_visit_made_within_the_month_we_are_in": "last_visit_within_current_month",
-        "is_the_individual_reporting_a_protection_concern_or_seeking_general_protection_information": "request_type_protection_or_information",
-        "main_protection_concern_presented_at_the_helpdesk": "main_protection_concern",
-        "if_protection_concerns_not_listed_specify_the_protection_concerns_presented": "concern_other_specify",
-        "type_of_general_protection_information_sought": "general_information_type",
-        "if_general_protection_not_in_the_list_please_specify_the_general_protection_information_sought": "info_other_specify",
-        "action_taken": "action_taken",
-        "if_action_taken_is_other_please_specify": "action_taken_other_specify",
-        "on_what_date_was_the_case_referred": "referral_date",
-        "which_partner_has_the_case_been_referred_to": "referred_partner",
-        "which_department_has_the_case_been_referred_to": "referred_department",
-        "if_external_please_specify_the_name_of_the_agency_referred_to": "external_agency_specify",
-        "any_follow_up_action_required": "follow_up_required",
-        "if_yes_what_is_the_follow_up_action": "follow_up_action",
-        "gps_location_latitude": "gps_latitude",
-        "gps_location_longitude": "gps_longitude",
-    }
+def map_select_multiple_indicator_columns(frame):
+    parent_columns = {"main_protection_concern", "general_information_type", "referred_partner"}
+    parent_columns.update(FIELD_ALIASES["main_protection_concern"])
+    parent_columns.update(FIELD_ALIASES["general_information_type"])
+    parent_columns.update(FIELD_ALIASES["referred_partner"])
 
-    contains_aliases = [
-        ("no_access_to_non_food_items", "concern_no_access_nfi"),
-        ("medical_assistive_devices", "concern_child_needs_assistive_devices"),
-        ("no_access_food", "concern_no_access_food"),
-        ("parental_neglect", "concern_parental_neglect"),
-        ("child_abandonment", "concern_child_abandonment"),
-        ("child_custody_related_concerns", "concern_child_custody"),
-        ("physical_violence", "concern_physical_violence"),
-        ("sexual_violence", "concern_sexual_violence"),
-        ("educational_support", "concern_educational_support"),
-        ("school_dropout_risk_or_dropped_out", "concern_school_dropout_risk_or_dropped_out"),
-        ("intimate_partner_violence", "concern_intimate_partner_violence"),
-        ("dangerous_child_work", "concern_dangerous_child_work"),
-        ("conflict_with_the_law", "concern_child_conflict_with_law"),
-        ("in_conflict_with_the_law", "concern_child_conflict_with_law"),
-        ("civil_registration_services", "concern_civil_registration_services"),
-        ("shelter_need", "concern_shelter_need"),
-        ("medical_support", "concern_medical_support"),
-        ("parental_care_unaccompanied", "concern_lacking_parental_care_unaccompanied"),
-        ("unhcr_profiling_registration", "concern_unhcr_profiling_registration"),
-        ("psychosocial_support", "concern_psychosocial_support"),
-        ("concerns_not_listed", "concern_other_not_listed"),
-        ("access_to_child_protection_services", "info_child_protection_services"),
-        ("access_to_gender_based_violence_gbv_support_services", "info_gbv_support_services"),
-        ("access_to_legal_services", "info_legal_services"),
-        ("access_to_durable_solutions", "info_durable_solutions"),
-        ("access_to_core_relief_items_cris", "info_core_relief_items"),
-        ("access_to_food_from_wfp", "info_food_access"),
-        ("access_to_livelihood_and_empowerment_opportunities", "info_livelihood_empowerment"),
-        ("access_to_medical_services", "info_medical_services"),
-        ("access_to_disability_support_services", "info_disability_support_services"),
-        ("access_to_wash", "info_wash_access"),
-        ("general_protection_not_in_the_list", "info_other_not_listed"),
-        ("referred_to_department_of_refugee_services_drs", "ref_partner_drs"),
-        ("referred_to_unhcr", "ref_partner_unhcr"),
-        ("referred_to_save_the_children_sci", "ref_partner_sci"),
-        ("referred_to_norwegian_refugee_council_nrc", "ref_partner_nrc"),
-        ("referred_to_international_rescue_committee_irc", "ref_partner_irc"),
-        ("referred_to_refugee_consortium_of_kenya_rck", "ref_partner_rck"),
-        ("referred_to_lutheran_world_federation_lwf", "ref_partner_lwf"),
-        ("referred_to_humanity_and_inclusion_hi", "ref_partner_hi"),
-        ("referred_to_danish_refugee_council_drc", "ref_partner_drc"),
-        ("referred_to_peace_winds_japan", "ref_partner_pwj"),
-        ("referred_to_directorate_of_children_services_dcs", "ref_partner_dcs"),
-        ("referred_to_film_aid_kenya_fak", "ref_partner_fak"),
-        ("referred_to_other_partners", "ref_partner_other"),
-        ("specify_the_partner_the_case_was_referred_to", "ref_partner_other_specify"),
-    ]
+    for needle, target_column in SELECT_MULTIPLE_ALIASES:
+        target_short = re.sub(r"^(concern|info|ref_partner)_", "", target_column)
+        aliases = {target_column, needle, target_short}
+        source_column = best_matching_column(frame, aliases, exclude=parent_columns | {target_column})
+        if source_column:
+            assign_or_fill_column(frame, target_column, source_column)
 
-    existing = set(frame.columns)
-    for source, target in exact_aliases.items():
-        if source in frame.columns:
-            assign_or_fill_column(frame, target, source)
-            existing.add(target)
-
-    for column in list(frame.columns):
-        for needle, target in contains_aliases:
-            if needle in column:
-                assign_or_fill_column(frame, target, column)
-                existing.add(target)
+def map_kobo_columns_to_dashboard(frame):
+    """Map Kobo JSON/export columns to the cleaned names used by the dashboard."""
+    map_standard_fields(frame)
+    map_select_multiple_indicator_columns(frame)
 
 
 def select_value_matches(value, aliases):
@@ -1556,7 +1544,7 @@ def load_data(source_signature):
     records.columns = [str(column).replace("/", "_").strip() for column in records.columns]
     records.columns = [re.sub(r"[^A-Za-z0-9_]+", "_", column).strip("_") for column in records.columns]
     records.columns = [re.sub(r"_+", "_", column).lower() for column in records.columns]
-    apply_known_kobo_column_aliases(records)
+    map_kobo_columns_to_dashboard(records)
 
     expected_source_columns = [
         "interview_date",
@@ -1581,10 +1569,6 @@ def load_data(source_signature):
     ]
     expected_source_columns.extend(WGQ_DISABILITY_DOMAINS.keys())
     expected_source_columns.extend(ADULT_DISABILITY_CATEGORY_COLUMNS)
-    for column in expected_source_columns:
-        copy_column_by_suffix(records, column)
-    expose_prefixed_select_multiple_columns(records)
-
     if "interview_date" not in records.columns and "submission_time" in records.columns:
         records["interview_date"] = records["submission_time"]
     if "record_id" not in records.columns:
