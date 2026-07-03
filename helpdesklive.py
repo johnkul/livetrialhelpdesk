@@ -173,57 +173,59 @@ CORE_RECORD_COLUMNS = [
     "follow_up_required_clean",
 ]
 
-# Robust mapping table representing raw Kobo database fields to standard variables
+# -----------------------------------------------------------------------------------------------------------------------------
+# THE TRANSLATION MAP: Translates the exact raw Kobo Collect header labels into the clean variables used in code analysis.
+# -----------------------------------------------------------------------------------------------------------------------------
 KOBO_TO_DASHBOARD_COLUMN_MAP = {
-    "consent_recording": "consent_recording",
-    "staff_name": "staff_name",
-    "interview_date": "interview_date",
-    "information_seeker_type": "information_seeker_type",
-    "information_seeker_name": "information_seeker_name",
-    "child_unaccompanied_minor": "child_unaccompanied_minor",
-    "respondent_relationship_to_child": "respondent_relationship_to_child",
-    "respondent_relationship_other": "respondent_relationship_other",
+    # Raw Kobo Collect Column Headers (Normalized to lowercase-underscores) -> Cleaned Column Names expected by Analysis
+    "name_of_staff_filling_form": "staff_name",
+    "enter_a_date": "interview_date",
+    "who_is_the_information_seeker": "information_seeker_type",
+    "name_of_the_information_seeker_at_the_help_desk": "information_seeker_name",
+    "is_the_child_unaccompanied_minor": "child_unaccompanied_minor",
+    "relationship_of_the_respondent_to_the_child": "respondent_relationship_to_child",
+    "if_relationship_is_not_listed_please_specify_the_relationship_to_child": "respondent_relationship_other",
     "household_type": "household_type",
     "camp_location": "camp_location",
-    "helpdesk_camp_location": "helpdesk_camp_location",
-    "helpdesk_section_block": "helpdesk_section_block",
-    "helpdesk_village": "helpdesk_village",
-    "residence_neighborhood_compound_house": "residence_neighborhood_compound_house",
-    "information_seeker_gender": "information_seeker_gender",
-    "information_seeker_age": "information_seeker_age",
-    "information_seeker_nationality": "information_seeker_nationality",
-    "information_seeker_nationality_other": "information_seeker_nationality_other",
-    "has_operational_phone": "has_operational_phone",
-    "information_seeker_phone": "information_seeker_phone",
-    "alternative_phone": "alternative_phone",
-    "registered_with_unhcr": "registered_with_unhcr",
-    "information_seeker_individual_number": "information_seeker_individual_number",
-    "information_seeker_ration_or_wristband_number": "information_seeker_ration_or_wristband_number",
-    "has_disability": "has_disability",
-    "child_disability_type": "child_disability_type",
-    "child_disability_type_other": "child_disability_type_other",
-    "difficulty_seeing": "difficulty_seeing",
-    "difficulty_hearing": "difficulty_hearing",
-    "difficulty_walking_or_climbing": "difficulty_walking_or_climbing",
-    "difficulty_self_care": "difficulty_self_care",
-    "difficulty_remembering_or_concentrating": "difficulty_remembering_or_concentrating",
-    "difficulty_communicating": "difficulty_communicating",
-    "information_seeker_disability_type_other": "information_seeker_disability_type_other",
-    "visited_tdh_helpdesk_before": "visited_tdh_helpdesk_before",
-    "last_visit_within_current_month": "last_visit_within_current_month",
-    "request_type_protection_or_information": "request_type_protection_or_information",
-    "main_protection_concern": "main_protection_concern",
-    "general_information_type": "general_information_type",
+    "specific_camp_location_hosting_the_helpdesk": "helpdesk_camp_location",
+    "section_block_hosting_the_helpdesk": "helpdesk_section_block",
+    "village_location_hosting_the_helpdesk": "helpdesk_village",
+    "in_which_neighborhood_compound_and_house_do_you_come_from": "residence_neighborhood_compound_house",
+    "gender_of_the_information_seeker": "information_seeker_gender",
+    "age_of_the_information_seeker": "information_seeker_age",
+    "nationality_of_the_information_seeker": "information_seeker_nationality",
+    "if_nationality_not_listed_above_please_specify_the_nationality": "information_seeker_nationality_other",
+    "do_you_have_a_phone_number_that_is_in_operation": "has_operational_phone",
+    "phone_number_of_the_information_seeker": "information_seeker_phone",
+    "alternative_phone_number": "alternative_phone",
+    "are_you_registered_with_the_unhcr": "registered_with_unhcr",
+    "individual_number_of_the_information_seeker": "information_seeker_individual_number",
+    "ration_card_number_wrist_band_number_of_the_information_seeker": "information_seeker_ration_or_wristband_number",
+    "do_you_have_any_disability": "has_disability",
+    "what_is_the_child_s_type_of_disability": "child_disability_type",
+    "if_other_disability_please_specify_the_type_of_disability_for_the_child": "child_disability_type_other",
+    "do_does_you_he_she_have_difficulty_seeing_even_if_wearing_glasses_would_you_say": "difficulty_seeing",
+    "do_does_you_he_she_have_difficulty_hearing_even_if_using_a_hearing_aid_s_would_you_say": "difficulty_hearing",
+    "do_does_you_he_she_have_difficulty_walking_or_climbing_steps_would_you_say": "difficulty_walking_or_climbing",
+    "do_does_you_he_she_have_difficulty_with_self_care_such_as_washing_all_over_or_dressing_would_you_say": "difficulty_self_care",
+    "do_does_you_he_she_have_difficulty_remembering_or_concentrating_would_you_say": "difficulty_remembering_or_concentrating",
+    "using_your_his_her_usual_language_do_does_you_he_she_have_difficulty_communicating_for_example_understanding_or_being_understood_would_you_say": "difficulty_communicating",
+    "other_disability_type_of_the_information_seeker_if_not_answered_by_the_questions_provided": "information_seeker_disability_type_other",
+    "have_you_been_to_any_of_tdh_s_helpdesks_before": "visited_tdh_helpdesk_before",
+    "was_your_last_visit_made_within_the_month_we_are_in": "last_visit_within_current_month",
+    "is_the_individual_reporting_a_protection_concern_or_seeking_general_protection_information": "request_type_protection_or_information",
+    "main_protection_concern_presented_at_the_helpdesk": "main_protection_concern",
+    "type_of_general_protection_information_sought": "general_information_type",
     "action_taken": "action_taken",
-    "action_taken_other_specify": "action_taken_other_specify",
-    "referral_date": "referral_date",
-    "referred_partner": "referred_partner",
-    "referred_department": "referred_department",
-    "external_agency_specify": "external_agency_specify",
-    "follow_up_required": "follow_up_required",
-    "follow_up_action": "follow_up_action",
-    "gps_latitude": "gps_latitude",
-    "gps_longitude": "gps_longitude",
+    "if_action_taken_is_other_please_specify": "action_taken_other_specify",
+    "on_what_date_was_the_case_referred": "referral_date",
+    "which_partner_has_the_case_been_referred_to": "referred_partner",
+    "which_department_has_the_case_been_referred_to": "referred_department",
+    "if_external_please_specify_the_name_of_the_agency_referred_to": "external_agency_specify",
+    "any_follow_up_action_required": "follow_up_required",
+    "if_yes_what_is_the_follow_up_action": "follow_up_action",
+    "gps_location_latitude": "gps_latitude",
+    "gps_location_longitude": "gps_longitude",
     "gps_location_precision": "gps_location_precision"
 }
 
@@ -260,7 +262,7 @@ def load_css():
             .kpi-bar-fill{height:100%;background:var(--accent);}
             .kpi-group-caption{font-weight:800;color:#12312F;margin:10px 0 8px;}
             .section-header{display:flex;align-items:center;gap:8px;margin:12px 0 4px;}
-            .section-accent{display:inline-block;width:8px;height:26px;background:#2F7D69;border-radius:99px;}
+            .section-accent{display:inline-block;width:8px;height:26px;background:#2F7D69;border-radius:999px;}
             .section-title{font-size:22px;font-weight:850;color:#12312F;}
             .insight-label{font-size:13px;font-weight:800;color:#64748B;}
             .insight-value{font-size:18px;font-weight:900;color:#12312F;margin-top:5px;}
@@ -315,7 +317,7 @@ CPV_NAME_STANDARD_MAP = {
     "clement skio marino": "Clement Akio Marino",
     "mulimbi_kalangiro": "Mulimbi Kalangiro Vainqueur",
     "mulimbi kalagiro": "Mulimbi Kalangiro Vainqueur",
-    "mulimbi kalangiro vainqueur": "Mulimbi Kalangiro Vainqueur",
+    "mulimbi_kalangiro_vainqueur": "Mulimbi Kalangiro Vainqueur",
     "leer biel": "Leer Biel Leer",
     "leer biel leer": "Leer Biel Leer",
     "godfrey ojok": "Godfrey Ojok",
@@ -344,7 +346,7 @@ CPV_NAME_STANDARD_MAP = {
     "belick": "Belick Uwisero",
     "belick uwisero": "Belick Uwisero",
     "belick uwusero": "Belick Uwisero",
-    "be ick uwisero": "Belick Uwisero",
+    "be ick_uwisero": "Belick Uwisero",
     "bekucknuwisero": "Belick Uwisero",
     "wardere mohamed": "Wardere Mohamed",
     "habibo abdi": "Habibo Abdi",
@@ -383,7 +385,7 @@ CPV_NAME_STANDARD_MAP = {
     "peter lobono": "Lobono Peter",
     "agnes ingiara oreste": "Agnes Ingiara Oreste",
     "adam": "Adam Owda Peter",
-    "adam owda peter": "Adam Owda Peter",
+    "adam owda_peter": "Adam Owda Peter",
     "lino lotino": "Lino Lotino",
     "madut_malul akon": "Madut Malul Akon",
     "beatrice akwero": "Beatrice Akwero",
@@ -1179,16 +1181,17 @@ def load_data(source_signature):
         st.stop()
 
     # 1. Clean and normalize the incoming Kobo API column names to safe lowercase underscore formats
-    # Also strip slash structures often exported by Kobo
+    # This matches the clean variable names we defined in the map keys!
     records.columns = [str(column).replace("/", "_").strip() for column in records.columns]
     records.columns = [re.sub(r"[^A-Za-z0-9_]+", "_", column).strip("_") for column in records.columns]
     records.columns = [re.sub(r"_+", "_", column).lower() for column in records.columns]
 
-    # Let's print columns to st.write under an expander for user troubleshooting
+    # Let's print columns to st.write under an expander for user troubleshooting if they want to inspect
     with st.expander("Troubleshooting: Raw Columns in Kobo Database"):
         st.write(sorted(records.columns.tolist()))
 
-    # 2. Map Kobo API raw column names to dashboard expected names
+    # 2. Translate raw Kobo columns using our explicit mapper!
+    # Because records.columns are now lowercase and underscores, they perfectly match the keys in KOBO_TO_DASHBOARD_COLUMN_MAP.
     records = records.rename(columns=KOBO_TO_DASHBOARD_COLUMN_MAP)
 
     # 3. Fallback group suffix matcher for prefixes introduced by Kobo Collect Group/Repeat fields
@@ -1321,9 +1324,7 @@ def load_data(source_signature):
     ] = "Information counselling only"
     records.loc[records["action_taken_clean"].eq("Action not taken at all"), "referral_status"] = "No action taken"
 
-    # CRITICAL WORKAROUND: Instead of hard-failing and stopping the dashboard, 
-    # we dynamically fall back to raw data if required fields aren't 100% matched,
-    # or print a diagnostic expander so the user can immediately see what failed to map.
+    # Friendly diagnostic and safety validation checks
     core_fields = ["interview_date", "information_seeker_type", "camp_location", "information_seeker_gender", "age_group", "request_category"]
     for col in core_fields:
         if col not in records.columns:
@@ -1334,7 +1335,7 @@ def load_data(source_signature):
         missing_summary = records[core_fields].isna().sum().reset_index()
         missing_summary.columns = ["Required field", "Missing rows"]
         
-        # Friendly Diagnostic Warning Screen
+        # Diagnostic Screen
         st.error(
             "⚠️ Kobo data was received, but no rows had all required dashboard fields. "
             "Below is a diagnostic panel showing which required variables failed to map from your Kobo database. "
@@ -1342,7 +1343,6 @@ def load_data(source_signature):
         )
         st.dataframe(missing_summary, use_container_width=True, hide_index=True)
         
-        # Display sample data to help user inspect
         st.markdown("### Sample Row Received from Kobo (Raw Columns):")
         st.dataframe(records.head(5), use_container_width=True)
 
