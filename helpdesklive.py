@@ -1369,11 +1369,13 @@ def load_data(source_signature):
 
     has_protection_detail = records.get("main_protection_concern", pd.Series(pd.NA, index=records.index)).map(clean_text).notna()
     if protection_indicator_cols:
-        has_protection_detail = has_protection_detail | records[protection_indicator_cols].applymap(is_selected_indicator).any(axis=1)
+        protection_selected = records[protection_indicator_cols].apply(lambda column: column.map(is_selected_indicator))
+        has_protection_detail = has_protection_detail | protection_selected.any(axis=1)
 
     has_information_detail = records.get("general_information_type", pd.Series(pd.NA, index=records.index)).map(clean_text).notna()
     if information_indicator_cols:
-        has_information_detail = has_information_detail | records[information_indicator_cols].applymap(is_selected_indicator).any(axis=1)
+        information_selected = records[information_indicator_cols].apply(lambda column: column.map(is_selected_indicator))
+        has_information_detail = has_information_detail | information_selected.any(axis=1)
 
     records.loc[request_missing & has_protection_detail, "request_category"] = "Reporting a protection concern"
     records.loc[request_missing & ~has_protection_detail & has_information_detail, "request_category"] = "Seeking general protection information"
