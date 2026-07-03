@@ -687,6 +687,73 @@ def age_group_life_stage(age_group):
     return pd.NA
 
 
+def standardize_age_group(value):
+    value = clean_text(value)
+    if pd.isna(value):
+        return pd.NA
+    if str(value) in AGE_GROUP_ORDER:
+        return str(value)
+
+    match = re.search(r"\d+", str(value))
+    if not match:
+        return value
+
+    age = int(match.group(0))
+    if age <= 5:
+        return "0-5 Years"
+    if age <= 11:
+        return "6-11 Years"
+    if age <= 17:
+        return "12-17 Years"
+    if age <= 35:
+        return "18-35 Years"
+    if age <= 49:
+        return "36-49 Years"
+    if age <= 64:
+        return "50-64 Years"
+    return "65 Years and Above"
+
+
+def normalize_request_category(value):
+    value = clean_text(value)
+    if pd.isna(value):
+        return pd.NA
+
+    normalized = normalize_response(value)
+    if normalized is None:
+        return pd.NA
+
+    if "general" in normalized and "information" in normalized:
+        return "Seeking general protection information"
+    if "information" in normalized and "concern" not in normalized:
+        return "Seeking general protection information"
+    if "protection" in normalized and "concern" in normalized:
+        return "Reporting a protection concern"
+    if normalized in {"concern", "protection", "reporting protection concern"}:
+        return "Reporting a protection concern"
+
+    return str(value)
+
+
+def is_selected_indicator(value):
+    value = clean_text(value)
+    if pd.isna(value):
+        return False
+    normalized = normalize_response(value)
+    if normalized is None:
+        return False
+    return normalized in {"1", "true", "yes", "y", "selected", "checked"} or normalized not in {
+        "0",
+        "false",
+        "no",
+        "n",
+        "none",
+        "nan",
+        "not selected",
+        "unchecked",
+    }
+
+
 def normalize_gender_by_life_stage(gender, life_stage):
     gender = clean_text(gender)
     life_stage = clean_text(life_stage)
@@ -1233,6 +1300,8 @@ def load_data(source_signature):
         "information_seeker_type",
         "information_seeker_gender",
         "request_type_protection_or_information",
+        "main_protection_concern",
+        "general_information_type",
         "action_taken",
         "follow_up_required",
         "has_disability",
@@ -1268,7 +1337,7 @@ def load_data(source_signature):
 
     records["staff_name"] = records["staff_name"].map(normalize_staff_name)
     records["household_type"] = records["household_type"].map(clean_text)
-    records["age_group"] = records["information_seeker_age"].map(clean_text)
+    records["age_group"] = records["information_seeker_age"].map(standardize_age_group)
     records["derived_life_stage"] = records["age_group"].map(age_group_life_stage)
     records["information_seeker_type_raw"] = records["information_seeker_type"].map(clean_text)
     records["information_seeker_gender_raw"] = records["information_seeker_gender"].map(clean_text)
@@ -1284,7 +1353,30 @@ def load_data(source_signature):
         "information_seeker_gender"
     ].fillna("[Missing]")
 
-    records["request_category"] = records["request_type_protection_or_information"].map(clean_text)
+    records["request_category"] = records["request_type_protection_or_information"].map(normalize_request_category)
+    request_missing = records["request_category"].isna()
+
+    protection_indicator_cols = [
+        col
+        for col in records.columns
+        if col.startswith("concern_") and not col.endswith("_specify")
+    ]
+    information_indicator_cols = [
+        col
+        for col in records.columns
+        if col.startswith("info_") and not col.endswith("_specify")
+    ]
+
+    has_protection_detail = records.get("main_protection_concern", pd.Series(pd.NA, index=records.index)).map(clean_text).notna()
+    if protection_indicator_cols:
+        has_protection_detail = has_protection_detail | records[protection_indicator_cols].applymap(is_selected_indicator).any(axis=1)
+
+    has_information_detail = records.get("general_information_type", pd.Series(pd.NA, index=records.index)).map(clean_text).notna()
+    if information_indicator_cols:
+        has_information_detail = has_information_detail | records[information_indicator_cols].applymap(is_selected_indicator).any(axis=1)
+
+    records.loc[request_missing & has_protection_detail, "request_category"] = "Reporting a protection concern"
+    records.loc[request_missing & ~has_protection_detail & has_information_detail, "request_category"] = "Seeking general protection information"
     records["action_taken_clean"] = records["action_taken"].map(clean_text)
     records["follow_up_required_clean"] = records["follow_up_required"].map(clean_text)
     records["helpdesk_location"] = records.apply(derive_linked_helpdesk_location, axis=1)
@@ -1347,7 +1439,7 @@ def load_data(source_signature):
         if not cols:
             return pd.DataFrame(columns=id_cols + [code_name, label_name])
         long = records[id_cols + cols].melt(id_vars=id_cols, value_vars=cols, var_name=code_name, value_name="selected")
-        long = long[pd.to_numeric(long["selected"], errors="coerce").eq(1)].drop(columns="selected")
+        long = long[long["selected"].map(is_selected_indicator)].drop(columns="selected")
         long[label_name] = long[code_name].map(label_map).fillna(long[code_name].map(safe_label_from_code))
         return long
 
