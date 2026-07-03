@@ -86,6 +86,64 @@ WGQ_DISABILITY_DOMAINS = {
 }
 ADULT_DISABILITY_CATEGORY_COLUMNS = ["information_seeker_disability_type_other"]
 
+PROTECTION_SELECT_ALIASES = [
+    ("no_access_to_non_food_items", "concern_no_access_nfi"),
+    ("medical_assistive_devices", "concern_child_needs_assistive_devices"),
+    ("no_access_food", "concern_no_access_food"),
+    ("parental_neglect", "concern_parental_neglect"),
+    ("child_abandonment", "concern_child_abandonment"),
+    ("child_custody_related_concerns", "concern_child_custody"),
+    ("physical_violence", "concern_physical_violence"),
+    ("sexual_violence", "concern_sexual_violence"),
+    ("educational_support", "concern_educational_support"),
+    ("school_dropout_risk_or_dropped_out", "concern_school_dropout_risk_or_dropped_out"),
+    ("intimate_partner_violence", "concern_intimate_partner_violence"),
+    ("dangerous_child_work", "concern_dangerous_child_work"),
+    ("conflict_with_the_law", "concern_child_conflict_with_law"),
+    ("in_conflict_with_the_law", "concern_child_conflict_with_law"),
+    ("civil_registration_services", "concern_civil_registration_services"),
+    ("shelter_need", "concern_shelter_need"),
+    ("medical_support", "concern_medical_support"),
+    ("parental_care_unaccompanied", "concern_lacking_parental_care_unaccompanied"),
+    ("unhcr_profiling_registration", "concern_unhcr_profiling_registration"),
+    ("psychosocial_support", "concern_psychosocial_support"),
+    ("concerns_not_listed", "concern_other_not_listed"),
+]
+
+INFORMATION_SELECT_ALIASES = [
+    ("access_to_child_protection_services", "info_child_protection_services"),
+    ("access_to_gender_based_violence_gbv_support_services", "info_gbv_support_services"),
+    ("access_to_legal_services", "info_legal_services"),
+    ("access_to_durable_solutions", "info_durable_solutions"),
+    ("access_to_core_relief_items_cris", "info_core_relief_items"),
+    ("access_to_food_from_wfp", "info_food_access"),
+    ("access_to_livelihood_and_empowerment_opportunities", "info_livelihood_empowerment"),
+    ("access_to_medical_services", "info_medical_services"),
+    ("access_to_disability_support_services", "info_disability_support_services"),
+    ("access_to_wash", "info_wash_access"),
+    ("general_protection_not_in_the_list", "info_other_not_listed"),
+]
+
+REFERRAL_SELECT_ALIASES = [
+    ("referred_to_department_of_refugee_services_drs", "ref_partner_drs"),
+    ("referred_to_unhcr", "ref_partner_unhcr"),
+    ("referred_to_save_the_children_sci", "ref_partner_sci"),
+    ("referred_to_norwegian_refugee_council_nrc", "ref_partner_nrc"),
+    ("referred_to_international_rescue_committee_irc", "ref_partner_irc"),
+    ("referred_to_refugee_consortium_of_kenya_rck", "ref_partner_rck"),
+    ("referred_to_lutheran_world_federation_lwf", "ref_partner_lwf"),
+    ("referred_to_humanity_and_inclusion_hi", "ref_partner_hi"),
+    ("referred_to_danish_refugee_council_drc", "ref_partner_drc"),
+    ("referred_to_peace_winds_japan", "ref_partner_pwj"),
+    ("referred_to_directorate_of_children_services_dcs", "ref_partner_dcs"),
+    ("referred_to_film_aid_kenya_fak", "ref_partner_fak"),
+    ("referred_to_other_partners", "ref_partner_other"),
+    ("specify_the_partner_the_case_was_referred_to", "ref_partner_other_specify"),
+]
+
+SELECT_MULTIPLE_ALIASES = PROTECTION_SELECT_ALIASES + INFORMATION_SELECT_ALIASES + REFERRAL_SELECT_ALIASES
+KNOWN_SELECT_MULTIPLE_COLUMNS = {target for _, target in SELECT_MULTIPLE_ALIASES}
+
 DISABILITY_TYPE_STANDARD_MAP = {
     "visual impairment": "Visual Impairment",
     "visual disability": "Visual Impairment",
@@ -736,6 +794,8 @@ def normalize_request_category(value):
 
 
 def is_selected_indicator(value):
+    if isinstance(value, (list, tuple, set)):
+        return len(value) > 0
     value = clean_text(value)
     if pd.isna(value):
         return False
@@ -759,12 +819,25 @@ def normalize_gender_by_life_stage(gender, life_stage):
     life_stage = clean_text(life_stage)
     if pd.isna(gender):
         return "[Missing]"
+    normalized_gender = normalize_response(gender)
     if pd.isna(life_stage):
         return gender
     if life_stage == "Adult":
+        if normalized_gender in {"female", "woman", "girl"}:
+            return "Woman"
+        if normalized_gender in {"male", "man", "boy"}:
+            return "Man"
         return {"Girl": "Woman", "Boy": "Man"}.get(gender, gender)
     if life_stage == "Child":
+        if normalized_gender in {"female", "woman", "girl"}:
+            return "Girl"
+        if normalized_gender in {"male", "man", "boy"}:
+            return "Boy"
         return {"Woman": "Girl", "Man": "Boy"}.get(gender, gender)
+    if normalized_gender == "female":
+        return "Woman"
+    if normalized_gender == "male":
+        return "Man"
     return gender
 
 
@@ -1206,22 +1279,60 @@ def open_kobo_records_from_payload(payload):
     return records, mapping
 
 
-def copy_column_by_suffix(frame, target_column):
-    """Map Kobo group-prefixed columns to the dashboard's expected names."""
-    if target_column in frame.columns:
+def value_is_present(value):
+    if isinstance(value, (list, tuple, set)):
+        return len(value) > 0
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip() != ""
+
+
+def populated_count(series):
+    return int(series.map(value_is_present).sum())
+
+
+def assign_or_fill_column(frame, target_column, source_column):
+    if source_column not in frame.columns:
         return
 
-    suffix = f"_{target_column}"
-    candidates = [column for column in frame.columns if column.endswith(suffix)]
+    source_values = frame[source_column]
+    if target_column not in frame.columns:
+        frame[target_column] = source_values
+        return
+
+    source_mask = source_values.map(value_is_present)
+    target_mask = frame[target_column].map(value_is_present)
+    if source_mask.sum() > target_mask.sum():
+        frame[target_column] = frame[target_column].where(target_mask, source_values)
+        if populated_count(source_values) > populated_count(frame[target_column]):
+            frame[target_column] = source_values
+
+
+def copy_column_by_suffix(frame, target_column):
+    """Map Kobo group-prefixed columns to the dashboard's expected names."""
+    suffixes = (
+        f"_{target_column}",
+        f"_{target_column}_label",
+        f"_{target_column}_labels",
+    )
+    candidates = [
+        column
+        for column in frame.columns
+        if column != target_column and any(column.endswith(suffix) for suffix in suffixes)
+    ]
+
     if not candidates:
         return
 
     candidates = sorted(
         candidates,
-        key=lambda column: (frame[column].notna().sum(), -len(column)),
+        key=lambda column: (populated_count(frame[column]), -len(column)),
         reverse=True,
     )
-    frame[target_column] = frame[candidates[0]]
+    assign_or_fill_column(frame, target_column, candidates[0])
 
 
 def expose_prefixed_select_multiple_columns(frame):
@@ -1235,8 +1346,10 @@ def expose_prefixed_select_multiple_columns(frame):
             if marker not in column:
                 continue
             exposed_name = column[column.index(marker) + 1 :]
-            if exposed_name and exposed_name not in existing:
-                frame[exposed_name] = frame[column]
+            if not exposed_name or exposed_name not in KNOWN_SELECT_MULTIPLE_COLUMNS:
+                continue
+            assign_or_fill_column(frame, exposed_name, column)
+            if exposed_name not in existing:
                 existing.add(exposed_name)
 
 
@@ -1345,15 +1458,56 @@ def apply_known_kobo_column_aliases(frame):
 
     existing = set(frame.columns)
     for source, target in exact_aliases.items():
-        if source in frame.columns and target not in existing:
-            frame[target] = frame[source]
+        if source in frame.columns:
+            assign_or_fill_column(frame, target, source)
             existing.add(target)
 
     for column in list(frame.columns):
         for needle, target in contains_aliases:
-            if needle in column and target not in existing:
-                frame[target] = frame[column]
+            if needle in column:
+                assign_or_fill_column(frame, target, column)
                 existing.add(target)
+
+
+def select_value_matches(value, aliases):
+    if isinstance(value, (list, tuple, set)):
+        raw_parts = [str(part) for part in value]
+    else:
+        if not value_is_present(value):
+            return False
+        raw_parts = re.split(r"[\s,;|]+", str(value))
+        raw_parts.append(str(value))
+
+    normalized_parts = {normalize_response(part) for part in raw_parts if value_is_present(part)}
+    normalized_parts.discard(None)
+    normalized_full = normalize_response(" ".join(str(part) for part in raw_parts if value_is_present(part))) or ""
+
+    for alias in aliases:
+        alias_norm = normalize_response(alias)
+        if not alias_norm:
+            continue
+        if alias_norm in normalized_parts:
+            return True
+        if f" {alias_norm} " in f" {normalized_full} ":
+            return True
+    return False
+
+
+def expand_select_multiple_parent(frame, source_column, aliases):
+    if source_column not in frame.columns:
+        return
+
+    source_values = frame[source_column]
+    for needle, target in aliases:
+        target_aliases = {
+            needle,
+            target,
+            re.sub(r"^(concern|info|ref_partner)_", "", target),
+        }
+        selected_mask = source_values.map(lambda value: select_value_matches(value, target_aliases))
+        if target not in frame.columns:
+            frame[target] = pd.NA
+        frame.loc[selected_mask, target] = 1
 
 
 def build_label_map(mapping, prefix):
@@ -1439,6 +1593,10 @@ def load_data(source_signature):
     for column in expected_source_columns:
         if column not in records.columns:
             records[column] = pd.NA
+
+    expand_select_multiple_parent(records, "main_protection_concern", PROTECTION_SELECT_ALIASES)
+    expand_select_multiple_parent(records, "general_information_type", INFORMATION_SELECT_ALIASES)
+    expand_select_multiple_parent(records, "referred_partner", REFERRAL_SELECT_ALIASES)
 
     records["source_row_number"] = records.index + 2
     records["record_id"] = records["source_row_number"].map(lambda row: f"HD-{row:05d}")
