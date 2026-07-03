@@ -1,9 +1,13 @@
 from pathlib import Path
 import base64
 import html
+import io
+import json
 import os
-import pickle
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import altair as alt
 import pandas as pd
@@ -16,9 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 LOGO_PATH = BASE_DIR / "assets" / "tdh-logo.png"
 DEVELOPER_LOGO_PATH = BASE_DIR / "assets" / "developer-logo.png"
 STYLES_PATH = BASE_DIR / "assets" / "styles.css"
-DATA_FILE_PATH = BASE_DIR / "data" / "HELPDESK_DashboardData_Tdh_Kenya_D2.xlsx"
-PROCESSED_CACHE_PATH = BASE_DIR / "data" / "processed" / "helpdesk_processed_cache.pkl"
-PROCESSED_CACHE_VERSION = "2026-06-30-v2"
+KOBO_CACHE_TTL_SECONDS = 300
 
 APP_VERSION = "Version 1.0"
 APP_VERSION_DATE = "June 2026"
@@ -986,16 +988,155 @@ def adult_person_impairment_frame(frame):
 # -----------------------------------------------------------------------------
 # Data loading
 # -----------------------------------------------------------------------------
-def data_file_signature(path):
-    if not path.exists():
-        return str(path), None, None, None
-    stat = path.stat()
-    return (
-        str(path.resolve()),
-        stat.st_mtime_ns,
-        stat.st_size,
-        pd.to_datetime(stat.st_mtime, unit="s").strftime("%d %b %Y %H:%M:%S"),
-    )
+def get_kobo_config():
+    """Return KoboToolbox settings from Streamlit secrets, if configured."""
+    try:
+        kobo_secrets = st.secrets.get("kobo", {})
+    except Exception:
+        return {}
+
+    export_url = kobo_secrets.get("export_url", "") if kobo_secrets else ""
+    api_token = kobo_secrets.get("api_token", "") if kobo_secrets else ""
+
+    # Also support top-level keys for users who did not nest them under [kobo].
+    if not export_url:
+        export_url = st.secrets.get("export_url", "")
+    if not api_token:
+        api_token = st.secrets.get("api_token", "")
+
+    return {
+        "export_url": str(export_url).strip(),
+        "api_token": str(api_token).strip(),
+    }
+
+
+def kobo_configured():
+    config = get_kobo_config()
+    return bool(config.get("export_url") and config.get("api_token"))
+
+
+def normalize_kobo_export_url(export_url):
+    """Accept either a direct Kobo API/export URL or a Kobo form page URL."""
+    if "#/forms/" not in export_url:
+        return export_url
+
+    parsed = urllib.parse.urlparse(export_url)
+    match = re.search(r"/forms/([^/]+)/data", parsed.fragment)
+    if not match:
+        return export_url
+
+    asset_uid = match.group(1)
+    return f"{parsed.scheme}://{parsed.netloc}/api/v2/assets/{asset_uid}/data/?format=json"
+
+
+def data_source_signature():
+    if not kobo_configured():
+        st.error(
+            "KoboToolbox is not configured. Add export_url and api_token in Streamlit Secrets."
+        )
+        st.stop()
+
+    config = get_kobo_config()
+    return ("kobo", normalize_kobo_export_url(config["export_url"]), None, "Kobo live data")
+
+
+@st.cache_data(ttl=KOBO_CACHE_TTL_SECONDS, show_spinner="Downloading latest KoboToolbox data...")
+def fetch_kobo_payload(export_url, api_token):
+    export_url = normalize_kobo_export_url(export_url)
+
+    def read_url(url):
+        request = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Token {api_token}",
+                "Accept": "application/json, text/csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, */*",
+                "User-Agent": "tdh-helpdesk-streamlit-dashboard/1.0",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return {
+                "content": response.read(),
+                "content_type": response.headers.get("Content-Type", ""),
+                "url": response.geturl(),
+            }
+
+    try:
+        payload = read_url(export_url)
+
+        if "json" not in payload.get("content_type", "").lower() and "format=json" not in payload.get("url", "").lower():
+            return payload
+
+        try:
+            parsed = json.loads(payload["content"].decode("utf-8"))
+        except Exception:
+            return payload
+
+        if not isinstance(parsed, dict) or "results" not in parsed:
+            return payload
+
+        all_results = list(parsed.get("results") or [])
+        next_url = parsed.get("next")
+        current_url = payload["url"]
+        page_guard = 0
+
+        while next_url and page_guard < 500:
+            page_guard += 1
+            next_url = urllib.parse.urljoin(current_url, next_url)
+            page_payload = read_url(next_url)
+            current_url = page_payload["url"]
+            page = json.loads(page_payload["content"].decode("utf-8"))
+            all_results.extend(page.get("results") or [])
+            next_url = page.get("next")
+
+        return {
+            "content": json.dumps({"results": all_results}).encode("utf-8"),
+            "content_type": "application/json",
+            "url": payload["url"],
+        }
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"KoboToolbox returned HTTP {error.code}: {detail}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Could not reach KoboToolbox: {error.reason}") from error
+
+
+def open_kobo_records_from_payload(payload):
+    content = payload["content"]
+    content_type = payload.get("content_type", "").lower()
+    source_url = payload.get("url", "").lower()
+
+    if "json" in content_type or "format=json" in source_url:
+        try:
+            parsed = json.loads(content.decode("utf-8"))
+        except Exception as error:
+            raise RuntimeError(f"KoboToolbox returned invalid JSON: {error}") from error
+
+        if isinstance(parsed, dict) and "results" in parsed:
+            return pd.json_normalize(parsed["results"]), None
+        if isinstance(parsed, list):
+            return pd.json_normalize(parsed), None
+        return pd.json_normalize(parsed), None
+
+    if "csv" in content_type or source_url.endswith(".csv"):
+        return pd.read_csv(io.BytesIO(content)), None
+
+    try:
+        workbook = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
+    except Exception as error:
+        raise RuntimeError(
+            "Could not read KoboToolbox response as Excel, CSV, or JSON. "
+            "Use a direct Kobo API data URL or a saved export data_url_xlsx/data_url_csv."
+        ) from error
+
+    data_sheet = "cleaned_data" if "cleaned_data" in workbook.sheet_names else workbook.sheet_names[0]
+    records = workbook.parse(data_sheet)
+    mapping = None
+    if "Column Mapping" in workbook.sheet_names:
+        try:
+            mapping = workbook.parse("Column Mapping")
+        except Exception:
+            mapping = None
+    return records, mapping
 
 
 def build_label_map(mapping, prefix):
@@ -1018,48 +1159,36 @@ def build_label_map(mapping, prefix):
     return label_map
 
 
-@st.cache_data(show_spinner="Loading latest helpdesk dataset...", persist="disk")
-def load_data(file_signature):
-    if not DATA_FILE_PATH.exists():
-        st.error(f"File not found: {DATA_FILE_PATH}")
+@st.cache_data(ttl=KOBO_CACHE_TTL_SECONDS, show_spinner="Loading latest helpdesk dataset...")
+def load_data(source_signature):
+    config = get_kobo_config()
+    try:
+        payload = fetch_kobo_payload(config["export_url"], config["api_token"])
+        records, mapping = open_kobo_records_from_payload(payload)
+    except Exception as error:
+        st.error(f"Could not load KoboToolbox data: {error}")
         st.stop()
 
-    # Fast path for deployed apps: load already-processed data if a matching
-    # processed cache exists. This avoids reparsing Excel and rerunning all
-    # transformations on Streamlit Cloud cold starts. Generate this cache once
-    # locally by running the app, then commit data/processed/helpdesk_processed_cache.pkl.
-    processed_cache_key = {
-        "version": PROCESSED_CACHE_VERSION,
-        # Use file size, not modified time, so a cache generated locally and
-        # committed to GitHub can still match after Streamlit Cloud checkout
-        # changes file timestamps.
-        "source_size": file_signature[2],
-    }
-    if PROCESSED_CACHE_PATH.exists():
-        try:
-            with PROCESSED_CACHE_PATH.open("rb") as cache_file:
-                cached_payload = pickle.load(cache_file)
-            if cached_payload.get("cache_key") == processed_cache_key:
-                return cached_payload["data"]
-        except Exception:
-            # If the processed cache is stale/corrupt, fall back to rebuilding
-            # from Excel rather than blocking the app.
-            pass
+    if mapping is None:
+        mapping = pd.DataFrame()
 
     try:
-        workbook = pd.ExcelFile(DATA_FILE_PATH)
+        records = records.copy()
     except Exception as error:
-        st.error(f"Could not open the workbook: {error}")
+        st.error(f"Could not prepare source records: {error}")
         st.stop()
 
-    data_sheet = "cleaned_data" if "cleaned_data" in workbook.sheet_names else workbook.sheet_names[0]
-    records = workbook.parse(data_sheet)
-    mapping = None
-    if "Column Mapping" in workbook.sheet_names:
-        try:
-            mapping = workbook.parse("Column Mapping")
-        except Exception:
-            mapping = None
+    if records.empty:
+        st.error("The selected data source returned no records.")
+        st.stop()
+
+    records.columns = [str(column).replace("/", "_").strip() for column in records.columns]
+    records.columns = [re.sub(r"[^A-Za-z0-9_]+", "_", column).strip("_") for column in records.columns]
+    records.columns = [re.sub(r"_+", "_", column).lower() for column in records.columns]
+    if "interview_date" not in records.columns and "_submission_time" in records.columns:
+        records["interview_date"] = records["_submission_time"]
+    if "record_id" not in records.columns:
+        records["record_id"] = records.get("_id", records.index.astype(str))
 
     required_columns = [
         "interview_date",
@@ -1311,22 +1440,6 @@ def load_data(file_signature):
     )
 
     processed_data = (dashboard_records, secure_records, protection, information, referrals, kpis)
-    try:
-        PROCESSED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with PROCESSED_CACHE_PATH.open("wb") as cache_file:
-            pickle.dump(
-                {
-                    "cache_key": processed_cache_key,
-                    "data": processed_data,
-                },
-                cache_file,
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
-    except Exception:
-        # Processed-cache writing is an optimization only; the app should still
-        # work even when the filesystem is read-only.
-        pass
-
     return processed_data
 
 # -----------------------------------------------------------------------------
@@ -2022,8 +2135,8 @@ def cpv_work_summary(frame):
 # App
 # -----------------------------------------------------------------------------
 load_css()
-file_signature = data_file_signature(DATA_FILE_PATH)
-records, secure_records, protection, information, referrals, kpis = load_data(file_signature)
+source_signature = data_source_signature()
+records, secure_records, protection, information, referrals, kpis = load_data(source_signature)
 
 if records.empty:
     st.error("No valid dashboard records were found in the source file.")
@@ -2137,7 +2250,7 @@ if "staff_name" in filtered_records.columns:
     staff_no = int(harmonized_staff[harmonized_staff.ne("[Not recorded]")].nunique())
 else:
     staff_no = 0
-last_updated = file_signature[3] if file_signature[3] else "Unknown"
+last_updated = source_signature[3] if source_signature[3] else "Unknown"
 
 st.markdown(
     f"""
