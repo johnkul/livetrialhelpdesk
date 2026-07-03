@@ -420,10 +420,19 @@ def load_css():
 
 
 def clean_text(value):
-    if pd.isna(value):
+    if isinstance(value, (list, tuple, set)):
+        values = [clean_text(part) for part in value]
+        values = [str(part) for part in values if not pd.isna(part)]
+        return ", ".join(values) if values else pd.NA
+    try:
+        if pd.isna(value):
+            return pd.NA
+    except (TypeError, ValueError):
         return pd.NA
     value = str(value).strip()
-    return pd.NA if value == "" else " ".join(value.split())
+    value = " ".join(value.split())
+    missing_values = {"", "nan", "none", "null", "missing", "[missing]", "not recorded", "[not recorded]", "n/a", "na"}
+    return pd.NA if value.lower() in missing_values else value
 
 
 def normalize_response(value):
@@ -923,16 +932,30 @@ def normalize_request_category(value):
     if normalized is None:
         return pd.NA
 
-    if "general" in normalized and "information" in normalized:
-        return "Seeking general protection information"
-    if "information" in normalized and "concern" not in normalized:
-        return "Seeking general protection information"
-    if "protection" in normalized and "concern" in normalized:
+    if "reporting a protection concern" in normalized:
         return "Reporting a protection concern"
-    if normalized in {"concern", "protection", "reporting protection concern"}:
+    if "seeking general protection information" in normalized:
+        return "Seeking general protection information"
+    if normalized in {"protection concern", "concern", "protection", "reporting protection concern"}:
         return "Reporting a protection concern"
+    if normalized in {"general protection information", "general information", "information", "seeking information"}:
+        return "Seeking general protection information"
 
-    return str(value)
+    has_concern = "concern" in normalized
+    has_information = "information" in normalized
+    has_reporting = "reporting" in normalized
+    has_seeking = "seeking" in normalized
+
+    if has_concern and not has_information:
+        return "Reporting a protection concern"
+    if has_reporting and "protection" in normalized and not has_seeking:
+        return "Reporting a protection concern"
+    if has_information and not has_concern and not has_reporting:
+        return "Seeking general protection information"
+    if has_seeking and has_information and not has_reporting:
+        return "Seeking general protection information"
+
+    return pd.NA
 
 
 def normalize_yes_no(value):
@@ -1026,17 +1049,29 @@ def is_host_community(value):
     return bool(value and "host" in value and "community" in value)
 
 
+def village_needs_camp_prefix(village):
+    normalized = normalize_response(village)
+    if not normalized:
+        return False
+    known_place_terms = {"kalobeyei", "hagadera", "dagahaley", "ifo", "kakuma", "reception", "community"}
+    if any(term in normalized for term in known_place_terms):
+        return False
+    return normalized.isdigit() or normalized.startswith("village") or normalized.startswith("block")
+
+
 def derive_linked_helpdesk_location(row):
     household_type = row.get("household_type")
     camp_location = clean_text(row.get("camp_location"))
     helpdesk_camp = clean_text(row.get("helpdesk_camp_location"))
     helpdesk_village = clean_text(row.get("helpdesk_village"))
-    if is_host_community(household_type):
-        return f"Host community - {camp_location}" if not pd.isna(camp_location) else "Host community"
+    if not pd.isna(helpdesk_village):
+        if not pd.isna(helpdesk_camp) and village_needs_camp_prefix(helpdesk_village):
+            return f"{helpdesk_camp} {helpdesk_village}"
+        return helpdesk_village
     if not pd.isna(helpdesk_camp):
         return helpdesk_camp
-    if not pd.isna(helpdesk_village):
-        return helpdesk_village
+    if is_host_community(household_type):
+        return f"Host community - {camp_location}" if not pd.isna(camp_location) else "Host community"
     return "[Not recorded]"
 
 
@@ -1597,6 +1632,14 @@ def expand_select_multiple_parent(frame, source_column, aliases):
         frame.loc[selected_mask, target] = 1
 
 
+def row_has_detail(value):
+    value = clean_text(value)
+    if pd.isna(value):
+        return False
+    normalized = normalize_response(value)
+    return normalized not in {"0", "false", "no", "n", "none", "not selected", "unchecked"}
+
+
 def build_label_map(mapping, prefix):
     label_map = {
         column: label
@@ -1715,9 +1758,6 @@ def load_data(source_signature):
         "information_seeker_gender"
     ].fillna("[Missing]")
 
-    records["request_category"] = records["request_type_protection_or_information"].map(normalize_request_category)
-    request_missing = records["request_category"].isna()
-
     protection_indicator_cols = [
         col
         for col in records.columns
@@ -1729,17 +1769,21 @@ def load_data(source_signature):
         if col.startswith("info_") and not col.endswith("_specify")
     ]
 
-    has_protection_detail = records.get("main_protection_concern", pd.Series(pd.NA, index=records.index)).map(clean_text).notna()
+    records["request_category"] = records["request_type_protection_or_information"].map(normalize_request_category)
+
+    has_protection_detail = records.get("main_protection_concern", pd.Series(pd.NA, index=records.index)).map(row_has_detail)
     if protection_indicator_cols:
         protection_selected = records[protection_indicator_cols].apply(lambda column: column.map(is_selected_indicator))
         has_protection_detail = has_protection_detail | protection_selected.any(axis=1)
 
-    has_information_detail = records.get("general_information_type", pd.Series(pd.NA, index=records.index)).map(clean_text).notna()
+    has_information_detail = records.get("general_information_type", pd.Series(pd.NA, index=records.index)).map(row_has_detail)
     if information_indicator_cols:
         information_selected = records[information_indicator_cols].apply(lambda column: column.map(is_selected_indicator))
         has_information_detail = has_information_detail | information_selected.any(axis=1)
 
+    request_missing = records["request_category"].isna() | records["request_category"].map(clean_text).isna()
     records.loc[request_missing & has_protection_detail, "request_category"] = "Reporting a protection concern"
+    request_missing = records["request_category"].isna() | records["request_category"].map(clean_text).isna()
     records.loc[request_missing & ~has_protection_detail & has_information_detail, "request_category"] = "Seeking general protection information"
     records["request_category"] = records["request_category"].fillna("[Missing]")
     records["action_taken_clean"] = records["action_taken"].map(normalize_action_taken)
