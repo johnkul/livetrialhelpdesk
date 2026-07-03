@@ -87,7 +87,8 @@ WGQ_DISABILITY_DOMAINS = {
 ADULT_DISABILITY_CATEGORY_COLUMNS = ["information_seeker_disability_type_other"]
 
 PROTECTION_SELECT_ALIASES = [
-    ("no_access_to_non_food_items", "concern_no_access_nfi"),
+    ("no_access_to_non_food_items", "concern_no_access_nf"),
+    ("no_access_nf", "concern_no_access_nf"),
     ("medical_assistive_devices", "concern_child_needs_assistive_devices"),
     ("no_access_food", "concern_no_access_food"),
     ("parental_neglect", "concern_parental_neglect"),
@@ -99,6 +100,7 @@ PROTECTION_SELECT_ALIASES = [
     ("school_dropout_risk_or_dropped_out", "concern_school_dropout_risk_or_dropped_out"),
     ("intimate_partner_violence", "concern_intimate_partner_violence"),
     ("dangerous_child_work", "concern_dangerous_child_work"),
+    ("contact_with_the_law", "concern_child_contact_with_law"),
     ("conflict_with_the_law", "concern_child_conflict_with_law"),
     ("in_conflict_with_the_law", "concern_child_conflict_with_law"),
     ("civil_registration_services", "concern_civil_registration_services"),
@@ -117,6 +119,7 @@ INFORMATION_SELECT_ALIASES = [
     ("access_to_durable_solutions", "info_durable_solutions"),
     ("access_to_core_relief_items_cris", "info_core_relief_items"),
     ("access_to_food_from_wfp", "info_food_access"),
+    ("access_to_shelter", "info_shelter_access"),
     ("access_to_livelihood_and_empowerment_opportunities", "info_livelihood_empowerment"),
     ("access_to_medical_services", "info_medical_services"),
     ("access_to_disability_support_services", "info_disability_support_services"),
@@ -143,6 +146,55 @@ REFERRAL_SELECT_ALIASES = [
 
 SELECT_MULTIPLE_ALIASES = PROTECTION_SELECT_ALIASES + INFORMATION_SELECT_ALIASES + REFERRAL_SELECT_ALIASES
 KNOWN_SELECT_MULTIPLE_COLUMNS = {target for _, target in SELECT_MULTIPLE_ALIASES}
+
+DEFAULT_LABEL_MAP = {
+    "concern_no_access_nf": "No access to non-food items",
+    "concern_child_needs_assistive_devices": "Child/family needs assistive devices",
+    "concern_no_access_food": "No access to food",
+    "concern_parental_neglect": "Parental neglect",
+    "concern_child_abandonment": "Child abandonment",
+    "concern_child_custody": "Child custody related concerns",
+    "concern_physical_violence": "Physical violence",
+    "concern_sexual_violence": "Sexual violence",
+    "concern_educational_support": "Educational support",
+    "concern_school_dropout_risk_or_dropped_out": "School dropout risk / dropped out",
+    "concern_intimate_partner_violence": "Intimate partner violence",
+    "concern_dangerous_child_work": "Engaging in dangerous work for pay",
+    "concern_child_contact_with_law": "Child in contact with the law",
+    "concern_child_conflict_with_law": "Child in conflict with the law",
+    "concern_civil_registration_services": "Civil registration services",
+    "concern_shelter_need": "Shelter need",
+    "concern_medical_support": "Medical support",
+    "concern_lacking_parental_care_unaccompanied": "Lacking parental care / unaccompanied",
+    "concern_unhcr_profiling_registration": "UNHCR profiling / registration",
+    "concern_psychosocial_support": "Psychosocial support",
+    "concern_other_not_listed": "Other Not Listed",
+    "info_child_protection_services": "Child protection services",
+    "info_gbv_support_services": "GBV support services",
+    "info_legal_services": "Legal services",
+    "info_durable_solutions": "Durable solutions",
+    "info_core_relief_items": "Core relief items",
+    "info_food_access": "Food access",
+    "info_shelter_access": "Shelter access",
+    "info_livelihood_empowerment": "Livelihood and empowerment",
+    "info_medical_services": "Medical services",
+    "info_disability_support_services": "Disability support services",
+    "info_wash_access": "WASH services",
+    "info_other_not_listed": "Other Not Listed",
+    "ref_partner_drs": "DRS",
+    "ref_partner_unhcr": "UNHCR",
+    "ref_partner_sci": "SCI",
+    "ref_partner_nrc": "NRC",
+    "ref_partner_irc": "IRC",
+    "ref_partner_rck": "RCK",
+    "ref_partner_lwf": "LWF",
+    "ref_partner_hi": "HI",
+    "ref_partner_drc": "DRC",
+    "ref_partner_pwj": "PWJ",
+    "ref_partner_dcs": "DCS",
+    "ref_partner_fak": "FAK",
+    "ref_partner_other": "OTHER NOT LISTED",
+}
 
 FIELD_ALIASES = {
     "staff_name": ["staff_name", "name_of_staff_filling_form"],
@@ -882,6 +934,44 @@ def normalize_request_category(value):
     return str(value)
 
 
+def normalize_yes_no(value):
+    value = clean_text(value)
+    if pd.isna(value):
+        return pd.NA
+    normalized = normalize_response(value)
+    if normalized in {"yes", "y", "true", "1"}:
+        return "Yes"
+    if normalized in {"no", "n", "false", "0"}:
+        return "No"
+    return str(value)
+
+
+def normalize_action_taken(value):
+    value = clean_text(value)
+    if pd.isna(value):
+        return pd.NA
+    normalized = normalize_response(value)
+    normalized_compact = normalized.replace(" ", "_") if normalized else ""
+
+    partner_terms = {"case_referred_to_partner_agencies", "case_referred_partner_agencies"}
+    tdh_terms = {"case_referrred_to_tdh_national_staff", "case_referred_to_tdh_national_staff"}
+    counselling_terms = {
+        "case_not_referred_to_any_partner_but_information_counselling_provided",
+        "information_counselling_provided",
+    }
+    no_action_terms = {"action_not_taken_at_all", "no_action_taken"}
+
+    if normalized_compact in partner_terms or ("partner" in normalized and "refer" in normalized):
+        return "Case referred to partner agencies"
+    if normalized_compact in tdh_terms or ("tdh" in normalized and "refer" in normalized):
+        return "Case referrred to Tdh national staff"
+    if normalized_compact in counselling_terms or ("counselling" in normalized and "not referred" in normalized):
+        return "Case not referred to any partner BUT information counselling provided"
+    if normalized_compact in no_action_terms or ("action" in normalized and "not" in normalized and "taken" in normalized):
+        return "Action not taken at all"
+    return str(value)
+
+
 def is_selected_indicator(value):
     if isinstance(value, (list, tuple, set)):
         return len(value) > 0
@@ -1463,20 +1553,26 @@ def select_value_matches(value, aliases):
     else:
         if not value_is_present(value):
             return False
-        raw_parts = re.split(r"[\s,;|]+", str(value))
+        raw_parts = re.split(r"[\s,;|/]+", str(value))
         raw_parts.append(str(value))
 
     normalized_parts = {normalize_response(part) for part in raw_parts if value_is_present(part)}
     normalized_parts.discard(None)
     normalized_full = normalize_response(" ".join(str(part) for part in raw_parts if value_is_present(part))) or ""
+    compact_full = normalized_full.replace(" ", "_")
 
     for alias in aliases:
         alias_norm = normalize_response(alias)
         if not alias_norm:
             continue
+        alias_compact = alias_norm.replace(" ", "_")
         if alias_norm in normalized_parts:
             return True
         if f" {alias_norm} " in f" {normalized_full} ":
+            return True
+        if alias_compact in {part.replace(" ", "_") for part in normalized_parts}:
+            return True
+        if alias_compact and alias_compact in compact_full:
             return True
     return False
 
@@ -1491,6 +1587,8 @@ def expand_select_multiple_parent(frame, source_column, aliases):
             needle,
             target,
             re.sub(r"^(concern|info|ref_partner)_", "", target),
+            re.sub(r"^(concern|info|ref_partner)_", "", target).replace("_", " "),
+            DEFAULT_LABEL_MAP.get(target, ""),
         }
         selected_mask = source_values.map(lambda value: select_value_matches(value, target_aliases))
         if target not in frame.columns:
@@ -1499,9 +1597,13 @@ def expand_select_multiple_parent(frame, source_column, aliases):
 
 
 def build_label_map(mapping, prefix):
+    label_map = {
+        column: label
+        for column, label in DEFAULT_LABEL_MAP.items()
+        if column.startswith(prefix) and not column.endswith("_specify")
+    }
     if mapping is None or mapping.empty or "cleaned_column_name" not in mapping.columns:
-        return {}
-    label_map = {}
+        return label_map
     selected = mapping[mapping["cleaned_column_name"].astype(str).str.startswith(prefix)]
     for _, row in selected.iterrows():
         cleaned_name = row["cleaned_column_name"]
@@ -1509,7 +1611,7 @@ def build_label_map(mapping, prefix):
             continue
         original_name = clean_text(row.get("original_column_name"))
         if pd.isna(original_name):
-            label = safe_label_from_code(cleaned_name)
+            label = DEFAULT_LABEL_MAP.get(cleaned_name, safe_label_from_code(cleaned_name))
         elif "/" in str(original_name):
             label = str(original_name).split("/", 1)[1].strip()
         else:
@@ -1639,8 +1741,8 @@ def load_data(source_signature):
     records.loc[request_missing & has_protection_detail, "request_category"] = "Reporting a protection concern"
     records.loc[request_missing & ~has_protection_detail & has_information_detail, "request_category"] = "Seeking general protection information"
     records["request_category"] = records["request_category"].fillna("[Missing]")
-    records["action_taken_clean"] = records["action_taken"].map(clean_text)
-    records["follow_up_required_clean"] = records["follow_up_required"].map(clean_text)
+    records["action_taken_clean"] = records["action_taken"].map(normalize_action_taken)
+    records["follow_up_required_clean"] = records["follow_up_required"].map(normalize_yes_no)
     records["helpdesk_location"] = records.apply(derive_linked_helpdesk_location, axis=1)
 
     records["adult_wgq_disability_domains"] = records.apply(derive_adult_wgq_disability_domains, axis=1)
@@ -2461,7 +2563,7 @@ def education_concern_followup_table(frame, referrals_frame):
     working = frame.copy()
     concern_mask = pd.Series(False, index=working.index)
     for col in available_concern_cols:
-        concern_mask = concern_mask | pd.to_numeric(working[col], errors="coerce").eq(1)
+        concern_mask = concern_mask | working[col].map(is_selected_indicator)
     working = working[concern_mask].copy()
 
     if working.empty:
@@ -2470,10 +2572,10 @@ def education_concern_followup_table(frame, referrals_frame):
     def selected_concern_labels(row):
         labels = []
         if "concern_educational_support" in row.index:
-            if pd.to_numeric(pd.Series([row.get("concern_educational_support")]), errors="coerce").iloc[0] == 1:
+            if is_selected_indicator(row.get("concern_educational_support")):
                 labels.append("Educational Support")
         if "concern_school_dropout_risk_or_dropped_out" in row.index:
-            if pd.to_numeric(pd.Series([row.get("concern_school_dropout_risk_or_dropped_out")]), errors="coerce").iloc[0] == 1:
+            if is_selected_indicator(row.get("concern_school_dropout_risk_or_dropped_out")):
                 labels.append("School Dropout Risk / Dropped Out")
         return "; ".join(labels)
 
