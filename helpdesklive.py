@@ -1496,13 +1496,26 @@ def open_kobo_records_from_payload(payload):
 
 def value_is_present(value):
     if isinstance(value, (list, tuple, set)):
-        return len(value) > 0
+        return any(value_is_present(part) for part in value)
     try:
         if pd.isna(value):
             return False
     except (TypeError, ValueError):
         pass
-    return str(value).strip() != ""
+    value = str(value).strip()
+    if not value:
+        return False
+    return value.lower() not in {
+        "nan",
+        "none",
+        "null",
+        "missing",
+        "[missing]",
+        "not recorded",
+        "[not recorded]",
+        "n/a",
+        "na",
+    }
 
 
 def populated_count(series):
@@ -2712,7 +2725,7 @@ with st.sidebar:
         st.rerun()
     action_col1, action_col2 = st.columns(2)
     with action_col1:
-        if st.button("↻ Refresh", use_container_width=True, help="Reload latest data from Excel"):
+        if st.button("↻ Refresh", use_container_width=True, help="Reload latest data from KoboToolbox"):
             st.cache_data.clear()
             st.rerun()
     with action_col2:
