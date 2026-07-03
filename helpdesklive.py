@@ -1469,10 +1469,6 @@ def load_data(source_signature):
     records["gender_age_correction_flag"] = records["information_seeker_gender_raw"].fillna("[Missing]") != records[
         "information_seeker_gender"
     ].fillna("[Missing]")
-    records["information_seeker_type"] = records["information_seeker_type"].fillna("[Missing]")
-    records["information_seeker_gender"] = records["information_seeker_gender"].fillna("[Missing]")
-    records["age_group"] = records["age_group"].fillna("[Missing]")
-    records["camp_location"] = records["camp_location"].map(clean_text).fillna("[Missing]")
 
     records["request_category"] = records["request_type_protection_or_information"].map(normalize_request_category)
     request_missing = records["request_category"].isna()
@@ -2517,7 +2513,7 @@ if "staff_name" in filtered_records.columns:
     staff_no = int(harmonized_staff[harmonized_staff.ne("[Not recorded]")].nunique())
 else:
     staff_no = 0
-last_updated = source_signature[3] if source_signature[3] else "Unknown"
+last_updated = source_signature[3] if source_signature[3] else "Kobo live data"
 
 st.markdown(
     f"""
