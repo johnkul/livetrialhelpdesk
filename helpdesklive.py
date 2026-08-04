@@ -4346,26 +4346,38 @@ HELPDESK_CATEGORY_LABELS = {
 
 
 def helpdesk_section_navigation():
+    """Render one compact navigation control for all dashboard views."""
     section_key = "helpdesk_section"
     category_key = "helpdesk_section_category"
     if section_key not in st.session_state or st.session_state[section_key] not in HELPDESK_SECTION_META:
         st.session_state[section_key] = "Overview"
-    current_category = next(category for category, views in HELPDESK_SECTION_GROUPS.items() if st.session_state[section_key] in views)
-    if category_key not in st.session_state or st.session_state[category_key] not in HELPDESK_SECTION_GROUPS:
-        st.session_state[category_key] = current_category
-    category = st.selectbox(
-        "**Dashboard section**", list(HELPDESK_SECTION_GROUPS), key=category_key,
-        format_func=lambda value: HELPDESK_CATEGORY_LABELS[value],
-        help="Choose a broad dashboard section, then select a view.",
+
+    selected = st.selectbox(
+        "**Explore dashboard**",
+        list(HELPDESK_SECTION_META),
+        key=section_key,
+        format_func=lambda value: (
+            f"{HELPDESK_SECTION_META[value][0]} {HELPDESK_SECTION_META[value][1]}"
+        ),
+        help="Choose any dashboard view. Type while the list is open to find a view quickly.",
     )
-    views = HELPDESK_SECTION_GROUPS[category]
-    if st.session_state[section_key] not in views:
-        st.session_state[section_key] = views[0]
-    return st.radio(
-        "View", views, key=section_key,
-        format_func=lambda value: f"{HELPDESK_SECTION_META[value][0]} {HELPDESK_SECTION_META[value][1]}",
-        help="Active filters remain in place when you change views.",
+    category = next(
+        category
+        for category, views in HELPDESK_SECTION_GROUPS.items()
+        if selected in views
     )
+    # Keep the legacy category state synchronized for saved sessions and reset
+    # behaviour, although navigation now uses one user-facing control.
+    st.session_state[category_key] = category
+    description = HELPDESK_SECTION_META[selected][2]
+    st.markdown(
+        f'<div class="sidebar-view-context">'
+        f'<div class="sidebar-view-group">{escape_text(category)}</div>'
+        f'<div class="sidebar-view-description">{escape_text(description)}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    return selected
 
 
 def helpdesk_section_intro(section, filtered_count):
@@ -4474,18 +4486,22 @@ def developer_logo_html():
 
 
 def show_footer():
-    st.markdown(
-        f"""
-        <div class="developer-footer">
-            <div class="developer-brand">
-                {developer_logo_html()}
-                <div><div class="developer-brand-name">ImpactLens Africa</div><div class="developer-brand-tagline">Turning Data Into Human Impact</div></div>
-            </div>
-            <div class="developer-credit"><div>Developed by <strong>John Kul</strong>, MEAL Officer-Tdh</div><div class="developer-version">{APP_VERSION} &middot; {APP_VERSION_DATE}</div></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    footer_html = (
+        '<div class="developer-footer">'
+        '<div class="developer-brand">'
+        f'{developer_logo_html()}'
+        '<div><div class="developer-brand-name">ImpactLens Africa</div>'
+        '<div class="developer-brand-tagline">Turning Data Into Human Impact</div></div>'
+        '</div>'
+        '<div class="developer-credit">'
+        '<div>Developed by <strong>John Kul</strong>, MEAL Officer-Tdh</div>'
+        f'<div class="developer-version">{APP_VERSION} &middot; {APP_VERSION_DATE}</div>'
+        '</div></div>'
     )
+    if hasattr(st, "html"):
+        st.html(footer_html)
+    else:
+        st.markdown(footer_html, unsafe_allow_html=True)
 
 
 def search_records(frame, query):
@@ -4883,7 +4899,6 @@ with st.sidebar:
         help="Clear filters and return to the Overview section.",
     )
 
-    st.markdown('<div class="sidebar-nav-title">Explore dashboard</div>', unsafe_allow_html=True)
     selected_tab = helpdesk_section_navigation()
     with st.expander("How to use this dashboard", expanded=False):
         st.markdown(
@@ -5138,18 +5153,18 @@ else:
     staff_no = 0
 last_updated = file_signature[3] if file_signature[3] else "Unknown"
 
-st.markdown(
-    f"""
-    <div class="app-header">
-        {tdh_logo_html()}
-        <div class="app-header-text">
-            <div class="app-header-title">Tdh Kenya Helpdesk Data Dashboard</div>
-            <div class="app-header-subtitle">Protection helpdesk monitoring &middot; Turkana West &amp; Dadaab</div>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
+header_html = (
+    '<div class="app-header">'
+    f'{tdh_logo_html()}'
+    '<div class="app-header-text">'
+    '<div class="app-header-title">Tdh Kenya Helpdesk Data Dashboard</div>'
+    '<div class="app-header-subtitle">Protection helpdesk monitoring &middot; Turkana West &amp; Dadaab</div>'
+    '</div></div>'
 )
+if hasattr(st, "html"):
+    st.html(header_html)
+else:
+    st.markdown(header_html, unsafe_allow_html=True)
 
 selection_pills_html = "".join([
     selection_pill("Camp", selected_camp_locations),

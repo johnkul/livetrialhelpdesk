@@ -1472,3 +1472,27 @@ section[data-testid="stSidebar"] [data-testid="stDateInput"] {
     margin: 1.35rem 0 0.8rem;
     border-top: 1px solid var(--line-soft);
 }
+
+/* Compact single-control dashboard navigation. */
+.sidebar-view-context {
+    margin: 0.45rem 0 0.95rem;
+    padding: 0.7rem 0.8rem;
+    border: 1px solid rgba(47, 125, 105, 0.20);
+    border-radius: 12px;
+    background: linear-gradient(135deg, var(--control-panel-strong), var(--control-panel));
+}
+
+.sidebar-view-group {
+    margin-bottom: 0.2rem;
+    color: var(--tdh-green-dark);
+    font-size: 0.72rem;
+    font-weight: 850;
+    letter-spacing: 0.055em;
+    text-transform: uppercase;
+}
+
+.sidebar-view-description {
+    color: var(--muted-2);
+    font-size: 0.82rem;
+    line-height: 1.4;
+}
