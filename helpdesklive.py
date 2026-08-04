@@ -4946,14 +4946,8 @@ with st.sidebar:
             fetch_kobo_form_contract.clear()
             load_data.clear()
             st.rerun()
-        auto_sync_enabled = st.toggle(
-            "Auto-sync every minute",
-            value=True,
-            key="helpdesk_auto_sync_enabled",
-            help="Refresh the dashboard automatically every 60 seconds while preserving filters.",
-        )
-        if auto_sync_enabled:
-            live_refresh_pulse()
+        # Keep near-live refresh active without adding another sidebar control.
+        live_refresh_pulse()
     else:
         st.caption("Using the local file fallback; live Kobo synchronization is unavailable.")
 
