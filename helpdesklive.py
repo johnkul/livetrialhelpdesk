@@ -1,16 +1,18 @@
 from pathlib import Path
 import base64
 import html
-import io
 import json
 import os
+import pickle
 import re
-import urllib.error
-import urllib.parse
-import urllib.request
+import time
+from collections.abc import Mapping
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
 
 import altair as alt
 import pandas as pd
+import requests
 import streamlit as st
 
 # -----------------------------------------------------------------------------
@@ -20,7 +22,849 @@ BASE_DIR = Path(__file__).resolve().parent
 LOGO_PATH = BASE_DIR / "assets" / "tdh-logo.png"
 DEVELOPER_LOGO_PATH = BASE_DIR / "assets" / "developer-logo.png"
 STYLES_PATH = BASE_DIR / "assets" / "styles.css"
-KOBO_CACHE_TTL_SECONDS = 300
+DATA_FILE_PATH = Path(os.environ.get("HELPDESK_DATA_PATH") or (BASE_DIR / "data" / "HELPDESK_DashboardData_Tdh_Kenya_D2.xlsx"))
+PROCESSED_CACHE_PATH = BASE_DIR / "data" / "processed" / "helpdesk_processed_cache.pkl"
+PROCESSED_CACHE_VERSION = "2026-08-04-kobo-v1"
+KOBO_CACHE_TTL_SECONDS = 900
+KOBO_SCHEMA_CACHE_TTL_SECONDS = 3600
+KOBO_REQUEST_TIMEOUT_SECONDS = 45
+KOBO_PAGE_SAFETY_LIMIT = 10000
+
+# Immutable schema contract: Kobo fields are matched by XML name/path or by
+# their survey label, never by column position. New form attributes remain
+# available for diagnostics without shifting any established dashboard field.
+COLUMN_MAPPING_RECORDS = [{'original_column_name': 'Having understood the information provided, do you consent to having your information '
+                          'recorded?',
+  'cleaned_column_name': 'consent_recording',
+  'field_group': 'collection_metadata',
+  'recommended_data_type': 'yes_no',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Name of staff filling form',
+  'cleaned_column_name': 'staff_name',
+  'field_group': 'collection_metadata',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'Yes',
+  'transformation_note': 'Sensitive/PII field; review before dashboard publication.'},
+ {'original_column_name': 'Enter a date',
+  'cleaned_column_name': 'interview_date',
+  'field_group': 'collection_metadata',
+  'recommended_data_type': 'date',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Who is the information seeker?',
+  'cleaned_column_name': 'information_seeker_type',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Name of the information seeker at the help desk',
+  'cleaned_column_name': 'information_seeker_name',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'Yes',
+  'transformation_note': 'Sensitive/PII field; review before dashboard publication.'},
+ {'original_column_name': 'Is the child Unaccompanied minor? ',
+  'cleaned_column_name': 'child_unaccompanied_minor',
+  'field_group': 'other',
+  'recommended_data_type': 'yes_no',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Relationship of the respondent to the child',
+  'cleaned_column_name': 'respondent_relationship_to_child',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'If relationship is not listed, please specify the relationship to child.',
+  'cleaned_column_name': 'respondent_relationship_other',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Household type',
+  'cleaned_column_name': 'household_type',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Camp location',
+  'cleaned_column_name': 'camp_location',
+  'field_group': 'location',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Specific Camp location hosting the helpdesk',
+  'cleaned_column_name': 'helpdesk_camp_location',
+  'field_group': 'location',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Section/Block hosting the helpdesk.',
+  'cleaned_column_name': 'helpdesk_section_block',
+  'field_group': 'location',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Village location hosting the helpdesk',
+  'cleaned_column_name': 'helpdesk_village',
+  'field_group': 'location',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'In which Neighborhood, Compound and House do you come from?',
+  'cleaned_column_name': 'residence_neighborhood_compound_house',
+  'field_group': 'location',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'Yes',
+  'transformation_note': 'Sensitive/PII field; review before dashboard publication.'},
+ {'original_column_name': 'Gender of the information seeker',
+  'cleaned_column_name': 'information_seeker_gender',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Age of the information seeker.',
+  'cleaned_column_name': 'information_seeker_age',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'number',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Nationality of the information seeker',
+  'cleaned_column_name': 'information_seeker_nationality',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'If nationality not listed above, please specify the nationality',
+  'cleaned_column_name': 'information_seeker_nationality_other',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Do you have a phone number that is in operation?',
+  'cleaned_column_name': 'has_operational_phone',
+  'field_group': 'other',
+  'recommended_data_type': 'yes_no',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Phone number of the information seeker',
+  'cleaned_column_name': 'information_seeker_phone',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'Yes',
+  'transformation_note': 'Sensitive/PII field; review before dashboard publication.'},
+ {'original_column_name': 'Alternative phone number',
+  'cleaned_column_name': 'alternative_phone',
+  'field_group': 'other',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'Yes',
+  'transformation_note': 'Sensitive/PII field; review before dashboard publication.'},
+ {'original_column_name': 'Are you registered with the UNHCR.',
+  'cleaned_column_name': 'registered_with_unhcr',
+  'field_group': 'other',
+  'recommended_data_type': 'yes_no',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Individual Number of the information seeker',
+  'cleaned_column_name': 'information_seeker_individual_number',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'Yes',
+  'transformation_note': 'Sensitive/PII field; review before dashboard publication.'},
+ {'original_column_name': 'Ration Card Number/ Wrist Band Number of the information seeker',
+  'cleaned_column_name': 'information_seeker_ration_or_wristband_number',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'Yes',
+  'transformation_note': 'Sensitive/PII field; review before dashboard publication.'},
+ {'original_column_name': 'Do you have any disability?',
+  'cleaned_column_name': 'has_disability',
+  'field_group': 'disability',
+  'recommended_data_type': 'yes_no',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': "What is the child's type of disability?",
+  'cleaned_column_name': 'child_disability_type',
+  'field_group': 'disability',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'If Other disability, please specify the type of disability for the child',
+  'cleaned_column_name': 'child_disability_type_other',
+  'field_group': 'disability',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': '[Do/Does] [you/he/she] have difficulty seeing, even if wearing glasses? Would you say… ',
+  'cleaned_column_name': 'difficulty_seeing',
+  'field_group': 'disability',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': '[Do/Does] [you/he/she] have difficulty hearing, even if using a hearing aid(s)? Would you '
+                          'say… ',
+  'cleaned_column_name': 'difficulty_hearing',
+  'field_group': 'disability',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': '[Do/Does] [you/he/she] have difficulty walking or climbing steps? Would you say… ',
+  'cleaned_column_name': 'difficulty_walking_or_climbing',
+  'field_group': 'disability',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': '[Do/does] [you/he/she] have difficulty with self-care, such as washing all over or '
+                          'dressing? Would you say…',
+  'cleaned_column_name': 'difficulty_self_care',
+  'field_group': 'disability',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': '[Do/does] [you/he/she] have difficulty remembering or concentrating? Would you say… ',
+  'cleaned_column_name': 'difficulty_remembering_or_concentrating',
+  'field_group': 'disability',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Using [your/his/her] usual language, [do/does] [you/he/she] have difficulty communicating, '
+                          'for example understanding or being understood? Would you say…',
+  'cleaned_column_name': 'difficulty_communicating',
+  'field_group': 'disability',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Other disability type of the information seeker if not answered by the Questions provided?',
+  'cleaned_column_name': 'information_seeker_disability_type_other',
+  'field_group': 'respondent_profile',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Have you been to any of Tdh`s helpdesks before?',
+  'cleaned_column_name': 'visited_tdh_helpdesk_before',
+  'field_group': 'other',
+  'recommended_data_type': 'yes_no',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Was your last visit made within the month we are in?',
+  'cleaned_column_name': 'last_visit_within_current_month',
+  'field_group': 'other',
+  'recommended_data_type': 'yes_no',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Is the individual reporting a protection concern or seeking general protection information',
+  'cleaned_column_name': 'request_type_protection_or_information',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk',
+  'cleaned_column_name': 'main_protection_concern',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Families with limited / No access to '
+                          'non-food items (Beddings, Mats, Plastic jerrycans)',
+  'cleaned_column_name': 'concern_no_access_nfi',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Children in need of disability assistive '
+                          'devices',
+  'cleaned_column_name': 'concern_child_needs_assistive_devices',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child (ren)/ Families with limited / No '
+                          'access to food commodities',
+  'cleaned_column_name': 'concern_no_access_food',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Parental Neglect',
+  'cleaned_column_name': 'concern_parental_neglect',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child Abandonment',
+  'cleaned_column_name': 'concern_child_abandonment',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child custody related concerns',
+  'cleaned_column_name': 'concern_child_custody',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child at risk of / experiencing physical '
+                          'violence',
+  'cleaned_column_name': 'concern_physical_violence',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child (ren) at risk of / experiencing '
+                          'sexual violence (Child marriage, FGM, Indecent touch, Sodomy)',
+  'cleaned_column_name': 'concern_sexual_violence',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Children in need of educational support',
+  'cleaned_column_name': 'concern_educational_support',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child (ren) at the risk of dropping out '
+                          'of school/ Have already dropped out',
+  'cleaned_column_name': 'concern_school_dropout_risk_or_dropped_out',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Intimate partner violence',
+  'cleaned_column_name': 'concern_intimate_partner_violence',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child (ren) engaging in dangerous work '
+                          'for pay',
+  'cleaned_column_name': 'concern_dangerous_child_work',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child (ren) in contact with the law',
+  'cleaned_column_name': 'concern_child_contact_with_law',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child (ren) in conflict with the law',
+  'cleaned_column_name': 'concern_child_conflict_with_law',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child in need of civil registration '
+                          'services (E.g. Birth certificates)',
+  'cleaned_column_name': 'concern_civil_registration_services',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child (ren) / families in need of shelter',
+  'cleaned_column_name': 'concern_shelter_need',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child (ren) in need of medical support',
+  'cleaned_column_name': 'concern_medical_support',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child lacking parental care / '
+                          'Unaccompanied minors',
+  'cleaned_column_name': 'concern_lacking_parental_care_unaccompanied',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Persons in need of profiling/registration '
+                          'by UNHCR',
+  'cleaned_column_name': 'concern_unhcr_profiling_registration',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Child(ren) in need of psychosocial '
+                          'support services',
+  'cleaned_column_name': 'concern_psychosocial_support',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'MAIN protection concern presented at the helpdesk/Protection_concerns not listed',
+  'cleaned_column_name': 'concern_other_not_listed',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'If protection_concerns not listed, specify the protection concerns presented.',
+  'cleaned_column_name': 'concern_other_specify',
+  'field_group': 'protection_concern',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Protection concern field renamed with concern_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought',
+  'cleaned_column_name': 'general_information_type',
+  'field_group': 'general_information',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Type of general protection information sought/Information on access to Child Protective '
+                          'services',
+  'cleaned_column_name': 'info_child_protection_services',
+  'field_group': 'general_information',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought/Information on access to Gender based '
+                          'Violence (GBV) support services',
+  'cleaned_column_name': 'info_gbv_support_services',
+  'field_group': 'general_information',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought/Information on access to legal services',
+  'cleaned_column_name': 'info_legal_services',
+  'field_group': 'general_information',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought/Information on access to durable solutions '
+                          '(Resettlement, Voluntary Repatriation, Local intergration)',
+  'cleaned_column_name': 'info_durable_solutions',
+  'field_group': 'general_information',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought/Information on access to core -relief items '
+                          '(NFI)',
+  'cleaned_column_name': 'info_core_relief_items',
+  'field_group': 'general_information',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought/Information on access to food from WFP and '
+                          'relevant partners.',
+  'cleaned_column_name': 'info_food_access',
+  'field_group': 'general_information',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought/Information on access to shelter',
+  'cleaned_column_name': 'info_shelter_access',
+  'field_group': 'general_information',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought/Information on access to livelihood and '
+                          'empowerment opportunities',
+  'cleaned_column_name': 'info_livelihood_empowerment',
+  'field_group': 'general_information',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought/Information on access to medical services',
+  'cleaned_column_name': 'info_medical_services',
+  'field_group': 'general_information',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought/Information on disability support services',
+  'cleaned_column_name': 'info_disability_support_services',
+  'field_group': 'disability',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought/Information on access to WASH',
+  'cleaned_column_name': 'info_wash_access',
+  'field_group': 'general_information',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Type of general protection information sought/General_protection not in the list',
+  'cleaned_column_name': 'info_other_not_listed',
+  'field_group': 'general_information',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'If general_protection not in the list, please specify the general protection information '
+                          'sought.',
+  'cleaned_column_name': 'info_other_specify',
+  'field_group': 'general_information',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'General information field renamed with info_ prefix.'},
+ {'original_column_name': 'Action Taken',
+  'cleaned_column_name': 'action_taken',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'If Action taken is Other, please specify',
+  'cleaned_column_name': 'action_taken_other_specify',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'On what date was the case referred',
+  'cleaned_column_name': 'referral_date',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'date',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Which partner has the case been referred to',
+  'cleaned_column_name': 'referred_partner',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Which partner has the case been referred to/Department of Refugee Services (DRS)',
+  'cleaned_column_name': 'ref_partner_drs',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/UNHCR',
+  'cleaned_column_name': 'ref_partner_unhcr',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/Save the Children (SCI)',
+  'cleaned_column_name': 'ref_partner_sci',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/Norwegian Refugee Council (NRC)',
+  'cleaned_column_name': 'ref_partner_nrc',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/International Rescue Commitee (IRC)',
+  'cleaned_column_name': 'ref_partner_irc',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/Refugee Consortium of Kenya (RCK)',
+  'cleaned_column_name': 'ref_partner_rck',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/Lutheran World Federation (LWF)',
+  'cleaned_column_name': 'ref_partner_lwf',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/Humanity and Inclusion (HI)',
+  'cleaned_column_name': 'ref_partner_hi',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/Danish Refugee Council (DRC)',
+  'cleaned_column_name': 'ref_partner_drc',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/Peace Winds Japan',
+  'cleaned_column_name': 'ref_partner_pwj',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/Directorate of Children Services (DCS)',
+  'cleaned_column_name': 'ref_partner_dcs',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/Film Aid Kenya (FAK)',
+  'cleaned_column_name': 'ref_partner_fak',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'multi_select_indicator',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which partner has the case been referred to/Other partners',
+  'cleaned_column_name': 'ref_partner_other',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'If Other, please specify the partner the case was referred to.',
+  'cleaned_column_name': 'ref_partner_other_specify',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Referral partner field renamed with ref_partner_ prefix.'},
+ {'original_column_name': 'Which department has the case been referred to?',
+  'cleaned_column_name': 'referred_department',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'If External, please specify the name of the agency referred to.',
+  'cleaned_column_name': 'external_agency_specify',
+  'field_group': 'referral_action',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'Any follow up action required ?',
+  'cleaned_column_name': 'follow_up_required',
+  'field_group': 'follow_up',
+  'recommended_data_type': 'yes_no',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': 'If Yes, what is the follow up action?',
+  'cleaned_column_name': 'follow_up_action',
+  'field_group': 'follow_up',
+  'recommended_data_type': 'text/category',
+  'sensitive_or_pii': 'No',
+  'transformation_note': 'Renamed to concise snake_case for dashboard/model use.'},
+ {'original_column_name': '_GPS Location_latitude',
+  'cleaned_column_name': 'gps_latitude',
+  'field_group': 'location',
+  'recommended_data_type': 'decimal',
+  'sensitive_or_pii': 'Yes',
+  'transformation_note': 'Sensitive/PII field; review before dashboard publication.'},
+ {'original_column_name': '_GPS Location_longitude',
+  'cleaned_column_name': 'gps_longitude',
+  'field_group': 'location',
+  'recommended_data_type': 'decimal',
+  'sensitive_or_pii': 'Yes',
+  'transformation_note': 'Sensitive/PII field; review before dashboard publication.'}]
+RAW_TO_TRANSFORMED_COLUMNS = {'Having understood the information provided, do you consent to having your information recorded?': 'consent_recording',
+ 'Name of staff filling form': 'staff_name',
+ 'Enter a date': 'interview_date',
+ 'Who is the information seeker?': 'information_seeker_type',
+ 'Name of the information seeker at the help desk': 'information_seeker_name',
+ 'Is the child Unaccompanied minor? ': 'child_unaccompanied_minor',
+ 'Relationship of the respondent to the child': 'respondent_relationship_to_child',
+ 'If relationship is not listed, please specify the relationship to child.': 'respondent_relationship_other',
+ 'Household type': 'household_type',
+ 'Camp location': 'camp_location',
+ 'Specific Camp location hosting the helpdesk': 'helpdesk_camp_location',
+ 'Section/Block hosting the helpdesk.': 'helpdesk_section_block',
+ 'Village location hosting the helpdesk': 'helpdesk_village',
+ 'In which Neighborhood, Compound and House do you come from?': 'residence_neighborhood_compound_house',
+ 'Gender of the information seeker': 'information_seeker_gender',
+ 'Age of the information seeker.': 'information_seeker_age',
+ 'Nationality of the information seeker': 'information_seeker_nationality',
+ 'If nationality not listed above, please specify the nationality': 'information_seeker_nationality_other',
+ 'Do you have a phone number that is in operation?': 'has_operational_phone',
+ 'Phone number of the information seeker': 'information_seeker_phone',
+ 'Alternative phone number': 'alternative_phone',
+ 'Are you registered with the UNHCR.': 'registered_with_unhcr',
+ 'Individual Number of the information seeker': 'information_seeker_individual_number',
+ 'Ration Card Number/ Wrist Band Number of the information seeker': 'information_seeker_ration_or_wristband_number',
+ 'Do you have any disability?': 'has_disability',
+ "What is the child's type of disability?": 'child_disability_type',
+ 'If Other disability, please specify the type of disability for the child': 'child_disability_type_other',
+ '[Do/Does] [you/he/she] have difficulty seeing, even if wearing glasses? Would you say… ': 'difficulty_seeing',
+ '[Do/Does] [you/he/she] have difficulty hearing, even if using a hearing aid(s)? Would you say… ': 'difficulty_hearing',
+ '[Do/Does] [you/he/she] have difficulty walking or climbing steps? Would you say… ': 'difficulty_walking_or_climbing',
+ '[Do/does] [you/he/she] have difficulty with self-care, such as washing all over or dressing? Would you say…': 'difficulty_self_care',
+ '[Do/does] [you/he/she] have difficulty remembering or concentrating? Would you say… ': 'difficulty_remembering_or_concentrating',
+ 'Using [your/his/her] usual language, [do/does] [you/he/she] have difficulty communicating, for example understanding or being understood? Would you say…': 'difficulty_communicating',
+ 'Other disability type of the information seeker if not answered by the Questions provided?': 'information_seeker_disability_type_other',
+ 'Have you been to any of Tdh`s helpdesks before?': 'visited_tdh_helpdesk_before',
+ 'Was your last visit made within the month we are in?': 'last_visit_within_current_month',
+ 'Is the individual reporting a protection concern or seeking general protection information': 'request_type_protection_or_information',
+ 'MAIN protection concern presented at the helpdesk': 'main_protection_concern',
+ 'MAIN protection concern presented at the helpdesk/Families with limited / No access to non-food items (Beddings, Mats, Plastic jerrycans)': 'concern_no_access_nfi',
+ 'MAIN protection concern presented at the helpdesk/Children in need of disability assistive devices': 'concern_child_needs_assistive_devices',
+ 'MAIN protection concern presented at the helpdesk/Child (ren)/ Families with limited / No access to food commodities': 'concern_no_access_food',
+ 'MAIN protection concern presented at the helpdesk/Parental Neglect': 'concern_parental_neglect',
+ 'MAIN protection concern presented at the helpdesk/Child Abandonment': 'concern_child_abandonment',
+ 'MAIN protection concern presented at the helpdesk/Child custody related concerns': 'concern_child_custody',
+ 'MAIN protection concern presented at the helpdesk/Child at risk of / experiencing physical violence': 'concern_physical_violence',
+ 'MAIN protection concern presented at the helpdesk/Child (ren) at risk of / experiencing sexual violence (Child marriage, FGM, Indecent touch, Sodomy)': 'concern_sexual_violence',
+ 'MAIN protection concern presented at the helpdesk/Children in need of educational support': 'concern_educational_support',
+ 'MAIN protection concern presented at the helpdesk/Child (ren) at the risk of dropping out of school/ Have already dropped out': 'concern_school_dropout_risk_or_dropped_out',
+ 'MAIN protection concern presented at the helpdesk/Intimate partner violence': 'concern_intimate_partner_violence',
+ 'MAIN protection concern presented at the helpdesk/Child (ren) engaging in dangerous work for pay': 'concern_dangerous_child_work',
+ 'MAIN protection concern presented at the helpdesk/Child (ren) in contact with the law': 'concern_child_contact_with_law',
+ 'MAIN protection concern presented at the helpdesk/Child (ren) in conflict with the law': 'concern_child_conflict_with_law',
+ 'MAIN protection concern presented at the helpdesk/Child in need of civil registration services (E.g. Birth certificates)': 'concern_civil_registration_services',
+ 'MAIN protection concern presented at the helpdesk/Child (ren) / families in need of shelter': 'concern_shelter_need',
+ 'MAIN protection concern presented at the helpdesk/Child (ren) in need of medical support': 'concern_medical_support',
+ 'MAIN protection concern presented at the helpdesk/Child lacking parental care / Unaccompanied minors': 'concern_lacking_parental_care_unaccompanied',
+ 'MAIN protection concern presented at the helpdesk/Persons in need of profiling/registration by UNHCR': 'concern_unhcr_profiling_registration',
+ 'MAIN protection concern presented at the helpdesk/Child(ren) in need of psychosocial support services': 'concern_psychosocial_support',
+ 'MAIN protection concern presented at the helpdesk/Protection_concerns not listed': 'concern_other_not_listed',
+ 'If protection_concerns not listed, specify the protection concerns presented.': 'concern_other_specify',
+ 'Type of general protection information sought': 'general_information_type',
+ 'Type of general protection information sought/Information on access to Child Protective services': 'info_child_protection_services',
+ 'Type of general protection information sought/Information on access to Gender based Violence (GBV) support services': 'info_gbv_support_services',
+ 'Type of general protection information sought/Information on access to legal services': 'info_legal_services',
+ 'Type of general protection information sought/Information on access to durable solutions (Resettlement, Voluntary Repatriation, Local intergration)': 'info_durable_solutions',
+ 'Type of general protection information sought/Information on access to core -relief items (NFI)': 'info_core_relief_items',
+ 'Type of general protection information sought/Information on access to food from WFP and relevant partners.': 'info_food_access',
+ 'Type of general protection information sought/Information on access to shelter': 'info_shelter_access',
+ 'Type of general protection information sought/Information on access to livelihood and empowerment opportunities': 'info_livelihood_empowerment',
+ 'Type of general protection information sought/Information on access to medical services': 'info_medical_services',
+ 'Type of general protection information sought/Information on disability support services': 'info_disability_support_services',
+ 'Type of general protection information sought/Information on access to WASH': 'info_wash_access',
+ 'Type of general protection information sought/General_protection not in the list': 'info_other_not_listed',
+ 'If general_protection not in the list, please specify the general protection information sought.': 'info_other_specify',
+ 'Action Taken': 'action_taken',
+ 'If Action taken is Other, please specify': 'action_taken_other_specify',
+ 'On what date was the case referred': 'referral_date',
+ 'Which partner has the case been referred to': 'referred_partner',
+ 'Which partner has the case been referred to/Department of Refugee Services (DRS)': 'ref_partner_drs',
+ 'Which partner has the case been referred to/UNHCR': 'ref_partner_unhcr',
+ 'Which partner has the case been referred to/Save the Children (SCI)': 'ref_partner_sci',
+ 'Which partner has the case been referred to/Norwegian Refugee Council (NRC)': 'ref_partner_nrc',
+ 'Which partner has the case been referred to/International Rescue Commitee (IRC)': 'ref_partner_irc',
+ 'Which partner has the case been referred to/Refugee Consortium of Kenya (RCK)': 'ref_partner_rck',
+ 'Which partner has the case been referred to/Lutheran World Federation (LWF)': 'ref_partner_lwf',
+ 'Which partner has the case been referred to/Humanity and Inclusion (HI)': 'ref_partner_hi',
+ 'Which partner has the case been referred to/Danish Refugee Council (DRC)': 'ref_partner_drc',
+ 'Which partner has the case been referred to/Peace Winds Japan': 'ref_partner_pwj',
+ 'Which partner has the case been referred to/Directorate of Children Services (DCS)': 'ref_partner_dcs',
+ 'Which partner has the case been referred to/Film Aid Kenya (FAK)': 'ref_partner_fak',
+ 'Which partner has the case been referred to/Other partners': 'ref_partner_other',
+ 'If Other, please specify the partner the case was referred to.': 'ref_partner_other_specify',
+ 'Which department has the case been referred to?': 'referred_department',
+ 'If External, please specify the name of the agency referred to.': 'external_agency_specify',
+ 'Any follow up action required ?': 'follow_up_required',
+ 'If Yes, what is the follow up action?': 'follow_up_action',
+ '_GPS Location_latitude': 'gps_latitude',
+ '_GPS Location_longitude': 'gps_longitude',
+ '_id': 'kobo_submission_id',
+ '_uuid': 'kobo_submission_uuid',
+ '_submission_time': 'kobo_submission_time',
+ '_validation_status': 'kobo_validation_status',
+ '_status': 'kobo_status',
+ '_submitted_by': 'kobo_submitted_by',
+ '_notes': 'kobo_notes',
+ '_tags': 'kobo_tags',
+ '_index': 'kobo_index',
+ 'today': 'kobo_today',
+ 'username': 'kobo_username',
+ 'deviceid': 'kobo_device_id',
+ 'phonenumber': 'kobo_phone_number'}
+ANALYSIS_COLUMN_NAMES = frozenset(['action_taken',
+ 'action_taken_other_specify',
+ 'alternative_phone',
+ 'camp_location',
+ 'child_disability_type',
+ 'child_disability_type_other',
+ 'child_unaccompanied_minor',
+ 'concern_child_abandonment',
+ 'concern_child_conflict_with_law',
+ 'concern_child_contact_with_law',
+ 'concern_child_custody',
+ 'concern_child_needs_assistive_devices',
+ 'concern_civil_registration_services',
+ 'concern_dangerous_child_work',
+ 'concern_educational_support',
+ 'concern_intimate_partner_violence',
+ 'concern_lacking_parental_care_unaccompanied',
+ 'concern_medical_support',
+ 'concern_no_access_food',
+ 'concern_no_access_nfi',
+ 'concern_other_not_listed',
+ 'concern_other_specify',
+ 'concern_parental_neglect',
+ 'concern_physical_violence',
+ 'concern_psychosocial_support',
+ 'concern_school_dropout_risk_or_dropped_out',
+ 'concern_sexual_violence',
+ 'concern_shelter_need',
+ 'concern_unhcr_profiling_registration',
+ 'consent_recording',
+ 'difficulty_communicating',
+ 'difficulty_hearing',
+ 'difficulty_remembering_or_concentrating',
+ 'difficulty_seeing',
+ 'difficulty_self_care',
+ 'difficulty_walking_or_climbing',
+ 'external_agency_specify',
+ 'follow_up_action',
+ 'follow_up_required',
+ 'general_information_type',
+ 'gps_latitude',
+ 'gps_longitude',
+ 'has_disability',
+ 'has_operational_phone',
+ 'helpdesk_camp_location',
+ 'helpdesk_section_block',
+ 'helpdesk_village',
+ 'household_type',
+ 'info_child_protection_services',
+ 'info_core_relief_items',
+ 'info_disability_support_services',
+ 'info_durable_solutions',
+ 'info_food_access',
+ 'info_gbv_support_services',
+ 'info_legal_services',
+ 'info_livelihood_empowerment',
+ 'info_medical_services',
+ 'info_other_not_listed',
+ 'info_other_specify',
+ 'info_shelter_access',
+ 'info_wash_access',
+ 'information_seeker_age',
+ 'information_seeker_disability_type_other',
+ 'information_seeker_gender',
+ 'information_seeker_individual_number',
+ 'information_seeker_name',
+ 'information_seeker_nationality',
+ 'information_seeker_nationality_other',
+ 'information_seeker_phone',
+ 'information_seeker_ration_or_wristband_number',
+ 'information_seeker_type',
+ 'interview_date',
+ 'kobo_device_id',
+ 'kobo_index',
+ 'kobo_notes',
+ 'kobo_phone_number',
+ 'kobo_status',
+ 'kobo_submission_id',
+ 'kobo_submission_time',
+ 'kobo_submission_uuid',
+ 'kobo_submitted_by',
+ 'kobo_tags',
+ 'kobo_today',
+ 'kobo_username',
+ 'kobo_validation_status',
+ 'last_visit_within_current_month',
+ 'main_protection_concern',
+ 'ref_partner_dcs',
+ 'ref_partner_drc',
+ 'ref_partner_drs',
+ 'ref_partner_fak',
+ 'ref_partner_hi',
+ 'ref_partner_irc',
+ 'ref_partner_lwf',
+ 'ref_partner_nrc',
+ 'ref_partner_other',
+ 'ref_partner_other_specify',
+ 'ref_partner_pwj',
+ 'ref_partner_rck',
+ 'ref_partner_sci',
+ 'ref_partner_unhcr',
+ 'referral_date',
+ 'referred_department',
+ 'referred_partner',
+ 'registered_with_unhcr',
+ 'request_type_protection_or_information',
+ 'residence_neighborhood_compound_house',
+ 'respondent_relationship_other',
+ 'respondent_relationship_to_child',
+ 'staff_name',
+ 'visited_tdh_helpdesk_before'])
 
 APP_VERSION = "Version 1.0"
 APP_VERSION_DATE = "June 2026"
@@ -66,13 +910,53 @@ CHILD_AGE_GROUPS = {"0-5 Years", "6-11 Years", "12-17 Years"}
 ADULT_AGE_GROUPS = {"18-35 Years", "36-49 Years", "50-64 Years", "65 Years and Above"}
 
 GENDER_ORDER = ["Girl", "Boy", "Woman", "Man", "Transgender", "[Missing]"]
+VISIT_HISTORY_ORDER = ["First-time visitor", "Repeat visitor", "[Missing]"]
+REPEAT_VISIT_TIMING_ORDER = [
+    "Repeat — within current month",
+    "Repeat — before current month",
+    "Repeat — timing not recorded",
+]
+CHILD_ACCOMPANIMENT_ORDER = ["Unaccompanied", "Not unaccompanied", "[Missing]"]
 GENDER_COLORS = {
-    "Girl": "#7C3AED",
+    "Girl": "#8B5CF6",
     "Boy": "#2563EB",
     "Woman": "#DB2777",
     "Man": "#059669",
-    "Transgender": "#F59E0B",
-    "[Missing]": "#9CA3AF",
+    "Transgender": "#D9A441",
+    "[Missing]": "#94A3B8",
+}
+
+CHART_CATEGORY_COLORS = [
+    "#2F7D69",
+    "#1F6FB2",
+    "#D9A441",
+    "#8B5CF6",
+    "#DB2777",
+    "#059669",
+    "#F97316",
+    "#14B8A6",
+    "#64748B",
+    "#A855F7",
+]
+
+STATUS_COLORS = {
+    "Has Disability": "#2F7D69",
+    "No Disability": "#94A3B8",
+    "Has disability": "#2F7D69",
+    "No disability": "#94A3B8",
+    "Has Impairment": "#2F7D69",
+    "No Impairment": "#94A3B8",
+}
+
+CPV_METRIC_COLORS = {
+    "Records": "#2F7D69",
+    "Protection concerns": "#1F6FB2",
+    "Information requests": "#6D5BD0",
+    "Partner referrals": "#059669",
+    "Follow-up required": "#D9A441",
+    "Disability records": "#DB2777",
+    "Mapped records": "#14B8A6",
+    "Helpdesk locations": "#64748B",
 }
 
 WGQ_DISABILITY_DOMAINS = {
@@ -84,209 +968,21 @@ WGQ_DISABILITY_DOMAINS = {
     "difficulty_self_care": "Self-Care Impairment",
     "difficulty_communicating": "Speech Impairment",
 }
-ADULT_DISABILITY_CATEGORY_COLUMNS = ["information_seeker_disability_type_other"]
-
-PROTECTION_SELECT_ALIASES = [
-    ("no_access_to_non_food_items", "concern_no_access_nfi"),
-    ("no_access_nf", "concern_no_access_nfi"),
-    ("no_access_nfi", "concern_no_access_nfi"),
-    ("medical_assistive_devices", "concern_child_needs_assistive_devices"),
-    ("no_access_food", "concern_no_access_food"),
-    ("parental_neglect", "concern_parental_neglect"),
-    ("child_abandonment", "concern_child_abandonment"),
-    ("child_custody_related_concerns", "concern_child_custody"),
-    ("physical_violence", "concern_physical_violence"),
-    ("sexual_violence", "concern_sexual_violence"),
-    ("educational_support", "concern_educational_support"),
-    ("school_dropout_risk_or_dropped_out", "concern_school_dropout_risk_or_dropped_out"),
-    ("intimate_partner_violence", "concern_intimate_partner_violence"),
-    ("dangerous_child_work", "concern_dangerous_child_work"),
-    ("contact_with_the_law", "concern_child_contact_with_law"),
-    ("conflict_with_the_law", "concern_child_conflict_with_law"),
-    ("in_conflict_with_the_law", "concern_child_conflict_with_law"),
-    ("civil_registration_services", "concern_civil_registration_services"),
-    ("shelter_need", "concern_shelter_need"),
-    ("medical_support", "concern_medical_support"),
-    ("parental_care_unaccompanied", "concern_lacking_parental_care_unaccompanied"),
-    ("unhcr_profiling_registration", "concern_unhcr_profiling_registration"),
-    ("psychosocial_support", "concern_psychosocial_support"),
-    ("concerns_not_listed", "concern_other_not_listed"),
+ADULT_DISABILITY_CATEGORY_COLUMNS = [
+    "information_seeker_disability_type_other",
+    "information_seeker_disability_type_other_specify",
+    "information_seeker_disability_other_specify",
 ]
-
-INFORMATION_SELECT_ALIASES = [
-    ("access_to_child_protection_services", "info_child_protection_services"),
-    ("access_to_gender_based_violence_gbv_support_services", "info_gbv_support_services"),
-    ("access_to_legal_services", "info_legal_services"),
-    ("access_to_durable_solutions", "info_durable_solutions"),
-    ("access_to_core_relief_items_cris", "info_core_relief_items"),
-    ("access_to_food_from_wfp", "info_food_access"),
-    ("access_to_shelter", "info_shelter_access"),
-    ("access_to_livelihood_and_empowerment_opportunities", "info_livelihood_empowerment"),
-    ("access_to_medical_services", "info_medical_services"),
-    ("access_to_disability_support_services", "info_disability_support_services"),
-    ("access_to_wash", "info_wash_access"),
-    ("general_protection_not_in_the_list", "info_other_not_listed"),
+CHILD_DISABILITY_OTHER_COLUMNS = [
+    "child_disability_type_other",
+    "child_disability_type_other_specify",
+    "child_disability_other_specify",
 ]
-
-REFERRAL_SELECT_ALIASES = [
-    ("referred_to_department_of_refugee_services_drs", "ref_partner_drs"),
-    ("referred_to_unhcr", "ref_partner_unhcr"),
-    ("referred_to_save_the_children_sci", "ref_partner_sci"),
-    ("referred_to_norwegian_refugee_council_nrc", "ref_partner_nrc"),
-    ("referred_to_international_rescue_committee_irc", "ref_partner_irc"),
-    ("referred_to_refugee_consortium_of_kenya_rck", "ref_partner_rck"),
-    ("referred_to_lutheran_world_federation_lwf", "ref_partner_lwf"),
-    ("referred_to_humanity_and_inclusion_hi", "ref_partner_hi"),
-    ("referred_to_danish_refugee_council_drc", "ref_partner_drc"),
-    ("referred_to_peace_winds_japan", "ref_partner_pwj"),
-    ("referred_to_directorate_of_children_services_dcs", "ref_partner_dcs"),
-    ("referred_to_film_aid_kenya_fak", "ref_partner_fak"),
-    ("referred_to_other_partners", "ref_partner_other"),
-    ("specify_the_partner_the_case_was_referred_to", "ref_partner_other_specify"),
-]
-
-SELECT_MULTIPLE_ALIASES = PROTECTION_SELECT_ALIASES + INFORMATION_SELECT_ALIASES + REFERRAL_SELECT_ALIASES
-KNOWN_SELECT_MULTIPLE_COLUMNS = {target for _, target in SELECT_MULTIPLE_ALIASES}
-
-DEFAULT_LABEL_MAP = {
-    "concern_no_access_nfi": "No Access Nfi",
-    "concern_child_needs_assistive_devices": "Child/family needs assistive devices",
-    "concern_no_access_food": "No access to food",
-    "concern_parental_neglect": "Parental neglect",
-    "concern_child_abandonment": "Child abandonment",
-    "concern_child_custody": "Child custody related concerns",
-    "concern_physical_violence": "Physical violence",
-    "concern_sexual_violence": "Sexual violence",
-    "concern_educational_support": "Educational support",
-    "concern_school_dropout_risk_or_dropped_out": "School dropout risk / dropped out",
-    "concern_intimate_partner_violence": "Intimate partner violence",
-    "concern_dangerous_child_work": "Engaging in dangerous work for pay",
-    "concern_child_contact_with_law": "Child in contact with the law",
-    "concern_child_conflict_with_law": "Child in conflict with the law",
-    "concern_civil_registration_services": "Civil registration services",
-    "concern_shelter_need": "Shelter need",
-    "concern_medical_support": "Medical support",
-    "concern_lacking_parental_care_unaccompanied": "Lacking parental care / unaccompanied",
-    "concern_unhcr_profiling_registration": "UNHCR profiling / registration",
-    "concern_psychosocial_support": "Psychosocial support",
-    "concern_other_not_listed": "Other Not Listed",
-    "info_child_protection_services": "Child protection services",
-    "info_gbv_support_services": "GBV support services",
-    "info_legal_services": "Legal services",
-    "info_durable_solutions": "Durable solutions",
-    "info_core_relief_items": "Core relief items",
-    "info_food_access": "Food access",
-    "info_shelter_access": "Shelter access",
-    "info_livelihood_empowerment": "Livelihood and empowerment",
-    "info_medical_services": "Medical services",
-    "info_disability_support_services": "Disability support services",
-    "info_wash_access": "WASH services",
-    "info_other_not_listed": "Other Not Listed",
-    "ref_partner_drs": "DRS",
-    "ref_partner_unhcr": "UNHCR",
-    "ref_partner_sci": "SCI",
-    "ref_partner_nrc": "NRC",
-    "ref_partner_irc": "IRC",
-    "ref_partner_rck": "RCK",
-    "ref_partner_lwf": "LWF",
-    "ref_partner_hi": "HI",
-    "ref_partner_drc": "DRC",
-    "ref_partner_pwj": "PWJ",
-    "ref_partner_dcs": "DCS",
-    "ref_partner_fak": "FAK",
-    "ref_partner_other": "OTHER NOT LISTED",
-}
-
-FIELD_ALIASES = {
-    "staff_name": ["staff_name", "name_of_staff_filling_form"],
-    "interview_date": ["interview_date", "enter_a_date"],
-    "information_seeker_type": ["information_seeker_type", "who_is_the_information_seeker"],
-    "information_seeker_name": ["information_seeker_name", "name_of_the_information_seeker_at_the_help_desk"],
-    "child_unaccompanied_minor": ["child_unaccompanied_minor", "is_the_child_unaccompanied_minor"],
-    "respondent_relationship_to_child": ["respondent_relationship_to_child", "relationship_of_the_respondent_to_the_child"],
-    "respondent_relationship_other": [
-        "respondent_relationship_other",
-        "if_relationship_is_not_listed_please_specify_the_relationship_to_child",
-    ],
-    "household_type": ["household_type"],
-    "camp_location": ["camp_location"],
-    "helpdesk_camp_location": ["helpdesk_camp_location", "specific_camp_location_hosting_the_helpdesk"],
-    "helpdesk_section_block": ["helpdesk_section_block", "section_block_hosting_the_helpdesk"],
-    "helpdesk_village": ["helpdesk_village", "village_location_hosting_the_helpdesk"],
-    "residence_neighborhood_compound_house": [
-        "residence_neighborhood_compound_house",
-        "in_which_neighborhood_compound_and_house_do_you_come_from",
-    ],
-    "information_seeker_gender": ["information_seeker_gender", "gender_of_the_information_seeker"],
-    "information_seeker_age": ["information_seeker_age", "age_of_the_information_seeker"],
-    "information_seeker_nationality": ["information_seeker_nationality", "nationality_of_the_information_seeker"],
-    "information_seeker_nationality_other": [
-        "information_seeker_nationality_other",
-        "if_nationality_not_listed_above_please_specify_the_nationality",
-    ],
-    "has_operational_phone": ["has_operational_phone", "do_you_have_a_phone_number_that_is_in_operation"],
-    "information_seeker_phone": ["information_seeker_phone", "phone_number_of_the_information_seeker"],
-    "alternative_phone": ["alternative_phone", "alternative_phone_number"],
-    "registered_with_unhcr": ["registered_with_unhcr", "are_you_registered_with_the_unhcr"],
-    "information_seeker_individual_number": [
-        "information_seeker_individual_number",
-        "individual_number_of_the_information_seeker",
-    ],
-    "information_seeker_ration_or_wristband_number": [
-        "information_seeker_ration_or_wristband_number",
-        "ration_card_number_wrist_band_number_of_the_information_seeker",
-    ],
-    "has_disability": ["has_disability", "do_you_have_any_disability"],
-    "child_disability_type": ["child_disability_type", "what_is_the_child_s_type_of_disability"],
-    "child_disability_type_other": [
-        "child_disability_type_other",
-        "if_other_disability_please_specify_the_type_of_disability_for_the_child",
-    ],
-    "difficulty_seeing": ["difficulty_seeing"],
-    "difficulty_hearing": ["difficulty_hearing"],
-    "difficulty_walking_or_climbing": ["difficulty_walking_or_climbing", "difficulty_walking_or_climbing_steps"],
-    "difficulty_self_care": ["difficulty_self_care"],
-    "difficulty_remembering_or_concentrating": ["difficulty_remembering_or_concentrating"],
-    "difficulty_communicating": ["difficulty_communicating"],
-    "information_seeker_disability_type_other": [
-        "information_seeker_disability_type_other",
-        "other_disability_type_of_the_information_seeker_if_not_answered_by_the_questions_provided",
-    ],
-    "visited_tdh_helpdesk_before": ["visited_tdh_helpdesk_before", "have_you_been_to_any_of_tdh_s_helpdesks_before"],
-    "last_visit_within_current_month": [
-        "last_visit_within_current_month",
-        "was_your_last_visit_made_within_the_month_we_are_in",
-    ],
-    "request_type_protection_or_information": [
-        "request_type_protection_or_information",
-        "is_the_individual_reporting_a_protection_concern_or_seeking_general_protection_information",
-    ],
-    "main_protection_concern": ["main_protection_concern", "main_protection_concern_presented_at_the_helpdesk"],
-    "concern_other_specify": [
-        "concern_other_specify",
-        "if_protection_concerns_not_listed_specify_the_protection_concerns_presented",
-    ],
-    "general_information_type": ["general_information_type", "type_of_general_protection_information_sought"],
-    "info_other_specify": [
-        "info_other_specify",
-        "if_general_protection_not_in_the_list_please_specify_the_general_protection_information_sought",
-    ],
-    "action_taken": ["action_taken"],
-    "action_taken_other_specify": ["action_taken_other_specify", "if_action_taken_is_other_please_specify"],
-    "referral_date": ["referral_date", "on_what_date_was_the_case_referred"],
-    "referred_partner": ["referred_partner", "which_partner_has_the_case_been_referred_to"],
-    "referred_department": ["referred_department", "which_department_has_the_case_been_referred_to"],
-    "external_agency_specify": [
-        "external_agency_specify",
-        "if_external_please_specify_the_name_of_the_agency_referred_to",
-    ],
-    "follow_up_required": ["follow_up_required", "any_follow_up_action_required"],
-    "follow_up_action": ["follow_up_action", "if_yes_what_is_the_follow_up_action"],
-    "gps_latitude": ["gps_latitude", "gps_location_latitude", "_gps_location_latitude"],
-    "gps_longitude": ["gps_longitude", "gps_location_longitude", "_gps_location_longitude"],
-}
 
 DISABILITY_TYPE_STANDARD_MAP = {
+    "chronic illnesses": "Chronic Illnesses",
+    "chronic illness": "Chronic Illnesses",
+    "chronic illnesses (any disease that is dependent on medicines e.g. diabetes, blood pressure etc.)": "Chronic Illnesses",
     "visual impairment": "Visual Impairment",
     "visual disability": "Visual Impairment",
     "seeing impairment": "Visual Impairment",
@@ -350,6 +1046,16 @@ CORE_RECORD_COLUMNS = [
     "information_seeker_gender_raw",
     "type_age_correction_flag",
     "gender_age_correction_flag",
+    "helpdesk_visit_history",
+    "visited_tdh_helpdesk_before_raw",
+    "repeat_visit_timing",
+    "last_visit_within_current_month_raw",
+    "visit_history_consistency",
+    "visit_history_inconsistency_flag",
+    "child_accompaniment_status",
+    "child_unaccompanied_minor_raw",
+    "respondent_relationship_to_child_raw",
+    "respondent_relationship_other_raw",
     "disability_status",
     "disability_type",
     "adult_wgq_disability_status",
@@ -420,19 +1126,10 @@ def load_css():
 
 
 def clean_text(value):
-    if isinstance(value, (list, tuple, set)):
-        values = [clean_text(part) for part in value]
-        values = [str(part) for part in values if not pd.isna(part)]
-        return ", ".join(values) if values else pd.NA
-    try:
-        if pd.isna(value):
-            return pd.NA
-    except (TypeError, ValueError):
+    if pd.isna(value):
         return pd.NA
     value = str(value).strip()
-    value = " ".join(value.split())
-    missing_values = {"", "nan", "none", "null", "missing", "[missing]", "not recorded", "[not recorded]", "n/a", "na"}
-    return pd.NA if value.lower() in missing_values else value
+    return pd.NA if value == "" else " ".join(value.split())
 
 
 def normalize_response(value):
@@ -441,6 +1138,115 @@ def normalize_response(value):
         return None
     value = str(value).strip().lower().replace("_", " ").replace("-", " ")
     return re.sub(r"\s+", " ", value)
+
+
+def consent_is_declined(value):
+    """Return True only for an explicit refusal of consent."""
+    normalized = normalize_response(value)
+    if normalized is None:
+        return False
+    return normalized in {
+        "no", "n", "0", "false", "declined", "decline", "refused",
+        "refuse", "not consented", "do not consent", "dont consent",
+        "i do not consent", "i dont consent", "consent not given",
+    }
+
+
+def derive_helpdesk_visit_history(value):
+    """Classify prior-helpdesk responses into first-time versus repeat visits."""
+    normalized = normalize_response(value)
+    if normalized is None:
+        return "[Missing]"
+    if normalized in {
+        "yes", "y", "1", "true", "visited before", "yes visited before",
+        "repeat", "repeat visit", "returning", "returning visitor",
+    }:
+        return "Repeat visitor"
+    if normalized in {
+        "no", "n", "0", "false", "not visited before", "never visited",
+        "first time", "first visit", "new visitor",
+    }:
+        return "First-time visitor"
+    if any(term in normalized for term in ["first time", "never visited", "not visited before"]):
+        return "First-time visitor"
+    if any(term in normalized for term in ["repeat", "returning", "visited before"]):
+        return "Repeat visitor"
+    return "[Missing]"
+
+
+def yes_no_response(value):
+    """Return True/False for a clear yes/no response, otherwise None."""
+    normalized = normalize_response(value)
+    if normalized in {"yes", "y", "1", "true"}:
+        return True
+    if normalized in {"no", "n", "0", "false"}:
+        return False
+    return None
+
+
+def derive_repeat_visit_timing(row):
+    """Use the follow-up question only for confirmed repeat visitors."""
+    visit_history = row.get("helpdesk_visit_history")
+    within_month = yes_no_response(row.get("last_visit_within_current_month"))
+    if visit_history != "Repeat visitor":
+        return pd.NA
+    if within_month is True:
+        return "Repeat — within current month"
+    if within_month is False:
+        return "Repeat — before current month"
+    return "Repeat — timing not recorded"
+
+
+def derive_visit_history_consistency(row):
+    """Audit skip logic between prior-visit and last-visit timing fields."""
+    visit_history = row.get("helpdesk_visit_history")
+    within_month = yes_no_response(row.get("last_visit_within_current_month"))
+    if visit_history == "First-time visitor" and within_month is not None:
+        return "Review — first-time visitor has a last-visit response"
+    if visit_history == "Repeat visitor" and within_month is None:
+        return "Review — repeat visit timing is missing"
+    if visit_history == "[Missing]" and within_month is not None:
+        return "Review — visit history missing but timing was answered"
+    if visit_history == "[Missing]":
+        return "Visit history missing"
+    return "Consistent"
+
+
+def derive_child_accompaniment_status(row):
+    """Harmonize unaccompanied-child status from direct and relationship fields."""
+    if not is_child(row):
+        return "[Missing]"
+
+    direct = normalize_response(row.get("child_unaccompanied_minor"))
+    if direct in {"yes", "y", "1", "true", "unaccompanied", "unaccompanied minor"}:
+        return "Unaccompanied"
+    if direct in {"no", "n", "0", "false", "accompanied", "not unaccompanied"}:
+        return "Not unaccompanied"
+
+    relationship_values = [
+        normalize_response(row.get("respondent_relationship_to_child")),
+        normalize_response(row.get("respondent_relationship_other")),
+    ]
+    relationship = " ".join(value for value in relationship_values if value)
+    if not relationship:
+        return "[Missing]"
+
+    unaccompanied_terms = [
+        "unaccompanied", "alone", "no caregiver", "without caregiver",
+        "without parent",
+    ]
+    accompanied_terms = [
+        "mother", "father", "parent", "caregiver", "guardian", "aunt",
+        "uncle", "grandmother", "grandfather", "grandparent", "brother",
+        "sister", "sibling", "relative", "stepmother", "stepfather",
+    ]
+    if any(term in relationship for term in unaccompanied_terms):
+        return "Unaccompanied"
+    if any(term in relationship for term in accompanied_terms):
+        return "Not unaccompanied"
+    if relationship.strip() in {"self", "child", "the child", "beneficiary"}:
+        return "Unaccompanied"
+    return "[Missing]"
 
 
 def staff_name_key(value):
@@ -597,19 +1403,66 @@ def standardize_disability_type(value):
         return DISABILITY_TYPE_STANDARD_MAP[normalized]
     if "multiple" in normalized:
         return "Multiple Impairments"
-    if "visual" in normalized or "seeing" in normalized:
+    if any(token in normalized for token in ["visual", "seeing", "sight", "blind"]):
         return "Visual Impairment"
-    if "hearing" in normalized:
+    if any(token in normalized for token in ["hearing", "deaf"]):
         return "Hearing Impairment"
-    if any(token in normalized for token in ["physical", "mobility", "walking", "climbing"]):
+    if any(token in normalized for token in ["physical", "mobility", "walking", "climbing", "limb", "paralys", "wheelchair"]):
         return "Physical/Mobility Impairment"
-    if any(token in normalized for token in ["cognitive", "remember", "concentrat", "autism", "adhd", "neurological"]):
+    if any(token in normalized for token in ["cognitive", "remember", "concentrat", "autism", "adhd", "neurological", "intellectual", "mental", "psychosocial", "learning", "epilep"]):
         return "Cognitive Impairment"
     if "self care" in normalized or "self-care" in normalized:
         return "Self-Care Impairment"
-    if "speech" in normalized or "communication" in normalized or "communicat" in normalized:
+    if any(token in normalized for token in ["speech", "communication", "communicat", "mute"]):
         return "Speech Impairment"
+    if "chronic illness" in normalized:
+        return "Chronic Illnesses"
     return str(value)
+
+
+def specified_disability_type(row, columns):
+    """Return a usable harmonized value from disability 'Other' detail fields."""
+    generic_values = {
+        "other", "others", "other disability", "other disabilities",
+        "other specify", "other specified", "yes", "y", "true", "1",
+        "none", "none of the above", "not applicable", "n/a", "na", "nil",
+    }
+    for column in columns:
+        if column not in row.index:
+            continue
+        value = clean_text(row.get(column))
+        if pd.isna(value):
+            continue
+        normalized = normalize_response(value)
+        if normalized in generic_values:
+            continue
+        # Some exports repeat the option label inside the specification, for
+        # example "Other disability: epilepsy". Harmonize the actual detail.
+        if normalized.startswith("other disability"):
+            value = re.sub(
+                r"^other\s+disabilit(?:y|ies)\s*[:;\-–—]?\s*",
+                "",
+                str(value),
+                flags=re.IGNORECASE,
+            ).strip()
+            if not value:
+                continue
+        standardized = standardize_disability_type(value)
+        if standardized != "None":
+            return standardized
+    return "None"
+
+
+def is_other_disability_response(value):
+    """Recognize Other Disability despite Kobo/export formatting variations."""
+    normalized = normalize_response(value)
+    if normalized is None:
+        return False
+    generic = {
+        "other", "others", "other disability", "other disabilities",
+        "other specify", "other specified",
+    }
+    return normalized in generic or ("other" in normalized and "disabil" in normalized)
 
 
 def safe_label_from_code(value):
@@ -675,6 +1528,290 @@ def harmonize_free_text(text, main_category_labels, default="Other Not Listed"):
         return cleaned
 
     return default
+
+
+# Extensible concept taxonomy for free-text protection concerns. Each rule maps
+# commonly used words, phrases and spelling variants to an existing listed
+# concern. Rules are evaluated before generic fuzzy label matching.
+PROTECTION_CONCERN_TEXT_RULES = [
+    {
+        "category_aliases": ["School dropout risk or dropped out", "School dropout", "Dropout risk"],
+        "keywords": ["dropout", "drop out", "dropped out", "not attending school", "left school", "school absenteeism"],
+    },
+    {
+        "category_aliases": ["Education support", "Educational support"],
+        "keywords": [
+            "scholastic material", "scholatic material", "scholastic matetial", "school material",
+            "learning material", "education material", "exercise book",
+            "textbook", "text book", "book", "uniform", "stationery",
+            "school supplies", "school fees", "school fee", "material support for school", "pencil", "pen",
+        ],
+    },
+    {
+        "category_aliases": ["Pre-Registration", "Pre Registration"],
+        "keywords": ["pre registration", "preregistration", "waiting for registration", "new arrival registration"],
+    },
+    {
+        "category_aliases": ["Unhcr Profiling Registration", "UNHCR registration", "Profiling registration"],
+        "keywords": ["unhcr registration", "unhcr profiling", "not appearing in the system", "profiling registration"],
+    },
+    {
+        "category_aliases": ["Card Separation", "Separation Card"],
+        "keywords": ["card separation", "separation card", "separate ration card", "card separated"],
+    },
+    {
+        "category_aliases": ["Bamba Chakula Issues", "Food card issue"],
+        "keywords": ["bamba chakula", "bamba pin", "pin issue", "card deactivation", "deactivation card", "deactivated card", "card desactivated", "card merging", "card marging", "card margin"],
+    },
+    {
+        "category_aliases": ["Alternative Food Collector"],
+        "keywords": ["alternative food collector", "alternative food collection", "alternative food collect", "altanative food collector", "food collector"],
+    },
+    {
+        "category_aliases": ["No Access Nfi", "NFI support", "Non food items"],
+        "keywords": ["clothes", "clothing", "shoe", "sandal", "sandle", "crocks", "soap", "sanitary pad", "sleeping material", "mattress", "blanket"],
+    },
+    {
+        "category_aliases": ["Basic Needs", "Material Support"],
+        "keywords": ["basic need", "bassic need", "material support", "need of material"],
+    },
+    {
+        "category_aliases": ["Child Abandonment"],
+        "keywords": ["child abandonment", "abandoned child", "child abandoned", "parent left child"],
+    },
+    {
+        "category_aliases": ["Lacking Parental Care Unaccompanied", "Unaccompanied child"],
+        "keywords": ["orphan", "orpha", "no parental care", "lacking parental care", "unaccompanied child", "no caregiver"],
+    },
+    {
+        "category_aliases": ["Child Pregnancy", "Teenage pregnancy"],
+        "keywords": ["child pregnancy", "teenage pregnancy", "teenage mother", "pregnant child"],
+    },
+    {
+        "category_aliases": ["No Access Food", "Food insecurity", "Food assistance", "Lack of food"],
+        "keywords": ["food", "hunger", "hungry", "ration", "starvation", "malnutrition", "no meals", "lack of meals"],
+    },
+    {
+        "category_aliases": ["Medical Support", "Health support", "Health services", "Health concern"],
+        "keywords": ["medical", "medicine", "medication", "hospital", "clinic", "health care", "healthcare", "treatment", "sick", "illness"],
+    },
+    {
+        "category_aliases": ["Shelter Need", "No Access Nfi", "Shelter support", "Shelter concern", "Inadequate shelter", "Shelter and NFI"],
+        "keywords": ["shelter", "tent", "house", "housing", "roof", "tarpaulin"],
+    },
+    {
+        "category_aliases": ["WASH support", "Water sanitation and hygiene", "Water and sanitation"],
+        "keywords": ["water", "latrine", "toilet", "sanitation", "hygiene", "soap", "bathing", "wash facility", "jerrycan"],
+    },
+    {
+        "category_aliases": ["Civil Registration Services", "Undocumented", "Documentation support", "Civil documentation", "Legal documentation"],
+        "keywords": ["documentation", "document", "birth certificate", "identity card", "id card", "registration", "ration card", "alien card"],
+    },
+    {
+        "category_aliases": ["Legal assistance", "Legal support", "Access to justice"],
+        "keywords": ["legal", "court", "justice", "lawyer", "police case", "arrest", "detention"],
+    },
+    {
+        "category_aliases": ["Sexual Violence", "Gender based violence", "GBV", "Sexual and gender based violence", "SGBV"],
+        "keywords": ["gbv", "sgbv", "rape", "defilement", "sexual violence", "sexual abuse", "domestic violence", "intimate partner violence", "physical violence by partner"],
+    },
+    {
+        "category_aliases": ["Dangerous Child Work", "Child labour", "Child labor", "Economic exploitation"],
+        "keywords": ["child labour", "child labor", "working child", "forced work", "economic exploitation"],
+    },
+    {
+        "category_aliases": ["Child marriage", "Early marriage", "Forced marriage"],
+        "keywords": ["child marriage", "early marriage", "forced marriage", "underage marriage", "married early"],
+    },
+    {
+        "category_aliases": ["Joining Family", "Family separation", "Unaccompanied or separated child", "Separated child"],
+        "keywords": ["family separation", "separated from family", "unaccompanied", "separated child", "missing child", "lost child", "child lost", "child got lost", "child disappeared", "looking for her children", "looking for children", "joining familly", "joining jamily", "family tracing"],
+    },
+    {
+        "category_aliases": ["Parental Neglect", "Child Neglect", "Neglect"],
+        "keywords": [
+            "neglect", "neglet", "abandoned", "abandonment",
+            "lack of parental care", "no caregiver", "poor care",
+            "mother left the children", "mother left children",
+            "father left the children", "father left children",
+            "parent left the children", "parent left children",
+            "leave two children", "left two children",
+            "went back to country of origin", "returned to country of origin",
+        ],
+    },
+    {
+        "category_aliases": ["Physical Violence", "Child abuse", "Violence against children", "Physical abuse"],
+        "keywords": ["child abuse", "beating child", "beaten child", "physical abuse", "emotional abuse", "violence against child", "corporal punishment"],
+    },
+    {
+        "category_aliases": ["Child exploitation", "Exploitation"],
+        "keywords": ["exploitation", "forced begging", "begging", "used for work"],
+    },
+    {
+        "category_aliases": ["Trafficking", "Human trafficking"],
+        "keywords": ["trafficking", "trafficked", "smuggling", "abduction", "kidnapping"],
+    },
+    {
+        "category_aliases": ["Psychosocial support", "Mental health and psychosocial support", "MHPSS"],
+        "keywords": ["psychosocial", "mental health", "stress", "distress", "trauma", "depression", "anxiety", "counselling", "counseling"],
+    },
+    {
+        "category_aliases": ["Physical Violence", "Safety and security", "Security concern", "Threats or violence"],
+        "keywords": ["insecurity", "unsafe", "security", "threat", "treatened", "treatened", "harassment", "attack", "community violence", "conflict"],
+    },
+    {
+        "category_aliases": ["Livelihood support", "Livelihood concern", "Cash assistance"],
+        "keywords": ["livelihood", "income", "employment", "job", "business", "cash assistance", "financial support", "money"],
+    },
+    {
+        "category_aliases": ["Child Needs Assistive Devices", "Disability support", "Disability inclusion", "Assistive devices"],
+        "keywords": ["disability", "wheelchair", "assistive device", "walking aid", "hearing aid", "disability support", "special needs"],
+    },
+]
+
+
+def harmonize_protection_concern_text(text, main_category_labels, default="Other Not Listed"):
+    """Map protection free text to the closest canonical listed concern."""
+    cleaned = clean_text(text)
+    if pd.isna(cleaned):
+        return default
+    normalized = normalize_response(cleaned)
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized or "")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    normalized_labels = {
+        normalize_response(label): str(label)
+        for label in main_category_labels
+        if label and not pd.isna(label)
+    }
+    for rule in PROTECTION_CONCERN_TEXT_RULES:
+        if not any(keyword in normalized for keyword in rule["keywords"]):
+            continue
+        for alias in rule["category_aliases"]:
+            alias_normalized = normalize_response(alias)
+            if alias_normalized in normalized_labels:
+                return normalized_labels[alias_normalized]
+        # If the workbook label contains extra wording, reuse that exact label.
+        for label_normalized, label in normalized_labels.items():
+            if any(normalize_response(alias) in label_normalized for alias in rule["category_aliases"]):
+                return label
+        # Token-overlap handles workbook labels with qualifiers or slightly
+        # different wording, while still limiting output to a listed concern.
+        best_label = None
+        best_score = 0.0
+        for label_normalized, label in normalized_labels.items():
+            label_tokens = set(re.findall(r"[a-z0-9]+", label_normalized or ""))
+            for alias in rule["category_aliases"]:
+                alias_tokens = set(re.findall(r"[a-z0-9]+", normalize_response(alias) or ""))
+                if not alias_tokens:
+                    continue
+                score = len(label_tokens & alias_tokens) / len(alias_tokens)
+                if score > best_score:
+                    best_label, best_score = label, score
+        if best_label is not None and best_score >= 0.5:
+            return best_label
+        # The concept was recognised, but no corresponding listed category was
+        # found. Preserve the text for review instead of inventing a category.
+        return harmonize_free_text(cleaned, main_category_labels, default=default)
+
+    return harmonize_free_text(cleaned, main_category_labels, default=default)
+
+
+def standardize_protection_concern_label(value):
+    """Apply preferred Child Protection terminology to concern labels."""
+    cleaned = clean_text(value)
+    if pd.isna(cleaned):
+        return cleaned
+    normalized = normalize_response(cleaned)
+    family_reunification_terms = {
+        "joining family", "joining familly", "joining jamily",
+        "family reunion", "family reunification", "reunification with family",
+    }
+    if normalized in family_reunification_terms:
+        return "Family Reunification"
+    if normalized in {
+        "separation card", "card separation", "card separation with the children because the father was died",
+    }:
+        return "Card Separation"
+    if (
+        "bamba chakula" in normalized
+        or "bamba pin" in normalized
+        or normalized in {
+            "pin issue", "card deactivation", "deactivation card",
+            "card desactivated", "card merging", "card marging", "card margin",
+        }
+    ):
+        return "Bamba Chakula Issues"
+    if normalized in {"child contact with law", "child conflict with law"}:
+        return "Children in Contact with the Law"
+    if normalized in {
+        "sexual violence", "intimate partner violence", "gender based violence",
+        "gender-based violence", "gbv", "sgbv",
+    }:
+        return "Gender Based Violence"
+    if normalized == "age correction":
+        return "Civil Registration Services"
+    if "breast feeding is not enough" in normalized or "breastfeeding is not enough" in normalized:
+        return "No Access Food"
+    if (
+        "went back to country of origin" in normalized
+        and any(term in normalized for term in ["leave two children", "left two children", "leave the children"])
+    ):
+        return "Parental Neglect"
+    return cleaned
+
+
+def migrate_processed_cache_data(processed_data):
+    """Apply display-rule migrations even when the fast processed cache is used."""
+    if not isinstance(processed_data, tuple) or len(processed_data) != 6:
+        return processed_data
+    dashboard_records, secure_records, protection, information, referrals, kpis = processed_data
+    if isinstance(protection, pd.DataFrame) and "protection_concern" in protection.columns:
+        protection = protection.copy()
+        protection["protection_concern"] = protection["protection_concern"].map(
+            standardize_protection_concern_label
+        )
+    if isinstance(information, pd.DataFrame) and "general_information_need" in information.columns:
+        information = information.copy()
+        information["general_information_need"] = information["general_information_need"].map(
+            standardize_information_need_label
+        )
+    return dashboard_records, secure_records, protection, information, referrals, kpis
+
+
+def standardize_information_need_label(value):
+    """Consolidate high-confidence information-request synonyms."""
+    cleaned = clean_text(value)
+    if pd.isna(cleaned):
+        return cleaned
+    normalized = normalize_response(cleaned)
+
+    if normalized in {"scholastic materials", "scholatic materials"} or any(
+        phrase in normalized for phrase in ["senior school", "sunior school", "school information"]
+    ):
+        return "Education"
+    if normalized in {
+        "need unhcr registration", "unhcr registration", "need of unhcr registration",
+        "in need of unhcr registration", "unhcr profiling registration",
+    }:
+        return "UNHCR Registration"
+    if normalized in {
+        "undocumented child", "card managing", "card management", "card separation",
+    }:
+        return "Legal Services"
+    if normalized in {"materials support", "material support", "basic needs", "basic need"}:
+        return "Core Relief Items"
+    if normalized in {"disability", "disability services", "assistive device support"}:
+        return "Disability Support Services"
+    if normalized in {"dcs", "department of children services", "children services"}:
+        return "Child Protection Services"
+    if normalized in {"shelter request", "shelter need", "shelter services"}:
+        return "Shelter Access"
+    if normalized in {"gbv support services", "gender based violence support services"}:
+        return "GBV Support Services"
+    if normalized in {"wash access", "water sanitation and hygiene access"}:
+        return "WASH Access"
+    return cleaned
 
 
 def canonical_organization_label(value):
@@ -896,151 +2033,17 @@ def age_group_life_stage(age_group):
     return pd.NA
 
 
-def standardize_age_group(value):
-    value = clean_text(value)
-    if pd.isna(value):
-        return pd.NA
-    if str(value) in AGE_GROUP_ORDER:
-        return str(value)
-
-    match = re.search(r"\d+", str(value))
-    if not match:
-        return value
-
-    age = int(match.group(0))
-    if age <= 5:
-        return "0-5 Years"
-    if age <= 11:
-        return "6-11 Years"
-    if age <= 17:
-        return "12-17 Years"
-    if age <= 35:
-        return "18-35 Years"
-    if age <= 49:
-        return "36-49 Years"
-    if age <= 64:
-        return "50-64 Years"
-    return "65 Years and Above"
-
-
-def normalize_request_category(value):
-    value = clean_text(value)
-    if pd.isna(value):
-        return pd.NA
-
-    normalized = normalize_response(value)
-    if normalized is None:
-        return pd.NA
-
-    if "reporting a protection concern" in normalized:
-        return "Reporting a protection concern"
-    if "seeking general protection information" in normalized:
-        return "Seeking general protection information"
-    if normalized in {"protection concern", "concern", "protection", "reporting protection concern"}:
-        return "Reporting a protection concern"
-    if normalized in {"general protection information", "general information", "information", "seeking information"}:
-        return "Seeking general protection information"
-
-    has_concern = "concern" in normalized
-    has_information = "information" in normalized
-    has_reporting = "reporting" in normalized
-    has_seeking = "seeking" in normalized
-
-    if has_concern and not has_information:
-        return "Reporting a protection concern"
-    if has_reporting and "protection" in normalized and not has_seeking:
-        return "Reporting a protection concern"
-    if has_information and not has_concern and not has_reporting:
-        return "Seeking general protection information"
-    if has_seeking and has_information and not has_reporting:
-        return "Seeking general protection information"
-
-    return pd.NA
-
-
-def normalize_yes_no(value):
-    value = clean_text(value)
-    if pd.isna(value):
-        return pd.NA
-    normalized = normalize_response(value)
-    if normalized in {"yes", "y", "true", "1"}:
-        return "Yes"
-    if normalized in {"no", "n", "false", "0"}:
-        return "No"
-    return str(value)
-
-
-def normalize_action_taken(value):
-    value = clean_text(value)
-    if pd.isna(value):
-        return pd.NA
-    normalized = normalize_response(value)
-    normalized_compact = normalized.replace(" ", "_") if normalized else ""
-
-    partner_terms = {"case_referred_to_partner_agencies", "case_referred_partner_agencies"}
-    tdh_terms = {"case_referrred_to_tdh_national_staff", "case_referred_to_tdh_national_staff"}
-    counselling_terms = {
-        "case_not_referred_to_any_partner_but_information_counselling_provided",
-        "information_counselling_provided",
-    }
-    no_action_terms = {"action_not_taken_at_all", "no_action_taken"}
-
-    if normalized_compact in partner_terms or ("partner" in normalized and "refer" in normalized):
-        return "Case referred to partner agencies"
-    if normalized_compact in tdh_terms or ("tdh" in normalized and "refer" in normalized):
-        return "Case referrred to Tdh national staff"
-    if normalized_compact in counselling_terms or ("counselling" in normalized and "not referred" in normalized):
-        return "Case not referred to any partner BUT information counselling provided"
-    if normalized_compact in no_action_terms or ("action" in normalized and "not" in normalized and "taken" in normalized):
-        return "Action not taken at all"
-    return str(value)
-
-
-def is_selected_indicator(value):
-    if isinstance(value, (list, tuple, set)):
-        return len(value) > 0
-    value = clean_text(value)
-    if pd.isna(value):
-        return False
-    normalized = normalize_response(value)
-    if normalized is None:
-        return False
-    return normalized in {"1", "true", "yes", "y", "selected", "checked"} or normalized not in {
-        "0",
-        "false",
-        "no",
-        "n",
-        "none",
-        "nan",
-        "not selected",
-        "unchecked",
-    }
-
-
 def normalize_gender_by_life_stage(gender, life_stage):
     gender = clean_text(gender)
     life_stage = clean_text(life_stage)
     if pd.isna(gender):
         return "[Missing]"
-    normalized_gender = normalize_response(gender)
     if pd.isna(life_stage):
         return gender
     if life_stage == "Adult":
-        if normalized_gender in {"female", "woman", "girl"}:
-            return "Woman"
-        if normalized_gender in {"male", "man", "boy"}:
-            return "Man"
         return {"Girl": "Woman", "Boy": "Man"}.get(gender, gender)
     if life_stage == "Child":
-        if normalized_gender in {"female", "woman", "girl"}:
-            return "Girl"
-        if normalized_gender in {"male", "man", "boy"}:
-            return "Boy"
         return {"Woman": "Girl", "Man": "Boy"}.get(gender, gender)
-    if normalized_gender == "female":
-        return "Woman"
-    if normalized_gender == "male":
-        return "Man"
     return gender
 
 
@@ -1049,29 +2052,17 @@ def is_host_community(value):
     return bool(value and "host" in value and "community" in value)
 
 
-def village_needs_camp_prefix(village):
-    normalized = normalize_response(village)
-    if not normalized:
-        return False
-    known_place_terms = {"kalobeyei", "hagadera", "dagahaley", "ifo", "kakuma", "reception", "community"}
-    if any(term in normalized for term in known_place_terms):
-        return False
-    return normalized.isdigit() or normalized.startswith("village") or normalized.startswith("block")
-
-
 def derive_linked_helpdesk_location(row):
     household_type = row.get("household_type")
     camp_location = clean_text(row.get("camp_location"))
     helpdesk_camp = clean_text(row.get("helpdesk_camp_location"))
     helpdesk_village = clean_text(row.get("helpdesk_village"))
-    if not pd.isna(helpdesk_village):
-        if not pd.isna(helpdesk_camp) and village_needs_camp_prefix(helpdesk_village):
-            return f"{helpdesk_camp} {helpdesk_village}"
-        return helpdesk_village
-    if not pd.isna(helpdesk_camp):
-        return helpdesk_camp
     if is_host_community(household_type):
         return f"Host community - {camp_location}" if not pd.isna(camp_location) else "Host community"
+    if not pd.isna(helpdesk_camp):
+        return helpdesk_camp
+    if not pd.isna(helpdesk_village):
+        return helpdesk_village
     return "[Not recorded]"
 
 
@@ -1164,12 +2155,7 @@ def derive_adult_wgq_disability_domains(row):
 def derive_adult_additional_disability_category(row):
     if not is_adult(row):
         return "None"
-    for column in ADULT_DISABILITY_CATEGORY_COLUMNS:
-        if column in row.index:
-            standardized_value = standardize_disability_type(row[column])
-            if standardized_value != "None":
-                return standardized_value
-    return "None"
+    return specified_disability_type(row, ADULT_DISABILITY_CATEGORY_COLUMNS)
 
 
 def split_impairment_types(value):
@@ -1265,20 +2251,50 @@ def derive_child_disability_status(row):
     if not is_child(row):
         return "No Disability"
     response = normalize_response(row.get("has_disability"))
-    return "Has Disability" if response in ["yes", "y", "true", "1"] else "No Disability"
+    if response not in ["yes", "y", "true", "1"]:
+        return "No Disability"
+
+    disability_type = clean_text(row.get("child_disability_type"))
+    normalized_type = normalize_response(disability_type) if not pd.isna(disability_type) else None
+    is_other_or_missing = normalized_type is None or is_other_disability_response(disability_type)
+    if is_other_or_missing:
+        specified_type = specified_disability_type(row, ["child_disability_type_other"])
+        if specified_type == "None":
+            return "No Disability"
+
+    return "Has Disability"
 
 
 def derive_child_disability_type(row):
     if not is_child(row) or derive_child_disability_status(row) != "Has Disability":
         return "No Disability"
     disability_type = clean_text(row.get("child_disability_type"))
-    disability_type_other = clean_text(row.get("child_disability_type_other"))
-    invalid = {"other", "others", "other specify", "other specified", "none", "none of the above", "not applicable", "n/a", "na", "nil"}
-    if not pd.isna(disability_type) and normalize_response(disability_type) not in invalid:
+    invalid = {"other", "others", "other disability", "other disabilities", "other specify", "other specified", "none", "none of the above", "not applicable", "n/a", "na", "nil"}
+    normalized_type = normalize_response(disability_type) if not pd.isna(disability_type) else None
+    is_other_disability = normalized_type in invalid or is_other_disability_response(disability_type)
+    if normalized_type is not None and not is_other_disability:
         return standardize_disability_type(disability_type)
-    if not pd.isna(disability_type_other) and normalize_response(disability_type_other) not in invalid:
-        return standardize_disability_type(disability_type_other)
-    return "Not specified"
+
+    # The form's authoritative detail field for the Other Disability option.
+    specified_type = specified_disability_type(row, ["child_disability_type_other"])
+    if specified_type != "None":
+        return specified_type
+
+    # Retain compatibility with alternate Kobo export suffixes only if the
+    # authoritative field is absent or blank.
+    child_other_columns = list(CHILD_DISABILITY_OTHER_COLUMNS)
+    child_other_columns.extend(
+        column
+        for column in row.index
+        if column not in child_other_columns
+        and "child" in str(column).lower()
+        and "disability" in str(column).lower()
+        and any(token in str(column).lower() for token in ["other", "specif"])
+    )
+    specified_type = specified_disability_type(row, child_other_columns)
+    if specified_type != "None":
+        return specified_type
+    return "Other Disability"
 
 
 def derive_combined_disability_status(row):
@@ -1341,326 +2357,337 @@ def adult_person_impairment_frame(frame):
     return pd.DataFrame(rows)
 
 # -----------------------------------------------------------------------------
-# Data loading
+# KoboToolbox live source and schema contract
 # -----------------------------------------------------------------------------
-def get_kobo_config():
-    """Return KoboToolbox settings from Streamlit secrets, if configured."""
+def setting(name, default=None):
+    """Read configuration from Streamlit secrets first, then environment."""
     try:
-        kobo_secrets = st.secrets.get("kobo", {})
+        value = st.secrets.get(name, default)
     except Exception:
-        return {}
+        value = default
+    return os.environ.get(name, value)
 
-    export_url = kobo_secrets.get("export_url", "") if kobo_secrets else ""
-    api_token = kobo_secrets.get("api_token", "") if kobo_secrets else ""
 
-    # Also support top-level keys for users who did not nest them under [kobo].
-    if not export_url:
-        export_url = st.secrets.get("export_url", "")
-    if not api_token:
-        api_token = st.secrets.get("api_token", "")
+def normalize_kobo_base_url(value):
+    """Accept a Kobo server URL or a copied form page and retain only its host."""
+    raw = str(value or "https://eu.kobotoolbox.org").strip()
+    if not re.match(r"^https?://", raw, flags=re.I):
+        raw = "https://" + raw
+    parsed = urlsplit(raw)
+    return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
 
-    return {
-        "export_url": str(export_url).strip(),
-        "api_token": str(api_token).strip(),
-    }
+
+def normalize_kobo_asset_uid(value):
+    """Accept either the asset UID itself or a copied Kobo form URL."""
+    raw = str(value or "").strip()
+    match = re.search(r"(?:#/)?forms/([^/?#]+)", raw, flags=re.I)
+    if not match:
+        match = re.search(r"assets/([^/?#]+)", raw, flags=re.I)
+    return match.group(1) if match else raw
 
 
 def kobo_configured():
-    config = get_kobo_config()
-    return bool(config.get("export_url") and config.get("api_token"))
+    return bool(setting("KOBO_TOKEN") and normalize_kobo_asset_uid(setting("KOBO_ASSET_UID")))
 
 
-def normalize_kobo_export_url(export_url):
-    """Accept either a direct Kobo API/export URL or a Kobo form page URL."""
-    if "#/forms/" not in export_url:
-        return export_url
-
-    parsed = urllib.parse.urlparse(export_url)
-    match = re.search(r"/forms/([^/]+)/data", parsed.fragment)
-    if not match:
-        return export_url
-
-    asset_uid = match.group(1)
-    return f"{parsed.scheme}://{parsed.netloc}/api/v2/assets/{asset_uid}/data/?format=json"
-
-
-def data_source_signature():
-    if not kobo_configured():
-        st.error(
-            "KoboToolbox is not configured. Add export_url and api_token in Streamlit Secrets."
-        )
-        st.stop()
-
-    config = get_kobo_config()
-    return ("kobo", normalize_kobo_export_url(config["export_url"]), None, "Kobo live data")
+def configured_kobo_column_map():
+    """Optional XML name/path overrides for fields whose labels were renamed."""
+    raw = setting("KOBO_COLUMN_MAP", {})
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            raise ValueError("KOBO_COLUMN_MAP must be a JSON object or TOML table.")
+        return parsed
+    return {}
 
 
-@st.cache_data(ttl=KOBO_CACHE_TTL_SECONDS, show_spinner="Downloading latest KoboToolbox data...")
-def fetch_kobo_payload(export_url, api_token):
-    export_url = normalize_kobo_export_url(export_url)
-
-    def read_url(url):
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Token {api_token}",
-                "Accept": "application/json, text/csv, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet, */*",
-                "User-Agent": "tdh-helpdesk-streamlit-dashboard/1.0",
-            },
-        )
-        with urllib.request.urlopen(request, timeout=120) as response:
-            return {
-                "content": response.read(),
-                "content_type": response.headers.get("Content-Type", ""),
-                "url": response.geturl(),
-            }
-
-    try:
-        payload = read_url(export_url)
-
-        if "json" not in payload.get("content_type", "").lower() and "format=json" not in payload.get("url", "").lower():
-            return payload
-
-        try:
-            parsed = json.loads(payload["content"].decode("utf-8"))
-        except Exception:
-            return payload
-
-        if not isinstance(parsed, dict) or "results" not in parsed:
-            return payload
-
-        all_results = list(parsed.get("results") or [])
-        next_url = parsed.get("next")
-        current_url = payload["url"]
-        page_guard = 0
-
-        while next_url and page_guard < 500:
-            page_guard += 1
-            next_url = urllib.parse.urljoin(current_url, next_url)
-            page_payload = read_url(next_url)
-            current_url = page_payload["url"]
-            page = json.loads(page_payload["content"].decode("utf-8"))
-            all_results.extend(page.get("results") or [])
-            next_url = page.get("next")
-
-        return {
-            "content": json.dumps({"results": all_results}).encode("utf-8"),
-            "content_type": "application/json",
-            "url": payload["url"],
-        }
-    except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"KoboToolbox returned HTTP {error.code}: {detail}") from error
-    except urllib.error.URLError as error:
-        raise RuntimeError(f"Could not reach KoboToolbox: {error.reason}") from error
+def contract_norm(value):
+    value = str(value or "").strip().casefold()
+    value = value.replace("`", "'").replace("’", "'")
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
 
 
-def open_kobo_records_from_payload(payload):
-    content = payload["content"]
-    content_type = payload.get("content_type", "").lower()
-    source_url = payload.get("url", "").lower()
-
-    if "json" in content_type or "format=json" in source_url:
-        try:
-            parsed = json.loads(content.decode("utf-8"))
-        except Exception as error:
-            raise RuntimeError(f"KoboToolbox returned invalid JSON: {error}") from error
-
-        if isinstance(parsed, dict) and "results" in parsed:
-            return pd.json_normalize(parsed["results"]), None
-        if isinstance(parsed, list):
-            return pd.json_normalize(parsed), None
-        return pd.json_normalize(parsed), None
-
-    if "csv" in content_type or source_url.endswith(".csv"):
-        return pd.read_csv(io.BytesIO(content)), None
-
-    try:
-        workbook = pd.ExcelFile(io.BytesIO(content), engine="openpyxl")
-    except Exception as error:
-        raise RuntimeError(
-            "Could not read KoboToolbox response as Excel, CSV, or JSON. "
-            "Use a direct Kobo API data URL or a saved export data_url_xlsx/data_url_csv."
-        ) from error
-
-    data_sheet = "cleaned_data" if "cleaned_data" in workbook.sheet_names else workbook.sheet_names[0]
-    records = workbook.parse(data_sheet)
-    mapping = None
-    if "Column Mapping" in workbook.sheet_names:
-        try:
-            mapping = workbook.parse("Column Mapping")
-        except Exception:
-            mapping = None
-    return records, mapping
+def metadata_labels(value):
+    if isinstance(value, dict):
+        values = list(value.values())
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = [value]
+    return [str(item).strip() for item in values if str(item).strip()]
 
 
-def value_is_present(value):
-    if isinstance(value, (list, tuple, set)):
-        return any(value_is_present(part) for part in value)
-    try:
-        if pd.isna(value):
-            return False
-    except (TypeError, ValueError):
-        pass
-    value = str(value).strip()
-    if not value:
-        return False
-    return value.lower() not in {
-        "nan",
-        "none",
-        "null",
-        "missing",
-        "[missing]",
-        "not recorded",
-        "[not recorded]",
-        "n/a",
-        "na",
+def question_list_name(question):
+    list_name = str(question.get("select_from_list_name", "") or "").strip()
+    if list_name:
+        return list_name
+    match = re.search(r"select_(?:one|multiple)\s+(.+)$", str(question.get("type", "") or "").strip())
+    return match.group(1).strip() if match else ""
+
+
+def question_aliases(question):
+    name = str(question.get("name", "") or "").strip().lstrip("/")
+    xpath = str(question.get("$xpath", "") or "").strip().lstrip("/")
+    aliases = []
+    for value in (name, xpath):
+        if value and value not in aliases:
+            aliases.append(value)
+        if "/" in value:
+            without_root = value.split("/", 1)[1]
+            if without_root and without_root not in aliases:
+                aliases.append(without_root)
+    return aliases
+
+
+def resolve_contract_target(candidates):
+    exact = {str(key).strip(): value for key, value in RAW_TO_TRANSFORMED_COLUMNS.items()}
+    normalized = {contract_norm(key): value for key, value in RAW_TO_TRANSFORMED_COLUMNS.items()}
+    for candidate in candidates:
+        raw = str(candidate or "").strip()
+        target = exact.get(raw) or normalized.get(contract_norm(raw))
+        if target:
+            return target
+        if raw in ANALYSIS_COLUMN_NAMES:
+            return raw
+    return None
+
+
+def flatten_kobo_record(record, prefix=""):
+    flat = {}
+    for key, value in record.items():
+        full_key = f"{prefix}/{key}" if prefix else str(key)
+        if isinstance(value, dict):
+            flat.update(flatten_kobo_record(value, full_key))
+        else:
+            flat[full_key] = value
+    return flat
+
+
+@st.cache_data(show_spinner=False, ttl=KOBO_SCHEMA_CACHE_TTL_SECONDS, max_entries=4)
+def fetch_kobo_form_contract(base_url, asset_uid, token):
+    """Build field and choice mappings from the currently deployed XLSForm."""
+    url = f"{base_url.rstrip('/')}/api/v2/assets/{asset_uid}/"
+    response = requests.get(
+        url,
+        headers={"Authorization": f"Token {token}", "Accept": "application/json"},
+        timeout=KOBO_REQUEST_TIMEOUT_SECONDS,
+    )
+    if response.status_code in {401, 403}:
+        raise RuntimeError("Kobo rejected the token or this account cannot view the form schema.")
+    response.raise_for_status()
+    payload = response.json()
+    content = payload.get("content", {}) or {}
+    survey = content.get("survey", []) or []
+    choices = content.get("choices", []) or []
+    choices_by_list = {}
+    for choice in choices:
+        if isinstance(choice, dict):
+            choices_by_list.setdefault(str(choice.get("list_name", "") or "").strip(), []).append(choice)
+
+    schema_map = {}
+    single_choice_maps = {}
+    multiple_expansions = []
+    unresolved_questions = []
+
+    for question in survey:
+        if not isinstance(question, dict):
+            continue
+        aliases = question_aliases(question)
+        labels = metadata_labels(question.get("label", ""))
+        target = resolve_contract_target([*labels, *aliases])
+        if target:
+            for alias in aliases:
+                schema_map[alias] = target
+
+        question_type = str(question.get("type", "") or "").strip().lower()
+        list_name = question_list_name(question)
+        question_choices = choices_by_list.get(list_name, [])
+        if question_type.startswith("select_one") and target and question_choices:
+            translated = {}
+            for choice in question_choices:
+                code = str(choice.get("name", "") or "").strip()
+                labels_for_choice = metadata_labels(choice.get("label", ""))
+                if code and labels_for_choice:
+                    translated[code] = labels_for_choice[0]
+                    translated[contract_norm(code)] = labels_for_choice[0]
+            if translated:
+                single_choice_maps[target] = translated
+
+        if question_type.startswith("select_multiple") and question_choices:
+            for choice in question_choices:
+                code = str(choice.get("name", "") or "").strip()
+                choice_labels = metadata_labels(choice.get("label", ""))
+                expanded_candidates = []
+                for question_label in labels:
+                    for choice_label in choice_labels:
+                        expanded_candidates.append(f"{question_label}/{choice_label}")
+                binary_target = resolve_contract_target(expanded_candidates)
+                if code and binary_target:
+                    multiple_expansions.append(
+                        {"aliases": aliases, "code": code, "target": binary_target}
+                    )
+
+        if labels and not target and question_type not in {"begin_group", "end_group", "note"}:
+            if not any(item.get("aliases") == aliases for item in multiple_expansions):
+                unresolved_questions.append(labels[0])
+
+    # Explicit overrides win over schema inference and can point nested XML
+    # paths to any established transformed analysis column.
+    schema_map.update(configured_kobo_column_map())
+    return {
+        "asset_name": payload.get("name") or payload.get("settings", {}).get("form_title") or asset_uid,
+        "schema_map": schema_map,
+        "single_choice_maps": single_choice_maps,
+        "multiple_expansions": multiple_expansions,
+        "unresolved_questions": sorted(set(unresolved_questions)),
     }
 
 
-def populated_count(series):
-    return int(series.map(value_is_present).sum())
-
-
-def assign_or_fill_column(frame, target_column, source_column):
-    if source_column not in frame.columns:
-        return
-
-    source_values = frame[source_column]
-    if target_column not in frame.columns:
-        frame[target_column] = source_values
-        return
-
-    source_mask = source_values.map(value_is_present)
-    target_mask = frame[target_column].map(value_is_present)
-    if source_mask.sum() > target_mask.sum():
-        frame[target_column] = frame[target_column].where(target_mask, source_values)
-        if populated_count(source_values) > populated_count(frame[target_column]):
-            frame[target_column] = source_values
-
-
-def normalized_slug(value):
-    value = str(value).replace("/", "_").replace(".", "_").strip()
-    value = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
-    return re.sub(r"_+", "_", value).lower()
-
-
-def column_matches_alias(column, alias):
-    column = normalized_slug(column)
-    alias = normalized_slug(alias)
-    if not alias:
-        return False
-    return column == alias or column.endswith(f"_{alias}")
-
-
-def best_matching_column(frame, aliases, exclude=None):
-    exclude = set(exclude or [])
-    candidates = [
-        column
-        for column in frame.columns
-        if column not in exclude and any(column_matches_alias(column, alias) for alias in aliases)
-    ]
-    if not candidates:
-        return None
-    candidates = sorted(
-        candidates,
-        key=lambda column: (populated_count(frame[column]), -len(column)),
-        reverse=True,
-    )
-    return candidates[0] if populated_count(frame[candidates[0]]) else None
-
-
-def map_standard_fields(frame):
-    for target_column, aliases in FIELD_ALIASES.items():
-        source_column = best_matching_column(frame, aliases, exclude={target_column})
-        if source_column:
-            assign_or_fill_column(frame, target_column, source_column)
-
-
-def map_select_multiple_indicator_columns(frame):
-    parent_columns = {"main_protection_concern", "general_information_type", "referred_partner"}
-    parent_columns.update(FIELD_ALIASES["main_protection_concern"])
-    parent_columns.update(FIELD_ALIASES["general_information_type"])
-    parent_columns.update(FIELD_ALIASES["referred_partner"])
-
-    for needle, target_column in SELECT_MULTIPLE_ALIASES:
-        target_short = re.sub(r"^(concern|info|ref_partner)_", "", target_column)
-        aliases = {target_column, needle, target_short}
-        source_column = best_matching_column(frame, aliases, exclude=parent_columns | {target_column})
-        if source_column:
-            assign_or_fill_column(frame, target_column, source_column)
-
-def map_kobo_columns_to_dashboard(frame):
-    """Map Kobo JSON/export columns to the cleaned names used by the dashboard."""
-    map_standard_fields(frame)
-    map_select_multiple_indicator_columns(frame)
-
-
-def select_value_matches(value, aliases):
+def selected_choice(value, code):
+    if value is None or (not isinstance(value, (list, tuple, set)) and pd.isna(value)):
+        return 0
     if isinstance(value, (list, tuple, set)):
-        raw_parts = [str(part) for part in value]
+        tokens = {str(item).strip() for item in value}
     else:
-        if not value_is_present(value):
-            return False
-        raw_parts = re.split(r"[\s,;|/]+", str(value))
-        raw_parts.append(str(value))
-
-    normalized_parts = {normalize_response(part) for part in raw_parts if value_is_present(part)}
-    normalized_parts.discard(None)
-    normalized_full = normalize_response(" ".join(str(part) for part in raw_parts if value_is_present(part))) or ""
-    compact_full = normalized_full.replace(" ", "_")
-
-    for alias in aliases:
-        alias_norm = normalize_response(alias)
-        if not alias_norm:
-            continue
-        alias_compact = alias_norm.replace(" ", "_")
-        if alias_norm in normalized_parts:
-            return True
-        if f" {alias_norm} " in f" {normalized_full} ":
-            return True
-        if alias_compact in {part.replace(" ", "_") for part in normalized_parts}:
-            return True
-        if alias_compact and alias_compact in compact_full:
-            return True
-    return False
+        tokens = {item for item in re.split(r"[\s;,|]+", str(value).strip()) if item}
+    return int(str(code).strip() in tokens)
 
 
-def expand_select_multiple_parent(frame, source_column, aliases):
-    if source_column not in frame.columns:
-        return
-
-    source_values = frame[source_column]
-    for needle, target in aliases:
-        target_aliases = {
-            needle,
-            target,
-            re.sub(r"^(concern|info|ref_partner)_", "", target),
-            re.sub(r"^(concern|info|ref_partner)_", "", target).replace("_", " "),
-            DEFAULT_LABEL_MAP.get(target, ""),
-        }
-        selected_mask = source_values.map(lambda value: select_value_matches(value, target_aliases))
-        if target not in frame.columns:
-            frame[target] = pd.NA
-        frame.loc[selected_mask, target] = 1
+def coalesce_duplicate_columns(frame):
+    if not frame.columns.duplicated().any():
+        return frame
+    combined = {}
+    for position, column in enumerate(frame.columns):
+        series = frame.iloc[:, position]
+        if column not in combined:
+            combined[column] = series.copy()
+        else:
+            current = combined[column]
+            missing = current.isna() | current.astype(str).str.strip().isin(["", "nan", "None"])
+            combined[column] = current.where(~missing, series)
+    return pd.DataFrame(combined, index=frame.index)
 
 
-def row_has_detail(value):
-    value = clean_text(value)
-    if pd.isna(value):
-        return False
-    normalized = normalize_response(value)
-    return normalized not in {"0", "false", "no", "n", "none", "not selected", "unchecked"}
+def harmonize_input_columns(frame):
+    """Apply the immutable label/name contract without relying on positions."""
+    out = frame.copy()
+    out.columns = [str(column).strip() for column in out.columns]
+    original_columns = list(out.columns)
+    exact = {str(key).strip(): value for key, value in RAW_TO_TRANSFORMED_COLUMNS.items()}
+    normalized = {contract_norm(key): value for key, value in RAW_TO_TRANSFORMED_COLUMNS.items()}
+    rename_map = {}
+    for column in out.columns:
+        target = exact.get(column) or normalized.get(contract_norm(column))
+        if target:
+            rename_map[column] = target
+        elif column in ANALYSIS_COLUMN_NAMES:
+            rename_map[column] = column
+    if rename_map:
+        out = out.rename(columns=rename_map)
+    out = coalesce_duplicate_columns(out)
+    mapped_sources = set(rename_map)
+    out.attrs["unmapped_source_columns"] = sorted(
+        column for column in original_columns if column not in mapped_sources and not str(column).startswith("_")
+    )
+    out.attrs["missing_contract_columns"] = sorted(set(ANALYSIS_COLUMN_NAMES) - set(out.columns))
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=KOBO_CACHE_TTL_SECONDS, max_entries=4)
+def fetch_kobo_submissions(base_url, asset_uid, token, refresh_nonce=0):
+    """Fetch all Kobo KPI v2 pages and convert them to the dashboard contract."""
+    del refresh_nonce
+    url = f"{base_url.rstrip('/')}/api/v2/assets/{asset_uid}/data/"
+    headers = {"Authorization": f"Token {token}", "Accept": "application/json"}
+    submissions = []
+    page_count = 0
+    with requests.Session() as session:
+        while url:
+            response = session.get(url, headers=headers, timeout=KOBO_REQUEST_TIMEOUT_SECONDS)
+            if response.status_code in {401, 403}:
+                raise RuntimeError("Kobo rejected the token or this account cannot view submissions.")
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, list):
+                submissions.extend(payload)
+                url = None
+            else:
+                submissions.extend(payload.get("results", []))
+                url = payload.get("next")
+            page_count += 1
+            if page_count > KOBO_PAGE_SAFETY_LIMIT:
+                raise RuntimeError("Kobo pagination exceeded the safety limit.")
+
+    flattened = [flatten_kobo_record(item) for item in submissions]
+    raw = pd.json_normalize(flattened, sep="/") if flattened else pd.DataFrame()
+    contract = fetch_kobo_form_contract(base_url, asset_uid, token)
+
+    # Recreate Kobo export's expanded binary columns from select_multiple
+    # response codes before field renaming.
+    for expansion in contract["multiple_expansions"]:
+        source = next((alias for alias in expansion["aliases"] if alias in raw.columns), None)
+        if source:
+            values = raw[source].map(lambda value, code=expansion["code"]: selected_choice(value, code))
+            target = expansion["target"]
+            if target in raw.columns:
+                raw[target] = pd.to_numeric(raw[target], errors="coerce").fillna(values)
+            else:
+                raw[target] = values
+
+    applicable = {
+        source: target
+        for source, target in contract["schema_map"].items()
+        if source in raw.columns
+    }
+    if applicable:
+        raw = raw.rename(columns=applicable)
+    raw = coalesce_duplicate_columns(raw)
+
+    for target, choice_map in contract["single_choice_maps"].items():
+        if target in raw.columns:
+            raw[target] = raw[target].map(
+                lambda value, mapping=choice_map: mapping.get(str(value).strip())
+                or mapping.get(contract_norm(value))
+                or value
+            )
+
+    raw = harmonize_input_columns(raw)
+    metadata = {
+        "mode": "KoboToolbox API",
+        "asset_uid": asset_uid,
+        "asset_name": contract["asset_name"],
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "api_pages": page_count,
+        "raw_records": len(raw),
+        "unmapped_source_columns": raw.attrs.get("unmapped_source_columns", []),
+        "missing_contract_columns": raw.attrs.get("missing_contract_columns", []),
+        "unresolved_schema_questions": contract["unresolved_questions"],
+    }
+    return raw, metadata
+
+
+# -----------------------------------------------------------------------------
+# Data loading
+# -----------------------------------------------------------------------------
+def data_file_signature(path):
+    if not path.exists():
+        return str(path), None, None, None
+    stat = path.stat()
+    return (
+        str(path.resolve()),
+        stat.st_mtime_ns,
+        stat.st_size,
+        pd.to_datetime(stat.st_mtime, unit="s").strftime("%d %b %Y %H:%M:%S"),
+    )
 
 
 def build_label_map(mapping, prefix):
-    label_map = {
-        column: label
-        for column, label in DEFAULT_LABEL_MAP.items()
-        if column.startswith(prefix) and not column.endswith("_specify")
-    }
     if mapping is None or mapping.empty or "cleaned_column_name" not in mapping.columns:
-        return label_map
+        return {}
+    label_map = {}
     selected = mapping[mapping["cleaned_column_name"].astype(str).str.startswith(prefix)]
     for _, row in selected.iterrows():
         cleaned_name = row["cleaned_column_name"]
@@ -1668,7 +2695,7 @@ def build_label_map(mapping, prefix):
             continue
         original_name = clean_text(row.get("original_column_name"))
         if pd.isna(original_name):
-            label = DEFAULT_LABEL_MAP.get(cleaned_name, safe_label_from_code(cleaned_name))
+            label = safe_label_from_code(cleaned_name)
         elif "/" in str(original_name):
             label = str(original_name).split("/", 1)[1].strip()
         else:
@@ -1677,35 +2704,85 @@ def build_label_map(mapping, prefix):
     return label_map
 
 
-@st.cache_data(ttl=KOBO_CACHE_TTL_SECONDS, show_spinner="Loading latest helpdesk dataset...")
+@st.cache_resource(show_spinner="Loading latest helpdesk dataset...", ttl=KOBO_CACHE_TTL_SECONDS, max_entries=4)
 def load_data(source_signature):
-    config = get_kobo_config()
-    try:
-        payload = fetch_kobo_payload(config["export_url"], config["api_token"])
-        records, mapping = open_kobo_records_from_payload(payload)
-    except Exception as error:
-        st.error(f"Could not load KoboToolbox data: {error}")
-        st.stop()
+    source_mode = source_signature[0]
+    file_signature = source_signature[1:] if source_mode == "local" else (None, None, None, None)
+    if source_mode == "local" and not DATA_FILE_PATH.exists():
+        raise FileNotFoundError(f"File not found: {DATA_FILE_PATH}")
 
-    if mapping is None:
-        mapping = pd.DataFrame()
+    # Fast path for deployed apps: load already-processed data if a matching
+    # processed cache exists. This avoids reparsing Excel and rerunning all
+    # transformations on Streamlit Cloud cold starts. Generate this cache once
+    # locally by running the app, then commit data/processed/helpdesk_processed_cache.pkl.
+    processed_cache_key = {
+        "version": PROCESSED_CACHE_VERSION,
+        # Use file size, not modified time, so a cache generated locally and
+        # committed to GitHub can still match after Streamlit Cloud checkout
+        # changes file timestamps.
+        "source_size": file_signature[2],
+    }
+    if source_mode == "local" and PROCESSED_CACHE_PATH.exists():
+        try:
+            with PROCESSED_CACHE_PATH.open("rb") as cache_file:
+                cached_payload = pickle.load(cache_file)
+            if cached_payload.get("cache_key") == processed_cache_key:
+                return migrate_processed_cache_data(cached_payload["data"])
+        except Exception:
+            # If the processed cache is stale/corrupt, fall back to rebuilding
+            # from Excel rather than blocking the app.
+            pass
 
-    try:
-        records = records.copy()
-    except Exception as error:
-        st.error(f"Could not prepare source records: {error}")
-        st.stop()
+    source_metadata = {"mode": "Local Excel fallback"}
+    if source_mode == "kobo":
+        base_url, asset_uid, refresh_nonce = source_signature[1:4]
+        token = str(setting("KOBO_TOKEN"))
+        records, source_metadata = fetch_kobo_submissions(
+            base_url, asset_uid, token, refresh_nonce
+        )
+    else:
+        try:
+            if DATA_FILE_PATH.suffix.lower() == ".csv":
+                records = pd.read_csv(DATA_FILE_PATH)
+            else:
+                records = pd.read_excel(DATA_FILE_PATH)
+        except Exception as error:
+            raise RuntimeError(f"Could not read the workbook: {error}") from error
+        records = harmonize_input_columns(records)
+        source_metadata.update(
+            {
+                "raw_records": len(records),
+                "fetched_at": file_signature[3],
+                "unmapped_source_columns": records.attrs.get("unmapped_source_columns", []),
+                "missing_contract_columns": records.attrs.get("missing_contract_columns", []),
+            }
+        )
 
-    if records.empty:
-        st.error("The selected data source returned no records.")
-        st.stop()
+    # Consent is an eligibility gate, not a dashboard category. Exclude only
+    # explicit refusals before deriving fields or calculating any result.
+    consent_priority = [
+        "consent",
+        "do_you_consent",
+        "consent_to_participate",
+        "information_statement",
+    ]
+    consent_column = next((column for column in consent_priority if column in records.columns), None)
+    if consent_column is None:
+        consent_column = next(
+            (column for column in records.columns if "consent" in str(column).lower()),
+            None,
+        )
+    if consent_column is not None:
+        records["consent_raw"] = records[consent_column].map(clean_text)
+        records["consent_declined"] = records[consent_column].map(consent_is_declined)
+        records = records.loc[~records["consent_declined"]].copy()
+    else:
+        records["consent_raw"] = pd.NA
+        records["consent_declined"] = False
 
-    records.columns = [str(column).replace("/", "_").strip() for column in records.columns]
-    records.columns = [re.sub(r"[^A-Za-z0-9_]+", "_", column).strip("_") for column in records.columns]
-    records.columns = [re.sub(r"_+", "_", column).lower() for column in records.columns]
-    map_kobo_columns_to_dashboard(records)
+    mapping = pd.DataFrame(COLUMN_MAPPING_RECORDS)
 
-    expected_source_columns = [
+    required_columns = [
         "interview_date",
         "staff_name",
         "gps_latitude",
@@ -1717,29 +2794,24 @@ def load_data(source_signature):
         "information_seeker_age",
         "information_seeker_type",
         "information_seeker_gender",
+        "visited_tdh_helpdesk_before",
+        "last_visit_within_current_month",
+        "child_unaccompanied_minor",
+        "respondent_relationship_to_child",
+        "respondent_relationship_other",
         "request_type_protection_or_information",
-        "main_protection_concern",
-        "general_information_type",
         "action_taken",
         "follow_up_required",
         "has_disability",
         "child_disability_type",
         "child_disability_type_other",
     ]
-    expected_source_columns.extend(WGQ_DISABILITY_DOMAINS.keys())
-    expected_source_columns.extend(ADULT_DISABILITY_CATEGORY_COLUMNS)
-    if "interview_date" not in records.columns and "submission_time" in records.columns:
-        records["interview_date"] = records["submission_time"]
-    if "record_id" not in records.columns:
-        records["record_id"] = records.get("id", records.index.astype(str))
-
-    for column in expected_source_columns:
+    required_columns.extend(WGQ_DISABILITY_DOMAINS.keys())
+    required_columns.extend(ADULT_DISABILITY_CATEGORY_COLUMNS)
+    required_columns.extend(CHILD_DISABILITY_OTHER_COLUMNS)
+    for column in required_columns:
         if column not in records.columns:
             records[column] = pd.NA
-
-    expand_select_multiple_parent(records, "main_protection_concern", PROTECTION_SELECT_ALIASES)
-    expand_select_multiple_parent(records, "general_information_type", INFORMATION_SELECT_ALIASES)
-    expand_select_multiple_parent(records, "referred_partner", REFERRAL_SELECT_ALIASES)
 
     records["source_row_number"] = records.index + 2
     records["record_id"] = records["source_row_number"].map(lambda row: f"HD-{row:05d}")
@@ -1755,7 +2827,7 @@ def load_data(source_signature):
 
     records["staff_name"] = records["staff_name"].map(normalize_staff_name)
     records["household_type"] = records["household_type"].map(clean_text)
-    records["age_group"] = records["information_seeker_age"].map(standardize_age_group)
+    records["age_group"] = records["information_seeker_age"].map(clean_text)
     records["derived_life_stage"] = records["age_group"].map(age_group_life_stage)
     records["information_seeker_type_raw"] = records["information_seeker_type"].map(clean_text)
     records["information_seeker_gender_raw"] = records["information_seeker_gender"].map(clean_text)
@@ -1770,38 +2842,46 @@ def load_data(source_signature):
     records["gender_age_correction_flag"] = records["information_seeker_gender_raw"].fillna("[Missing]") != records[
         "information_seeker_gender"
     ].fillna("[Missing]")
+    records["visited_tdh_helpdesk_before_raw"] = records[
+        "visited_tdh_helpdesk_before"
+    ].map(clean_text)
+    records["helpdesk_visit_history"] = records[
+        "visited_tdh_helpdesk_before"
+    ].map(derive_helpdesk_visit_history)
+    records["last_visit_within_current_month_raw"] = records[
+        "last_visit_within_current_month"
+    ].map(clean_text)
+    records["repeat_visit_timing"] = records.apply(
+        derive_repeat_visit_timing,
+        axis=1,
+    )
+    records["visit_history_consistency"] = records.apply(
+        derive_visit_history_consistency,
+        axis=1,
+    )
+    records["visit_history_inconsistency_flag"] = records[
+        "visit_history_consistency"
+    ].astype(str).str.startswith("Review")
+    records["child_unaccompanied_minor_raw"] = records[
+        "child_unaccompanied_minor"
+    ].map(clean_text)
+    records["respondent_relationship_to_child_raw"] = records[
+        "respondent_relationship_to_child"
+    ].map(clean_text)
+    records["respondent_relationship_other_raw"] = records[
+        "respondent_relationship_other"
+    ].map(clean_text)
+    records["child_accompaniment_status"] = records.apply(
+        derive_child_accompaniment_status,
+        axis=1,
+    )
 
-    protection_indicator_cols = [
-        col
-        for col in records.columns
-        if col.startswith("concern_") and not col.endswith("_specify")
-    ]
-    information_indicator_cols = [
-        col
-        for col in records.columns
-        if col.startswith("info_") and not col.endswith("_specify")
-    ]
-
-    records["request_category"] = records["request_type_protection_or_information"].map(normalize_request_category)
-
-    has_protection_detail = records.get("main_protection_concern", pd.Series(pd.NA, index=records.index)).map(row_has_detail)
-    if protection_indicator_cols:
-        protection_selected = records[protection_indicator_cols].apply(lambda column: column.map(is_selected_indicator))
-        has_protection_detail = has_protection_detail | protection_selected.any(axis=1)
-
-    has_information_detail = records.get("general_information_type", pd.Series(pd.NA, index=records.index)).map(row_has_detail)
-    if information_indicator_cols:
-        information_selected = records[information_indicator_cols].apply(lambda column: column.map(is_selected_indicator))
-        has_information_detail = has_information_detail | information_selected.any(axis=1)
-
-    request_missing = records["request_category"].isna() | records["request_category"].map(clean_text).isna()
-    records.loc[request_missing & has_protection_detail, "request_category"] = "Reporting a protection concern"
-    request_missing = records["request_category"].isna() | records["request_category"].map(clean_text).isna()
-    records.loc[request_missing & ~has_protection_detail & has_information_detail, "request_category"] = "Seeking general protection information"
-    records["request_category"] = records["request_category"].fillna("[Missing]")
-    records["action_taken_clean"] = records["action_taken"].map(normalize_action_taken)
-    records["follow_up_required_clean"] = records["follow_up_required"].map(normalize_yes_no)
+    records["request_category"] = records["request_type_protection_or_information"].map(clean_text)
+    records["action_taken_clean"] = records["action_taken"].map(clean_text)
+    records["follow_up_required_clean"] = records["follow_up_required"].map(clean_text)
     records["helpdesk_location"] = records.apply(derive_linked_helpdesk_location, axis=1)
+    records["has_disability_raw"] = records["has_disability"].map(clean_text)
+    records["child_disability_type_raw"] = records["child_disability_type"].map(clean_text)
 
     records["adult_wgq_disability_domains"] = records.apply(derive_adult_wgq_disability_domains, axis=1)
     records["adult_additional_disability_category"] = records.apply(derive_adult_additional_disability_category, axis=1)
@@ -1817,6 +2897,20 @@ def load_data(source_signature):
     records["adult_disability_exclusion_risk"] = records.apply(derive_adult_disability_exclusion_risk, axis=1)
 
     records["child_disability_status"] = records.apply(derive_child_disability_status, axis=1)
+    # Apply the correction to the working source field as well as the derived
+    # status. This ensures every downstream KPI, chart, table and export counts
+    # an unsubstantiated child "Other Disability" response alongside No.
+    child_other_without_detail = (
+        records.apply(is_child, axis=1)
+        & records["has_disability_raw"].map(lambda value: normalize_response(value) in ["yes", "y", "true", "1"])
+        & records["child_disability_type_raw"].map(is_other_disability_response)
+        & records.apply(
+            lambda row: specified_disability_type(row, ["child_disability_type_other"]) == "None",
+            axis=1,
+        )
+    )
+    records["child_disability_reclassified_no"] = child_other_without_detail
+    records.loc[child_other_without_detail, "has_disability"] = "No"
     records["child_disability_type"] = records.apply(derive_child_disability_type, axis=1)
     records["disability_status"] = records.apply(derive_combined_disability_status, axis=1)
     records["disability_type"] = records.apply(derive_combined_disability_type, axis=1)
@@ -1830,23 +2924,11 @@ def load_data(source_signature):
     ] = "Information counselling only"
     records.loc[records["action_taken_clean"].eq("Action not taken at all"), "referral_status"] = "No action taken"
 
-    dashboard_fields = ["interview_date", "information_seeker_type", "camp_location", "information_seeker_gender", "age_group", "request_category"]
-    for col in dashboard_fields:
+    core_fields = ["interview_date", "information_seeker_type", "camp_location", "information_seeker_gender", "age_group", "request_category"]
+    for col in core_fields:
         if col not in records.columns:
             records[col] = pd.NA
-    valid_date_mask = records["interview_date"].notna()
-    if not valid_date_mask.any():
-        missing_summary = records[dashboard_fields].isna().sum().reset_index()
-        missing_summary.columns = ["Dashboard field", "Missing rows"]
-        st.error(
-            "Kobo data was received, but no rows had a valid interview date. "
-            "This usually means the Kobo date field is not mapped to interview_date."
-        )
-        st.dataframe(missing_summary, use_container_width=True, hide_index=True)
-        with st.expander("Available Kobo columns"):
-            st.write(sorted(records.columns.tolist()))
-        st.stop()
-    records = records[valid_date_mask].copy()
+    records = records[records[core_fields].notna().all(axis=1)].copy()
 
     id_cols = [col for col in CORE_RECORD_COLUMNS if col in records.columns]
     protection_cols = [col for col in records.columns if col.startswith("concern_") and not col.endswith("_specify")]
@@ -1861,7 +2943,7 @@ def load_data(source_signature):
         if not cols:
             return pd.DataFrame(columns=id_cols + [code_name, label_name])
         long = records[id_cols + cols].melt(id_vars=id_cols, value_vars=cols, var_name=code_name, value_name="selected")
-        long = long[long["selected"].map(is_selected_indicator)].drop(columns="selected")
+        long = long[pd.to_numeric(long["selected"], errors="coerce").eq(1)].drop(columns="selected")
         long[label_name] = long[code_name].map(label_map).fillna(long[code_name].map(safe_label_from_code))
         return long
 
@@ -1881,28 +2963,61 @@ def load_data(source_signature):
     # This prevents charts/tables from keeping a generic "Other Not Listed"
     # bucket when the respondent actually specified a meaningful value.
     # ------------------------------------------------------------------
-    main_protection_labels = [
+    protection_other_codes = protection["protection_concern_code"].astype(str).str.contains(
+        r"^concern_.*other", case=False, na=False, regex=True
+    ) if not protection.empty else pd.Series(dtype=bool)
+    observed_protection_labels = (
+        protection.loc[~protection_other_codes, "protection_concern"].dropna().astype(str).tolist()
+        if not protection.empty
+        else []
+    )
+    main_protection_labels = list(dict.fromkeys([
         value
-        for value in protection_label_map.values()
+        for value in list(protection_label_map.values()) + observed_protection_labels
         if value and normalize_response(value) not in ["other", "other not listed", "others", "other specify"]
-    ]
+    ]))
     main_information_labels = [
         value
         for value in information_label_map.values()
         if value and normalize_response(value) not in ["other", "other not listed", "others", "other specify"]
     ]
 
-    if not protection.empty and "concern_other_specify" in records.columns:
-        concern_specify_values = records.set_index("record_id")["concern_other_specify"].to_dict()
-        concern_other_mask = protection["protection_concern_code"].astype(str).eq("concern_other_not_listed")
+    concern_specify_columns = [
+        column
+        for column in records.columns
+        if str(column).startswith("concern_") and str(column).endswith("_specify")
+    ]
+    if "concern_other_specify" in concern_specify_columns:
+        concern_specify_columns.remove("concern_other_specify")
+        concern_specify_columns.insert(0, "concern_other_specify")
+
+    if not protection.empty and concern_specify_columns:
+        concern_specify_values = records.set_index("record_id")[concern_specify_columns].apply(
+            lambda row: next(
+                (clean_text(value) for value in row if not pd.isna(clean_text(value))),
+                pd.NA,
+            ),
+            axis=1,
+        ).to_dict()
+        concern_other_mask = protection["protection_concern_code"].astype(str).str.contains(
+            r"^concern_.*other",
+            case=False,
+            na=False,
+            regex=True,
+        )
         protection.loc[concern_other_mask, "protection_concern"] = protection.loc[
             concern_other_mask, "record_id"
         ].map(
-            lambda record_id: harmonize_free_text(
+            lambda record_id: harmonize_protection_concern_text(
                 clean_text(concern_specify_values.get(record_id)),
                 main_protection_labels,
                 default="Other Not Listed",
             )
+        )
+
+    if not protection.empty and "protection_concern" in protection.columns:
+        protection["protection_concern"] = protection["protection_concern"].map(
+            standardize_protection_concern_label
         )
 
     if not information.empty and "info_other_specify" in records.columns:
@@ -1916,6 +3031,11 @@ def load_data(source_signature):
                 main_information_labels,
                 default="Other Not Listed",
             )
+        )
+
+    if not information.empty and "general_information_need" in information.columns:
+        information["general_information_need"] = information["general_information_need"].map(
+            standardize_information_need_label
         )
 
     # Referral partner harmonization:
@@ -1963,6 +3083,22 @@ def load_data(source_signature):
 
     if not referrals.empty and "referral_partner" in referrals.columns:
         referrals["referral_partner"] = referrals["referral_partner"].map(normalize_organization_label)
+        # Partner selections are valid only for cases whose final action was a
+        # partner-agency referral. Keep one row per case-partner assignment;
+        # a case sent to two partners legitimately contributes two mentions.
+        partner_referred_ids = set(
+            records.loc[
+                records["referral_status"].eq("Referred to partner agency"),
+                "record_id",
+            ].astype(str)
+        )
+        referrals = referrals[
+            referrals["record_id"].astype(str).isin(partner_referred_ids)
+        ].copy()
+        referrals = referrals.drop_duplicates(
+            subset=["record_id", "referral_partner"],
+            keep="first",
+        )
 
     # Keep two record frames:
     # - secure_records keeps PII for password-protected DQA follow-up tables.
@@ -1985,6 +3121,11 @@ def load_data(source_signature):
                 "adult_multiple_impairment_records",
                 "gender_age_corrected_records",
                 "type_age_corrected_records",
+                "first_time_visitor_records",
+                "repeat_visitor_records",
+                "repeat_visits_within_current_month",
+                "visit_history_inconsistency_records",
+                "unaccompanied_child_records",
             ],
             "value": [
                 len(dashboard_records),
@@ -2000,12 +3141,38 @@ def load_data(source_signature):
                 dashboard_records["adult_wgq_multiplicity"].eq("Multiple Impairments").sum(),
                 dashboard_records["gender_age_correction_flag"].sum(),
                 dashboard_records["type_age_correction_flag"].sum(),
+                dashboard_records["helpdesk_visit_history"].eq("First-time visitor").sum(),
+                dashboard_records["helpdesk_visit_history"].eq("Repeat visitor").sum(),
+                dashboard_records["repeat_visit_timing"].eq("Repeat — within current month").sum(),
+                dashboard_records["visit_history_inconsistency_flag"].sum(),
+                dashboard_records["child_accompaniment_status"].eq("Unaccompanied").sum(),
             ],
         }
     )
 
     processed_data = (dashboard_records, secure_records, protection, information, referrals, kpis)
-    return processed_data
+    if source_mode == "local":
+        try:
+            PROCESSED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with PROCESSED_CACHE_PATH.open("wb") as cache_file:
+                pickle.dump(
+                    {
+                        "cache_key": processed_cache_key,
+                        "data": processed_data,
+                    },
+                    cache_file,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+        except Exception:
+            # Processed-cache writing is an optimization only; the app should
+            # still work when the filesystem is read-only.
+            pass
+
+    migrated = migrate_processed_cache_data(processed_data)
+    for frame in migrated:
+        if hasattr(frame, "attrs"):
+            frame.attrs["source_metadata"] = source_metadata
+    return migrated
 
 # -----------------------------------------------------------------------------
 # Filter, chart, table, and UI helpers
@@ -2031,9 +3198,12 @@ def sanitize_multiselect_state(key, options):
 def reset_filters(default_from_date, max_date):
     st.session_state["from_date_filter"] = default_from_date
     st.session_state["to_date_filter"] = max_date
+    st.session_state.pop("date_range_filter", None)
     for key in FILTER_KEYS:
         st.session_state[key] = []
     st.session_state["records_search"] = ""
+    st.session_state["helpdesk_section_category"] = "Summary"
+    st.session_state["helpdesk_section"] = "Overview"
 
 
 def apply_filters(frame, filters):
@@ -2057,21 +3227,113 @@ def apply_filters(frame, filters):
 
 def gender_color(field, available=None):
     available = [gender for gender in (available or GENDER_ORDER) if gender in GENDER_COLORS]
+    legend_columns = max(1, min(5, len(available)))
     return alt.Color(
         field,
         title="Gender",
         scale=alt.Scale(domain=available, range=[GENDER_COLORS[g] for g in available]),
         sort=available,
+        legend=alt.Legend(
+            symbolType="circle",
+            orient="bottom",
+            direction="horizontal",
+            columns=legend_columns,
+            labelLimit=140,
+            columnPadding=18,
+            rowPadding=4,
+        ),
     )
+
+
+def category_color(field, title=None, domain=None, legend=True):
+    color_kwargs = {
+        "title": title,
+        "scale": alt.Scale(range=CHART_CATEGORY_COLORS),
+    }
+
+    if domain:
+        color_kwargs["scale"] = alt.Scale(
+            domain=domain,
+            range=CHART_CATEGORY_COLORS[: len(domain)],
+        )
+
+    if legend:
+        color_kwargs["legend"] = alt.Legend(symbolType="circle", orient="bottom", columns=3, labelLimit=120)
+    else:
+        color_kwargs["legend"] = None
+
+    return alt.Color(field, **color_kwargs)
 
 
 def polish_chart(chart):
     return (
-        chart.configure_axis(labelColor="#334155", titleColor="#1E293B", gridColor="#E2E8F0", domainColor="#CBD5D1", tickColor="#CBD5D1", labelFontSize=12, titleFontSize=13, titleFontWeight=600, labelLimit=1000)
-        .configure_legend(labelColor="#1E293B", titleColor="#1E293B", labelFontSize=12, titleFontSize=13, titleFontWeight=600, orient="bottom", symbolType="circle", symbolSize=120)
+        chart.configure_axis(
+            labelColor="#334155",
+            titleColor="#1E293B",
+            gridColor="#E2E8F0",
+            domainColor="#CBD5D1",
+            tickColor="#CBD5D1",
+            labelFontSize=12,
+            titleFontSize=13,
+            titleFontWeight=700,
+            labelLimit=1000,
+            labelPadding=6,
+            titlePadding=10,
+        )
+        .configure_axisY(grid=True)
+        .configure_axisX(
+            grid=False,
+            labelBound=True,
+            labelFlush=True,
+            labelFlushOffset=4,
+            labelOverlap="parity",
+            labelLimit=160,
+        )
+        .configure_legend(
+            labelColor="#1E293B",
+            titleColor="#1E293B",
+            labelFontSize=12,
+            titleFontSize=13,
+            titleFontWeight=700,
+            orient="bottom",
+            symbolType="circle",
+            symbolSize=125,
+        )
+        .configure_header(
+            labelColor="#12312F",
+            titleColor="#12312F",
+            labelFontSize=12,
+            titleFontSize=13,
+            labelFontWeight=700,
+            titleFontWeight=800,
+        )
+        .configure_title(
+            color="#12312F",
+            fontSize=15,
+            fontWeight=800,
+            anchor="start",
+            offset=10,
+        )
         .configure_view(strokeWidth=0)
         .configure(background="transparent", font="Inter, Segoe UI, system-ui, sans-serif")
     )
+
+
+def display_category_value(value):
+    """Apply concise presentation labels without altering retained raw values."""
+    if pd.isna(value):
+        return value
+    normalized = normalize_response(value)
+    if normalized and "chronic illness" in normalized:
+        return "Chronic Illnesses"
+    return value
+
+
+def chart_headroom(values, fraction=0.18):
+    """Return a safe quantitative upper bound for labels drawn beyond marks."""
+    numeric = pd.to_numeric(pd.Series(values), errors="coerce").fillna(0)
+    maximum = float(numeric.max()) if not numeric.empty else 0.0
+    return max(1.0, maximum * (1.0 + fraction))
 
 
 def gender_pivot_table(frame, category_column, category_label, top_n=None):
@@ -2102,28 +3364,96 @@ def gender_pivot_table(frame, category_column, category_label, top_n=None):
 
 def style_total_table(table, label_column):
     numeric_columns = [col for col in table.columns if col != label_column]
+    label_columns = [label_column] if label_column in table.columns else []
+
+    formatters = {}
+    for col in numeric_columns:
+        if pd.api.types.is_numeric_dtype(table[col]):
+            formatters[col] = "{:,.0f}"
 
     def highlight_total_row(row):
         if row[label_column] == "Total":
-            return ["background-color: #DDEDE5; color: #102A2A; font-weight: 800;" for _ in row]
-        background = "#FFFFFF" if row.name % 2 == 0 else "#F7FAF8"
-        return [f"background-color: {background};" for _ in row]
+            return [
+                "background-color: #DCEBE4; color: #0B2523; font-weight: 850; "
+                "border-top: 2px solid #2F7D69;"
+                for _ in row
+            ]
+
+        background = "#FFFFFF" if row.name % 2 == 0 else "#F6FAF8"
+        return [f"background-color: {background}; color: #1E293B;" for _ in row]
 
     def highlight_total_column(column):
         if column.name == "Total":
-            return ["background-color: #FFF4D8; color: #102A2A; font-weight: 800;" for _ in column]
+            return [
+                "background-color: #FFF1CC; color: #0B2523; font-weight: 850; "
+                "border-left: 2px solid #E3B341;"
+                for _ in column
+            ]
         return ["" for _ in column]
 
-    return (
-        table.style.format({col: "{:,.0f}" for col in numeric_columns})
+    def mute_missing(value):
+        if str(value) in ["[Missing]", "[Not recorded]", "None", "nan", "NaT"]:
+            return "color: #94A3B8; font-style: italic;"
+        return ""
+
+    styled = (
+        table.style.format(formatters)
         .apply(highlight_total_row, axis=1)
         .apply(highlight_total_column, axis=0)
-        .set_properties(subset=[label_column], **{"text-align": "left", "font-weight": "650", "white-space": "normal"})
-        .set_properties(subset=numeric_columns, **{"text-align": "center", "font-variant-numeric": "tabular-nums"})
-        .set_table_styles([
-            {"selector": "th", "props": [("background-color", "#12312F"), ("color", "#FFFFFF"), ("font-weight", "800"), ("text-align", "center"), ("border", "1px solid #D8E2DC")]},
-            {"selector": "td", "props": [("border", "1px solid #E5E7EB"), ("padding", "7px 9px")]},
-        ])
+    )
+    styled = styled.map(mute_missing) if hasattr(styled, "map") else styled.applymap(mute_missing)
+
+    return (
+        styled
+        .set_properties(
+            subset=label_columns,
+            **{
+                "text-align": "left",
+                "font-weight": "700",
+                "white-space": "normal",
+                "min-width": "180px",
+            },
+        )
+        .set_properties(
+            subset=numeric_columns,
+            **{
+                "text-align": "right",
+                "font-variant-numeric": "tabular-nums",
+                "font-feature-settings": '"tnum"',
+                "min-width": "72px",
+            },
+        )
+        .set_table_styles(
+            [
+                {
+                    "selector": "th",
+                    "props": [
+                        ("background-color", "#12312F"),
+                        ("color", "#FFFFFF"),
+                        ("font-weight", "850"),
+                        ("text-align", "center"),
+                        ("border", "1px solid #D8E2DC"),
+                        ("border-bottom", "3px solid #D9A441"),
+                        ("padding", "10px 12px"),
+                        ("white-space", "normal"),
+                    ],
+                },
+                {
+                    "selector": "td",
+                    "props": [
+                        ("border", "1px solid #E3ECE7"),
+                        ("padding", "8px 10px"),
+                        ("vertical-align", "middle"),
+                    ],
+                },
+                {
+                    "selector": "tbody tr:hover td",
+                    "props": [
+                        ("background-color", "#FFF8E7"),
+                    ],
+                },
+            ]
+        )
     )
 
 
@@ -2141,16 +3471,176 @@ def style_records_table(table):
         else:
             formatters[col] = "{:,.0f}"
 
-    def zebra_rows(row):
-        background = "#FFFFFF" if row.name % 2 == 0 else "#F7FAF8"
-        return [f"background-color: {background};" for _ in row]
+    descriptor_columns = [
+        col
+        for col in display_table.columns
+        if col not in numeric_columns and col not in date_columns
+    ]
 
-    return (
+    def zebra_rows(row):
+        background = "#FFFFFF" if row.name % 2 == 0 else "#F6FAF8"
+        return [f"background-color: {background}; color: #1E293B;" for _ in row]
+
+    def highlight_total_like_rows(row):
+        first_value = str(row.iloc[0]) if len(row) else ""
+        if first_value == "Total":
+            return [
+                "background-color: #DCEBE4; color: #0B2523; font-weight: 850; "
+                "border-top: 2px solid #2F7D69;"
+                for _ in row
+            ]
+        return ["" for _ in row]
+
+    def mute_missing(value):
+        if str(value) in ["[Missing]", "[Not recorded]", "None", "nan", "NaT"]:
+            return "color: #94A3B8; font-style: italic;"
+        return ""
+
+    styled = (
         display_table.style.format(formatters)
         .apply(zebra_rows, axis=1)
-        .set_properties(**{"border": "1px solid #E5E7EB", "padding": "7px 9px", "white-space": "normal"})
-        .set_table_styles([{"selector": "th", "props": [("background-color", "#12312F"), ("color", "#FFFFFF"), ("font-weight", "800"), ("text-align", "left"), ("border", "1px solid #D8E2DC")]}])
+        .apply(highlight_total_like_rows, axis=1)
     )
+    styled = styled.map(mute_missing) if hasattr(styled, "map") else styled.applymap(mute_missing)
+
+    return (
+        styled
+        .set_properties(
+            subset=descriptor_columns,
+            **{
+                "text-align": "left",
+                "white-space": "normal",
+                "min-width": "150px",
+            },
+        )
+        .set_properties(
+            subset=numeric_columns,
+            **{
+                "text-align": "right",
+                "font-variant-numeric": "tabular-nums",
+                "font-feature-settings": '"tnum"',
+                "min-width": "72px",
+            },
+        )
+        .set_properties(
+            subset=date_columns,
+            **{
+                "text-align": "left",
+                "white-space": "nowrap",
+                "min-width": "112px",
+            },
+        )
+        .set_table_styles(
+            [
+                {
+                    "selector": "th",
+                    "props": [
+                        ("background-color", "#12312F"),
+                        ("color", "#FFFFFF"),
+                        ("font-weight", "850"),
+                        ("text-align", "left"),
+                        ("border", "1px solid #D8E2DC"),
+                        ("border-bottom", "3px solid #D9A441"),
+                        ("padding", "10px 12px"),
+                        ("white-space", "normal"),
+                    ],
+                },
+                {
+                    "selector": "td",
+                    "props": [
+                        ("border", "1px solid #E3ECE7"),
+                        ("padding", "8px 10px"),
+                        ("vertical-align", "middle"),
+                    ],
+                },
+                {
+                    "selector": "tbody tr:hover td",
+                    "props": [
+                        ("background-color", "#FFF8E7"),
+                    ],
+                },
+            ]
+        )
+    )
+
+
+def display_table_value(value):
+    if pd.isna(value):
+        return ""
+
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%d %b %Y")
+
+    if hasattr(value, "strftime") and not isinstance(value, str):
+        try:
+            return value.strftime("%d %b %Y")
+        except Exception:
+            pass
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if float(value).is_integer():
+            return f"{int(value):,}"
+        return f"{value:,.1f}"
+
+    return str(value)
+
+
+def render_dashboard_table(table, label_column=None, max_height=560):
+    if table.empty:
+        st.info("No records match the selected filters.")
+        return
+
+    display_table = table.copy()
+    columns = display_table.columns.tolist()
+    numeric_columns = display_table.select_dtypes(include="number").columns.tolist()
+
+    header_cells = []
+    for column in columns:
+        classes = []
+        if column in numeric_columns:
+            classes.append("numeric")
+        if column == "Total":
+            classes.append("total-col")
+        class_attr = f' class="{" ".join(classes)}"' if classes else ""
+        header_cells.append(f"<th{class_attr}>{escape_text(column)}</th>")
+
+    body_rows = []
+    for _, row in display_table.iterrows():
+        first_value = str(row.iloc[0]) if len(row) else ""
+        is_total_row = first_value == "Total" or (
+            label_column in display_table.columns and str(row.get(label_column)) == "Total"
+        )
+        row_class = ' class="total-row"' if is_total_row else ""
+        cells = []
+
+        for column in columns:
+            value = row[column]
+            display_value = display_table_value(value)
+            classes = []
+
+            if column == label_column or column == columns[0]:
+                classes.append("label-cell")
+            if column in numeric_columns:
+                classes.append("numeric")
+            if column == "Total":
+                classes.append("total-col")
+            if display_value in ["[Missing]", "[Not recorded]", "None", "nan", "NaT", ""]:
+                classes.append("missing")
+
+            class_attr = f' class="{" ".join(classes)}"' if classes else ""
+            cells.append(f"<td{class_attr}>{escape_text(display_value)}</td>")
+
+        body_rows.append(f"<tr{row_class}>{''.join(cells)}</tr>")
+
+    table_html = (
+        f'<div class="dashboard-table-wrap" style="max-height: {int(max_height)}px;">'
+        + '<table class="dashboard-table">'
+        + f"<thead><tr>{''.join(header_cells)}</tr></thead>"
+        + f"<tbody>{''.join(body_rows)}</tbody>"
+        + "</table></div>"
+    )
+
+    st.markdown(table_html, unsafe_allow_html=True)
 
 
 def show_gender_table(frame, category_column, category_label, top_n=None):
@@ -2158,7 +3648,169 @@ def show_gender_table(frame, category_column, category_label, top_n=None):
     if table.empty:
         st.info("No records match the selected filters.")
         return
-    st.dataframe(style_total_table(table, category_label), use_container_width=True, hide_index=True)
+    render_dashboard_table(table, label_column=category_label)
+
+
+def age_breakdown_options(frame, category_column):
+    if frame.empty or category_column not in frame.columns:
+        return []
+
+    return (
+        frame[category_column]
+        .dropna()
+        .astype(str)
+        .value_counts()
+        .index
+        .tolist()
+    )
+
+
+def age_gender_breakdown_table(frame, category_column, selected_categories, category_label):
+    if (
+        frame.empty
+        or category_column not in frame.columns
+        or "age_group" not in frame.columns
+        or "information_seeker_gender" not in frame.columns
+    ):
+        return pd.DataFrame()
+
+    if not selected_categories:
+        return pd.DataFrame()
+
+    selected = frame.copy()
+    selected[category_column] = selected[category_column].map(clean_text).fillna("[Missing]")
+    selected["age_group"] = selected["age_group"].map(clean_text).fillna("[Missing]")
+    selected["information_seeker_gender"] = (
+        selected["information_seeker_gender"].map(clean_text).fillna("[Missing]")
+    )
+    selected = selected[selected[category_column].astype(str).isin(selected_categories)]
+
+    if selected.empty:
+        return pd.DataFrame()
+
+    grouped = (
+        selected.groupby(["age_group", "information_seeker_gender"], dropna=False)
+        .size()
+        .reset_index(name="Records")
+    )
+
+    table = grouped.pivot_table(
+        index="age_group",
+        columns="information_seeker_gender",
+        values="Records",
+        aggfunc="sum",
+        fill_value=0,
+    ).reset_index()
+
+    gender_columns = [gender for gender in GENDER_ORDER if gender in table.columns]
+    other_gender_columns = [
+        col
+        for col in table.columns
+        if col not in ["age_group"] + gender_columns
+    ]
+    numeric_columns = gender_columns + other_gender_columns
+    table["Total"] = table[numeric_columns].sum(axis=1)
+
+    age_order_map = {age: index for index, age in enumerate(AGE_GROUP_ORDER)}
+    table["_sort_order"] = table["age_group"].map(age_order_map).fillna(999)
+    table = table.sort_values(["_sort_order", "age_group"]).drop(columns="_sort_order")
+
+    table = table.rename(columns={"age_group": "Age group"})
+    ordered_columns = ["Age group"] + numeric_columns + ["Total"]
+    table = table[ordered_columns]
+
+    total_row = {"Age group": "Total"}
+    for col in numeric_columns + ["Total"]:
+        total_row[col] = table[col].sum()
+
+    return pd.concat([table, pd.DataFrame([total_row])], ignore_index=True)
+
+
+def draw_age_gender_breakdown_bar(
+    frame,
+    category_column,
+    selected_categories,
+    category_label,
+    height=340,
+):
+    table = age_gender_breakdown_table(
+        frame,
+        category_column,
+        selected_categories,
+        category_label,
+    )
+
+    if table.empty:
+        st.info("No age breakdown is available for the selected option.")
+        return
+
+    chart_data = table[table["Age group"] != "Total"].copy()
+
+    if chart_data.empty:
+        st.info("No age breakdown is available for the selected option.")
+        return
+
+    gender_columns = [
+        col
+        for col in chart_data.columns
+        if col not in ["Age group", "Total"]
+    ]
+
+    long_chart = chart_data.melt(
+        id_vars=["Age group"],
+        value_vars=gender_columns,
+        var_name="Gender",
+        value_name="Records",
+    )
+    long_chart = long_chart[long_chart["Records"] > 0]
+
+    if long_chart.empty:
+        st.info("No age breakdown is available for the selected option.")
+        return
+
+    row_order = chart_data["Age group"].tolist()
+    chart_height = max(height, min(850, 30 * len(row_order) + 90))
+
+    chart = (
+        alt.Chart(long_chart)
+        .mark_bar(cornerRadiusEnd=5, opacity=0.92, stroke="#FFFFFF", strokeWidth=0.7)
+        .encode(
+            y=alt.Y(
+                "Age group:N",
+                sort=row_order,
+                title=None,
+                axis=alt.Axis(labelFontSize=11),
+            ),
+            x=alt.X("Records:Q", title="Records", stack="zero"),
+            color=gender_color(
+                "Gender:N",
+                available=[gender for gender in GENDER_ORDER if gender in set(long_chart["Gender"].astype(str))],
+            ),
+            tooltip=[
+                alt.Tooltip("Age group:N", title="Age group"),
+                alt.Tooltip("Gender:N", title="Gender"),
+                alt.Tooltip("Records:Q", title="Records", format=","),
+            ],
+        )
+        .properties(height=chart_height)
+    )
+
+    st.altair_chart(polish_chart(chart), use_container_width=True)
+
+
+def show_age_gender_breakdown_table(frame, category_column, selected_categories, category_label):
+    table = age_gender_breakdown_table(
+        frame,
+        category_column,
+        selected_categories,
+        category_label,
+    )
+
+    if table.empty:
+        st.info("No age breakdown is available for the selected option.")
+        return
+
+    render_dashboard_table(table, label_column="Age group")
 
 
 def gender_wide_chart_data(frame, category_column, top_n=None, ascending=False):
@@ -2183,23 +3835,42 @@ def draw_gender_bar(frame, category_column, top_n=None, height=430, ascending=Fa
         st.info("No records match the selected filters.")
         return
     chart_data = chart_data.reset_index()
-    gender_columns = [col for col in chart_data.columns if col != category_column]
+    if category_column == "general_information_need":
+        chart_data[category_column] = chart_data[category_column].map(display_category_value)
+        chart_data = chart_data.groupby(category_column, as_index=False).sum(numeric_only=True)
+    gender_columns = [
+        col
+        for col in chart_data.columns
+        if col != category_column and pd.to_numeric(chart_data[col], errors="coerce").fillna(0).sum() > 0
+    ]
     totals = chart_data.assign(_total=chart_data[gender_columns].sum(axis=1))
+    x_upper = chart_headroom(totals["_total"])
     category_order = totals.sort_values("_total", ascending=ascending)[category_column].astype(str).tolist()
     long_chart = chart_data.melt(id_vars=[category_column], value_vars=gender_columns, var_name="Gender", value_name="Records")
+    long_chart["Category total"] = long_chart.groupby(category_column)["Records"].transform("sum")
+    long_chart["Gender share"] = long_chart["Records"].div(long_chart["Category total"].where(long_chart["Category total"].ne(0)))
     chart_height = max(height, min(900, 36 * len(category_order) + 80))
     chart = (
         alt.Chart(long_chart)
-        .mark_bar(cornerRadiusEnd=2, stroke="#FFFFFF", strokeWidth=0.5)
+        .mark_bar(cornerRadiusEnd=5, opacity=0.92, stroke="#FFFFFF", strokeWidth=0.7)
         .encode(
-            y=alt.Y(f"{category_column}:N", sort=category_order, title=None, axis=alt.Axis(labelLimit=700, labelFontSize=11, labelPadding=6)),
-            x=alt.X("Records:Q", title="Records", stack="zero"),
-            color=gender_color("Gender:N"),
-            tooltip=[alt.Tooltip(f"{category_column}:N", title="Category"), alt.Tooltip("Gender:N", title="Gender"), alt.Tooltip("Records:Q", title="Records", format=",")],
+            y=alt.Y(f"{category_column}:N", sort=category_order, title=None, axis=alt.Axis(labelLimit=420, labelFontSize=11, labelPadding=6)),
+            x=alt.X("Records:Q", title="Records", stack="zero", scale=alt.Scale(domain=[0, x_upper], nice=False)),
+            color=gender_color("Gender:N", available=gender_columns),
+            tooltip=[alt.Tooltip(f"{category_column}:N", title="Category"), alt.Tooltip("Gender:N", title="Gender"), alt.Tooltip("Records:Q", title="Records", format=","), alt.Tooltip("Gender share:Q", title="Share of category", format=".1%"), alt.Tooltip("Category total:Q", title="Category total", format=",")],
         )
         .properties(height=chart_height)
     )
-    st.altair_chart(polish_chart(chart), use_container_width=True)
+    totals_layer = (
+        alt.Chart(totals)
+        .mark_text(align="left", baseline="middle", dx=7, fontSize=11, fontWeight=800, color="#1E293B")
+        .encode(
+            y=alt.Y(f"{category_column}:N", sort=category_order, title=None),
+            x=alt.X("_total:Q", title="Records", scale=alt.Scale(domain=[0, x_upper], nice=False)),
+            text=alt.Text("_total:Q", format=","),
+        )
+    )
+    st.altair_chart(polish_chart(chart + totals_layer), use_container_width=True)
 
 
 def draw_gender_column_bar(frame, category_column, top_n=None, height=360):
@@ -2208,24 +3879,85 @@ def draw_gender_column_bar(frame, category_column, top_n=None, height=360):
         st.info("No records match the selected filters.")
         return
     chart_data = chart_data.reset_index()
-    gender_columns = [col for col in chart_data.columns if col != category_column]
-    category_order = chart_data.assign(Total=chart_data[gender_columns].sum(axis=1)).sort_values("Total", ascending=False)[category_column].astype(str).tolist()
-    max_chars = 18 if category_column in ["age_group", "helpdesk_location"] else 24
-    chart_data["axis_label"] = chart_data[category_column].map(lambda value: short_axis_label(value, max_chars=max_chars))
-    axis_order = [chart_data.loc[chart_data[category_column].astype(str).eq(value), "axis_label"].iloc[0] for value in category_order if not chart_data.loc[chart_data[category_column].astype(str).eq(value)].empty]
-    long_chart = chart_data.melt(id_vars=[category_column, "axis_label"], value_vars=gender_columns, var_name="Gender", value_name="Records")
+    if category_column in {"disability_type", "adult_person_impairment_type", "child_disability_type"}:
+        chart_data[category_column] = chart_data[category_column].map(display_category_value)
+        chart_data = chart_data.groupby(category_column, as_index=False).sum(numeric_only=True)
+    gender_columns = [
+        col
+        for col in chart_data.columns
+        if col != category_column and pd.to_numeric(chart_data[col], errors="coerce").fillna(0).sum() > 0
+    ]
+    chart_data["Total"] = chart_data[gender_columns].sum(axis=1)
+    if category_column == "age_group":
+        available_categories = set(chart_data[category_column].astype(str))
+        category_order = [age for age in AGE_GROUP_ORDER if age in available_categories]
+        category_order += [value for value in chart_data[category_column].astype(str) if value not in category_order]
+        long_chart = chart_data.melt(
+            id_vars=[category_column, "Total"],
+            value_vars=gender_columns,
+            var_name="Gender",
+            value_name="Records",
+        )
+        long_chart["Gender share"] = long_chart["Records"].div(
+            long_chart["Total"].where(long_chart["Total"].ne(0))
+        )
+        age_chart = (
+            alt.Chart(long_chart)
+            .mark_bar(cornerRadiusEnd=5, opacity=0.92, stroke="#FFFFFF", strokeWidth=0.7)
+            .encode(
+                x=alt.X(
+                    f"{category_column}:N",
+                    sort=category_order,
+                    title=None,
+                    axis=alt.Axis(
+                        labelAngle=-20,
+                        labelLimit=125,
+                        labelFontSize=10,
+                        labelBound=True,
+                        labelOverlap="parity",
+                    ),
+                ),
+                y=alt.Y("Records:Q", title="Records", stack="zero"),
+                color=gender_color("Gender:N", available=gender_columns),
+                tooltip=[
+                    alt.Tooltip(f"{category_column}:N", title="Age group"),
+                    alt.Tooltip("Gender:N", title="Gender"),
+                    alt.Tooltip("Records:Q", title="Records", format=","),
+                    alt.Tooltip("Gender share:Q", title="Share of age group", format=".1%"),
+                    alt.Tooltip("Total:Q", title="Age-group total", format=","),
+                ],
+            )
+            .properties(height=height)
+        )
+        st.altair_chart(polish_chart(age_chart), use_container_width=True)
+        return
+    else:
+        category_order = chart_data.sort_values("Total", ascending=False)[category_column].astype(str).tolist()
+    long_chart = chart_data.melt(id_vars=[category_column, "Total"], value_vars=gender_columns, var_name="Gender", value_name="Records")
+    long_chart["Gender share"] = long_chart["Records"].div(long_chart["Total"].where(long_chart["Total"].ne(0)))
+    chart_height = max(height, min(850, 34 * len(category_order) + 80))
+    x_upper = chart_headroom(chart_data["Total"])
     chart = (
         alt.Chart(long_chart)
-        .mark_bar(cornerRadiusEnd=2, stroke="#FFFFFF", strokeWidth=0.5)
+        .mark_bar(cornerRadiusEnd=5, opacity=0.92, stroke="#FFFFFF", strokeWidth=0.7)
         .encode(
-            x=alt.X("axis_label:N", sort=axis_order, title=None, axis=alt.Axis(labelAngle=-30, labelLimit=150, labelFontSize=10)),
-            y=alt.Y("Records:Q", title="Records", stack="zero"),
-            color=gender_color("Gender:N"),
-            tooltip=[alt.Tooltip(f"{category_column}:N", title="Category"), alt.Tooltip("Gender:N", title="Gender"), alt.Tooltip("Records:Q", title="Records", format=",")],
+            y=alt.Y(f"{category_column}:N", sort=category_order, title=None, axis=alt.Axis(labelLimit=420, labelFontSize=11, labelPadding=6)),
+            x=alt.X("Records:Q", title="Records", stack="zero", scale=alt.Scale(domain=[0, x_upper], nice=False)),
+            color=gender_color("Gender:N", available=gender_columns),
+            tooltip=[alt.Tooltip(f"{category_column}:N", title="Category"), alt.Tooltip("Gender:N", title="Gender"), alt.Tooltip("Records:Q", title="Records", format=","), alt.Tooltip("Gender share:Q", title="Share of category", format=".1%"), alt.Tooltip("Total:Q", title="Category total", format=",")],
         )
-        .properties(height=height)
+        .properties(height=chart_height)
     )
-    st.altair_chart(polish_chart(chart), use_container_width=True)
+    total_labels = (
+        alt.Chart(chart_data)
+        .mark_text(align="left", baseline="middle", dx=7, fontSize=11, fontWeight=800, color="#1E293B")
+        .encode(
+            y=alt.Y(f"{category_column}:N", sort=category_order, title=None),
+            x=alt.X("Total:Q", title="Records", scale=alt.Scale(domain=[0, x_upper], nice=False)),
+            text=alt.Text("Total:Q", format=","),
+        )
+    )
+    st.altair_chart(polish_chart(chart + total_labels), use_container_width=True)
 
 
 def draw_total_donut(frame, category_column, category_label, height=320, min_label_share=0.04):
@@ -2239,17 +3971,73 @@ def draw_total_donut(frame, category_column, category_label, height=320, min_lab
     summary[category_column] = summary[category_column].fillna("[Missing]").astype(str)
     summary["Share"] = summary["Records"] / summary["Records"].sum()
     summary["Share label"] = summary["Share"].map(lambda value: f"{value:.1%}" if value >= min_label_share else "")
+    summary["Slice order"] = range(len(summary))
+
+    category_values = summary[category_column].astype(str).tolist()
+
+    if category_column == "information_seeker_gender":
+        available_genders = [gender for gender in GENDER_ORDER if gender in category_values]
+        color_encoding = gender_color(f"{category_column}:N", available=available_genders)
+    elif all(value in STATUS_COLORS for value in category_values):
+        color_encoding = alt.Color(
+            f"{category_column}:N",
+            title=category_label,
+            scale=alt.Scale(
+                domain=category_values,
+                range=[STATUS_COLORS[value] for value in category_values],
+            ),
+            legend=alt.Legend(symbolType="circle", orient="bottom", columns=3, labelLimit=120),
+        )
+    else:
+        color_encoding = category_color(f"{category_column}:N", title=category_label)
+
+    # Keep the complete donut and its labels inside narrow Streamlit columns.
+    # The previous fixed radii (122px ring, 145px labels) overflowed the
+    # two-column disability cards. These values scale with the available chart
+    # height and place labels safely inside the ring.
+    chart_height = max(240, int(height))
+    outer_radius = max(72, min(106, int((chart_height - 90) / 2)))
+    inner_radius = int(outer_radius * 0.60)
+    label_radius = int((inner_radius + outer_radius) / 2)
+
     donut = (
         alt.Chart(summary)
-        .mark_arc(innerRadius=72, outerRadius=120, stroke="#FFFFFF", strokeWidth=2)
+        .mark_arc(innerRadius=inner_radius, outerRadius=outer_radius, cornerRadius=3, stroke="#FFFFFF", strokeWidth=2)
         .encode(
             theta=alt.Theta("Records:Q", stack=True),
-            color=alt.Color(f"{category_column}:N", title=category_label, scale=alt.Scale(range=["#2F7D69", "#D9A441", "#2563EB", "#DB2777", "#7C3AED", "#64748B"])),
+            color=color_encoding,
+            order=alt.Order("Slice order:Q", sort="ascending"),
             tooltip=[alt.Tooltip(f"{category_column}:N", title=category_label), alt.Tooltip("Records:Q", title="Records", format=","), alt.Tooltip("Share:Q", title="Share", format=".1%")],
         )
     )
-    labels = alt.Chart(summary[summary["Share label"].ne("")]).mark_text(radius=145, fontSize=12, fontWeight=700, color="#334155").encode(theta=alt.Theta("Records:Q", stack=True), text=alt.Text("Share label:N"))
-    st.altair_chart(polish_chart((donut + labels).properties(height=height)), use_container_width=True)
+    labels = (
+        # Retain every slice so the text layer uses exactly the same angular
+        # scale as the arcs. Small slices carry a blank label rather than being
+        # removed, which prevents remaining labels from shifting segments.
+        alt.Chart(summary)
+        .mark_text(
+            radius=label_radius,
+            fontSize=11,
+            fontWeight=800,
+            color="#FFFFFF",
+            stroke="#334155",
+            strokeWidth=1.2,
+        )
+        .encode(
+            theta=alt.Theta("Records:Q", stack=True),
+            order=alt.Order("Slice order:Q", sort="ascending"),
+            text=alt.Text("Share label:N"),
+        )
+    )
+    st.altair_chart(
+        polish_chart(
+            (donut + labels).properties(
+                height=chart_height,
+                padding={"top": 10, "right": 10, "bottom": 10, "left": 10},
+            )
+        ),
+        use_container_width=True,
+    )
 
 
 def draw_request_type_bar(frame, height=190):
@@ -2283,6 +4071,7 @@ def draw_request_type_bar(frame, height=190):
 
     type_order = summary["Request type"].tolist()
     type_colors = ["#2F7D69", "#D9A441", "#2563EB", "#DB2777", "#64748B"]
+    x_upper = chart_headroom(summary["Records"], fraction=0.35)
 
     base = alt.Chart(summary).encode(
         y=alt.Y(
@@ -2291,10 +4080,10 @@ def draw_request_type_bar(frame, height=190):
             title=None,
             axis=alt.Axis(labelLimit=360, labelFontSize=12, labelPadding=8),
         ),
-        x=alt.X("Records:Q", title="Records"),
+        x=alt.X("Records:Q", title="Records", scale=alt.Scale(domain=[0, x_upper], nice=False)),
     )
 
-    bars = base.mark_bar(cornerRadiusEnd=4).encode(
+    bars = base.mark_bar(cornerRadiusEnd=6, opacity=0.94, stroke="#FFFFFF", strokeWidth=0.7).encode(
         color=alt.Color(
             "Request type:N",
             legend=None,
@@ -2325,12 +4114,49 @@ def draw_status_donut_pair(frame, status_column, height=300):
     if frame.empty or status_column not in frame.columns:
         st.info("No records match the selected filters.")
         return
-    status_cols = st.columns(2)
-    for column, status in zip(status_cols, ["No Disability", "Has Disability"]):
-        with column:
-            st.caption(status)
-            status_frame = frame[frame[status_column].astype(str).eq(status)]
-            draw_total_donut(status_frame, "information_seeker_gender", "Gender", height=height, min_label_share=0.06)
+    status_data = frame[[status_column, "information_seeker_gender"]].copy()
+    status_data[status_column] = status_data[status_column].fillna("[Missing]").astype(str)
+    status_data["Gender"] = status_data["information_seeker_gender"].fillna("[Missing]").astype(str)
+    status_data = status_data[status_data[status_column].isin(["No Disability", "Has Disability"])]
+    if status_data.empty:
+        st.info("No disability status data for the selected filters.")
+        return
+    grouped = status_data.groupby(["Gender", status_column], dropna=False).size().reset_index(name="Records")
+    overall = status_data.groupby(status_column, dropna=False).size().reset_index(name="Records")
+    overall["Gender"] = "Overall"
+    grouped = pd.concat([overall, grouped], ignore_index=True)
+    grouped["Gender total"] = grouped.groupby("Gender")["Records"].transform("sum")
+    grouped["Share"] = grouped["Records"] / grouped["Gender total"]
+    grouped["Label"] = grouped.apply(lambda row: f"{row['Share']:.1%}" if row["Share"] >= 0.07 else "", axis=1)
+    gender_order = ["Overall"] + [gender for gender in GENDER_ORDER if gender in set(grouped["Gender"])]
+    status_order = ["No Disability", "Has Disability"]
+    grouped["Status order"] = grouped[status_column].map({status: index for index, status in enumerate(status_order)})
+    grouped = grouped.sort_values(["Gender", "Status order"])
+    grouped["Cumulative share"] = grouped.groupby("Gender")["Share"].cumsum()
+    grouped["Label position"] = grouped["Cumulative share"] - (grouped["Share"] / 2)
+    status_chart = (
+        alt.Chart(grouped)
+        .mark_bar(cornerRadiusEnd=5, stroke="#FFFFFF", strokeWidth=0.8)
+        .encode(
+            y=alt.Y("Gender:N", sort=gender_order, title=None),
+            x=alt.X("Share:Q", stack="zero", title="Share within gender", axis=alt.Axis(format="%"), scale=alt.Scale(domain=[0, 1])),
+            color=alt.Color(f"{status_column}:N", title="Disability status", scale=alt.Scale(domain=status_order, range=[STATUS_COLORS[value] for value in status_order]), legend=alt.Legend(orient="bottom")),
+            order=alt.Order("Status order:Q", sort="ascending"),
+            tooltip=[alt.Tooltip("Gender:N", title="Gender"), alt.Tooltip(f"{status_column}:N", title="Status"), alt.Tooltip("Records:Q", title="Records", format=","), alt.Tooltip("Share:Q", title="Share within gender", format=".1%")],
+        )
+        .properties(height=max(height, 38 * len(gender_order) + 70))
+    )
+    status_labels = (
+        alt.Chart(grouped)
+        .mark_text(fontSize=11, fontWeight=800, color="#FFFFFF")
+        .encode(
+            y=alt.Y("Gender:N", sort=gender_order, title=None),
+            x=alt.X("Label position:Q", scale=alt.Scale(domain=[0, 1])),
+            text=alt.Text("Label:N"),
+            tooltip=[alt.Tooltip("Gender:N", title="Gender"), alt.Tooltip(f"{status_column}:N", title="Status"), alt.Tooltip("Records:Q", title="Records", format=","), alt.Tooltip("Share:Q", title="Share within gender", format=".1%")],
+        )
+    )
+    st.altair_chart(polish_chart(status_chart + status_labels), use_container_width=True)
 
 
 def draw_monthly_gender_column_bar(frame, height=340):
@@ -2358,9 +4184,24 @@ def draw_monthly_gender_column_bar(frame, height=340):
 
     line = (
         alt.Chart(monthly)
-        .mark_line(point=True, strokeWidth=3)
+        .mark_line(
+            point=alt.OverlayMarkDef(filled=True, size=70, stroke="#FFFFFF", strokeWidth=1),
+            strokeWidth=3.2,
+            interpolate="monotone",
+        )
         .encode(
-            x=alt.X("year_month:N", sort=month_order, title=None, axis=alt.Axis(labelAngle=-30, labelFontSize=11)),
+            x=alt.X(
+                "year_month:N",
+                sort=month_order,
+                title=None,
+                axis=alt.Axis(
+                    labelAngle=-20,
+                    labelLimit=85,
+                    labelFontSize=11,
+                    labelBound=True,
+                    labelOverlap="parity",
+                ),
+            ),
             y=alt.Y("Records:Q", title="Records"),
             color=gender_color("information_seeker_gender:N", available=available_genders),
             tooltip=[
@@ -2381,8 +4222,9 @@ def draw_count_bar(frame, category_column, category_label, height=360):
     chart_data = frame.groupby(category_column, dropna=False).size().reset_index(name="Records").rename(columns={category_column: category_label}).sort_values("Records", ascending=False)
     chart_data["axis_label"] = chart_data[category_label].map(lambda value: short_axis_label(value, max_chars=24))
     axis_order = chart_data["axis_label"].tolist()
-    base = alt.Chart(chart_data).encode(x=alt.X("axis_label:N", sort=axis_order, title=None, axis=alt.Axis(labelAngle=-30, labelLimit=160, labelFontSize=11)), y=alt.Y("Records:Q", title="Records"))
-    bars = base.mark_bar(cornerRadiusEnd=3, color="#2F7D69").encode(tooltip=[alt.Tooltip(f"{category_label}:N", title=category_label), alt.Tooltip("Records:Q", title="Records", format=",")])
+    y_upper = chart_headroom(chart_data["Records"], fraction=0.14)
+    base = alt.Chart(chart_data).encode(x=alt.X("axis_label:N", sort=axis_order, title=None, axis=alt.Axis(labelAngle=-20, labelLimit=120, labelFontSize=11, labelBound=True, labelOverlap="parity")), y=alt.Y("Records:Q", title="Records", scale=alt.Scale(domain=[0, y_upper], nice=False)))
+    bars = base.mark_bar(cornerRadiusEnd=6, color="#2F7D69", opacity=0.94, stroke="#FFFFFF", strokeWidth=0.7).encode(tooltip=[alt.Tooltip(f"{category_label}:N", title=category_label), alt.Tooltip("Records:Q", title="Records", format=",")])
     labels = base.mark_text(dy=-6, fontSize=11, fontWeight=700, color="#1E293B").encode(text=alt.Text("Records:Q", format=","))
     st.altair_chart(polish_chart((bars + labels).properties(height=height)), use_container_width=True)
 
@@ -2424,10 +4266,114 @@ def selection_pill(label, values):
     return '<div class="app-pill app-pill-filter">' f'<span class="pill-key">{escape_text(label)}</span>' f'<span class="pill-val">{escape_text(filter_label(values))}</span>' "</div>"
 
 
+def filter_section_badge(number, title, detail, tone):
+    st.markdown(
+        f"""
+        <div class="filter-section-badge filter-section-badge-{escape_text(tone)}">
+            <div class="filter-section-number">{escape_text(number)}</div>
+            <div class="filter-section-copy">
+                <div class="filter-section-title">{escape_text(title)}</div>
+                <div class="filter-section-detail">{escape_text(detail)}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def filter_selection_feedback(label, values, max_items=4):
+    if not values:
+        return
+
+    values = list(values)
+    shown_values = values[:max_items]
+    extra_count = len(values) - len(shown_values)
+    chips = "".join(
+        f'<span class="filter-selected-chip">{escape_text(value)}</span>'
+        for value in shown_values
+    )
+
+    if extra_count > 0:
+        chips += f'<span class="filter-selected-chip filter-selected-more">+{extra_count} more</span>'
+
+    st.markdown(
+        f"""
+        <div class="filter-selected-summary">
+            <span class="filter-selected-label">Selected {escape_text(label)}</span>
+            <div class="filter-selected-chips">{chips}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def section_header(title, note=None):
     st.markdown(f"""<div class="section-header"><span class="section-accent"></span><span class="section-title">{escape_text(title)}</span></div>""", unsafe_allow_html=True)
     if note:
         st.markdown(f'<div class="section-note">{escape_text(note)}</div>', unsafe_allow_html=True)
+
+
+HELPDESK_SECTION_META = {
+    "Overview": ("🏠", "Overview", "Review overall volume, request mix, demographics and location coverage."),
+    "CPV Work": ("👥", "Staff / CPV Performance", "Compare staff workload, requests, referrals, follow-up and operating coverage."),
+    "Disability": ("♿", "Disability Inclusion", "Review disability prevalence, impairment types and single versus multiple impairments."),
+    "Concerns": ("🛡️", "Protection Concerns", "Explore reported protection concerns, rankings and age/gender patterns."),
+    "Information": ("ℹ️", "Information Requests", "Understand the protection information requested by helpdesk users."),
+    "Referrals": ("🔁", "Referrals", "Review referral partners, destinations and demographic patterns."),
+    "Map": ("🗺️", "Service Map", "Locate mapped helpdesk records and assess geographic coverage."),
+    "DQA": ("✅", "Data Quality", "Review completeness, corrections and protected follow-up records."),
+    "Records": ("📄", "Records & Export", "Inspect filtered records and prepare privacy-safe downloads."),
+}
+HELPDESK_SECTION_GROUPS = {
+    "Summary": ["Overview"],
+    "CPVs Submissions": ["CPV Work"],
+    "Service Requests": ["Disability", "Concerns", "Information", "Referrals"],
+    "Operations & Data": ["Map", "DQA", "Records"],
+}
+HELPDESK_CATEGORY_LABELS = {
+    "Summary": "📊 Summary", "CPVs Submissions": "👥 CPVs Submissions",
+    "Service Requests": "🛡️ Service Requests", "Operations & Data": "✅ Operations & Data",
+}
+
+
+def helpdesk_section_navigation():
+    section_key = "helpdesk_section"
+    category_key = "helpdesk_section_category"
+    if section_key not in st.session_state or st.session_state[section_key] not in HELPDESK_SECTION_META:
+        st.session_state[section_key] = "Overview"
+    current_category = next(category for category, views in HELPDESK_SECTION_GROUPS.items() if st.session_state[section_key] in views)
+    if category_key not in st.session_state or st.session_state[category_key] not in HELPDESK_SECTION_GROUPS:
+        st.session_state[category_key] = current_category
+    category = st.selectbox(
+        "**Dashboard section**", list(HELPDESK_SECTION_GROUPS), key=category_key,
+        format_func=lambda value: HELPDESK_CATEGORY_LABELS[value],
+        help="Choose a broad dashboard section, then select a view.",
+    )
+    views = HELPDESK_SECTION_GROUPS[category]
+    if st.session_state[section_key] not in views:
+        st.session_state[section_key] = views[0]
+    return st.radio(
+        "View", views, key=section_key,
+        format_func=lambda value: f"{HELPDESK_SECTION_META[value][0]} {HELPDESK_SECTION_META[value][1]}",
+        help="Active filters remain in place when you change views.",
+    )
+
+
+def helpdesk_section_intro(section, filtered_count):
+    icon, label, description = HELPDESK_SECTION_META[section]
+    category = next(category for category, views in HELPDESK_SECTION_GROUPS.items() if section in views)
+    st.caption(f"Dashboard › {category} › {label} · {filtered_count:,} records in view")
+    st.markdown(
+        f'<div class="section-intro-card"><div class="section-intro-icon">{icon}</div>'
+        f'<div><div class="section-intro-title">{escape_text(label)}</div>'
+        f'<div class="section-intro-desc">{escape_text(description)}</div></div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def helpdesk_go_to_overview():
+    st.session_state["helpdesk_section_category"] = "Summary"
+    st.session_state["helpdesk_section"] = "Overview"
 
 
 def kpi_group_caption(text):
@@ -2621,7 +4567,7 @@ def education_concern_followup_table(frame, referrals_frame):
     working = frame.copy()
     concern_mask = pd.Series(False, index=working.index)
     for col in available_concern_cols:
-        concern_mask = concern_mask | working[col].map(is_selected_indicator)
+        concern_mask = concern_mask | pd.to_numeric(working[col], errors="coerce").eq(1)
     working = working[concern_mask].copy()
 
     if working.empty:
@@ -2630,10 +4576,10 @@ def education_concern_followup_table(frame, referrals_frame):
     def selected_concern_labels(row):
         labels = []
         if "concern_educational_support" in row.index:
-            if is_selected_indicator(row.get("concern_educational_support")):
+            if pd.to_numeric(pd.Series([row.get("concern_educational_support")]), errors="coerce").iloc[0] == 1:
                 labels.append("Educational Support")
         if "concern_school_dropout_risk_or_dropped_out" in row.index:
-            if is_selected_indicator(row.get("concern_school_dropout_risk_or_dropped_out")):
+            if pd.to_numeric(pd.Series([row.get("concern_school_dropout_risk_or_dropped_out")]), errors="coerce").iloc[0] == 1:
                 labels.append("School Dropout Risk / Dropped Out")
         return "; ".join(labels)
 
@@ -2696,15 +4642,199 @@ def cpv_work_summary(frame):
         )
     return pd.DataFrame(rows).sort_values("Records", ascending=False) if rows else pd.DataFrame(columns=columns)
 
+def build_helpdesk_findings(section, frame, protection_frame, information_frame, referral_frame):
+    """Build auditable findings from the filtered sources used by each section."""
+    total = len(frame)
+    if total == 0:
+        return "No records match the current filters, so the section tables do not support a finding."
+
+    excluded = {"[Missing]", "[Not recorded]", "Missing / unspecified", "Needs review", "None"}
+
+    def value_counts(data, column):
+        if data.empty or column not in data.columns:
+            return pd.Series(dtype="int64")
+        values = data[column].dropna().astype(str)
+        return values[~values.isin(excluded)].value_counts()
+
+    def leading(data, column):
+        result = value_counts(data, column)
+        return (str(result.index[0]), int(result.iloc[0])) if not result.empty else ("", 0)
+
+    def gender_distribution(data=frame):
+        result = value_counts(data, "information_seeker_gender")
+        denominator = int(result.sum())
+        if not denominator:
+            return "Gender disaggregation is unavailable for the current filters."
+        details = "; ".join(f"{label}: {int(count):,} ({int(count) / denominator:.1%})" for label, count in result.items())
+        return f"Among {denominator:,} records with a usable gender response, {details}."
+
+    def positive_gender_rates(column, positive, description):
+        if column not in frame.columns:
+            return ""
+        parts = []
+        for gender in GENDER_ORDER:
+            scoped = frame[frame["information_seeker_gender"].astype(str).eq(gender) & frame[column].notna()]
+            if len(scoped) < 5:
+                continue
+            positive_count = int(scoped[column].astype(str).eq(positive).sum())
+            parts.append(f"{gender}: {positive_count:,} of {len(scoped):,} ({positive_count / len(scoped):.1%})")
+        return f"By gender, {description} was recorded for " + "; ".join(parts) + "." if parts else ""
+
+    def leaders_by_gender(data, column, unit="records"):
+        if data.empty or column not in data.columns or "information_seeker_gender" not in data.columns:
+            return ""
+        parts = []
+        for gender in GENDER_ORDER:
+            scoped = data[data["information_seeker_gender"].astype(str).eq(gender)]
+            label, count = leading(scoped, column)
+            if label:
+                parts.append(f"for {gender}, {label} is highest at {count:,} {unit}")
+        return "; ".join(parts) + "." if parts else ""
+
+    blocks = []
+    if section == "Overview":
+        location, location_n = leading(frame, "helpdesk_location")
+        request, request_n = leading(frame, "request_category")
+        age, age_n = leading(frame, "age_group")
+        coverage = f"The view contains {total:,} records"
+        if location:
+            coverage += f"; {location} is the busiest helpdesk with {location_n:,} records ({location_n / total:.1%})"
+        blocks.append(("Coverage", coverage + "."))
+        profile = f"{request} is the largest request category at {request_n:,} ({request_n / total:.1%})" if request else "No usable request category remains"
+        if age:
+            profile += f", while {age} is the largest age group at {age_n:,} ({age_n / total:.1%})"
+        blocks.append(("Request and demographic profile", profile + ". " + gender_distribution()))
+        visit_counts = value_counts(frame, "helpdesk_visit_history")
+        known_visits = int(visit_counts.sum())
+        first_time = int(visit_counts.get("First-time visitor", 0))
+        repeat = int(visit_counts.get("Repeat visitor", 0))
+        if known_visits:
+            repeat_timing = value_counts(frame, "repeat_visit_timing")
+            within_month = int(repeat_timing.get("Repeat — within current month", 0))
+            timed_repeats = int(
+                repeat_timing.get("Repeat — within current month", 0)
+                + repeat_timing.get("Repeat — before current month", 0)
+            )
+            timing_sentence = (
+                f" Of {timed_repeats:,} repeat visits with recorded timing, "
+                f"{within_month:,} occurred within the current month "
+                f"({within_month / timed_repeats:.1%})."
+                if timed_repeats else ""
+            )
+            blocks.append((
+                "Helpdesk entry point",
+                f"Among {known_visits:,} records with known prior-visit status, "
+                f"{first_time:,} were first-time visitors ({first_time / known_visits:.1%}) "
+                f"and {repeat:,} were repeat visitors ({repeat / known_visits:.1%})."
+                f"{timing_sentence}",
+            ))
+    elif section == "CPV Work":
+        summary = cpv_work_summary(frame)
+        if not summary.empty:
+            top = summary.iloc[0]
+            blocks.append(("Workload", f"{len(summary):,} CPVs are represented; {top['CPV']} has the largest workload with {int(top['Records']):,} records."))
+        blocks.append(("Gender reach", gender_distribution()))
+        blocks.append(("Case outcomes", " ".join(filter(None, [positive_gender_rates("follow_up_required_clean", "Yes", "follow-up required"), positive_gender_rates("referral_status", "Referred to partner agency", "a partner referral")]))))
+    elif section == "Disability":
+        disability = frame[frame["disability_status"].astype(str).eq("Has Disability")]
+        dtype, dtype_n = leading(disability, "disability_type")
+        blocks.append(("Prevalence", f"Disability is recorded in {len(disability):,} of {total:,} records ({len(disability) / total:.1%}). {positive_gender_rates('disability_status', 'Has Disability', 'a disability')}"))
+        if dtype:
+            blocks.append(("Impairment profile", f"{dtype} is the most frequently recorded disability type ({dtype_n:,} records). {leaders_by_gender(disability, 'disability_type')}"))
+        if not disability.empty:
+            adult_disability = disability[disability["derived_life_stage"].astype(str).eq("Adult")]
+            adult_people = adult_person_impairment_frame(adult_disability)
+            if not adult_people.empty:
+                multiplicity = value_counts(adult_people, "adult_impairment_multiplicity")
+                single_n = int(multiplicity.get("Single Impairment", 0))
+                multiple_n = int(multiplicity.get("Multiple Impairments", 0))
+                blocks.append((
+                    "Adult impairment multiplicity",
+                    f"Among {len(adult_people):,} adults with disability, {single_n:,} have one impairment and {multiple_n:,} have two or more impairments.",
+                ))
+    elif section == "Concerns":
+        concern, concern_n = leading(protection_frame, "protection_concern")
+        record_n = protection_frame["record_id"].nunique() if "record_id" in protection_frame.columns else 0
+        blocks.append(("Concern profile", f"The tables contain {len(protection_frame):,} concern mentions across {record_n:,} records. {concern} is highest at {concern_n:,} mentions." if concern else "No usable protection-concern mentions remain."))
+        if concern:
+            blocks.append(("Gender pattern", leaders_by_gender(protection_frame, "protection_concern", "mentions")))
+        children = frame[frame["derived_life_stage"].astype(str).eq("Child")]
+        accompaniment = value_counts(children, "child_accompaniment_status")
+        known_children = int(accompaniment.sum())
+        unaccompanied = int(accompaniment.get("Unaccompanied", 0))
+        if known_children:
+            blocks.append((
+                "Child accompaniment",
+                f"Among {known_children:,} child records with a determinable accompaniment status, "
+                f"{unaccompanied:,} were unaccompanied ({unaccompanied / known_children:.1%}).",
+            ))
+    elif section == "Information":
+        need, need_n = leading(information_frame, "general_information_need")
+        record_n = information_frame["record_id"].nunique() if "record_id" in information_frame.columns else 0
+        blocks.append(("Information profile", f"The tables contain {len(information_frame):,} information-need mentions across {record_n:,} records. {need} is highest at {need_n:,} mentions." if need else "No usable information-request mentions remain."))
+        if need:
+            blocks.append(("Gender pattern", leaders_by_gender(information_frame, "general_information_need", "mentions")))
+    elif section == "Referrals":
+        partner, partner_n = leading(referral_frame, "referral_partner")
+        referred = int(frame["referral_status"].astype(str).eq("Referred to partner agency").sum())
+        blocks.append(("Referral rate", f"{referred:,} of {total:,} records were referred to a partner agency ({referred / total:.1%}). {positive_gender_rates('referral_status', 'Referred to partner agency', 'a partner referral')}"))
+        if partner:
+            blocks.append(("Partner profile", f"{partner} is the leading recorded referral partner with {partner_n:,} mentions. {leaders_by_gender(referral_frame, 'referral_partner', 'mentions')}"))
+    elif section == "Map":
+        mapped = frame[["gps_latitude", "gps_longitude"]].notna().all(axis=1) if {"gps_latitude", "gps_longitude"}.issubset(frame.columns) else pd.Series(False, index=frame.index)
+        camp, camp_n = leading(frame[mapped], "camp_location")
+        blocks.append(("Geographic coverage", f"{int(mapped.sum()):,} of {total:,} records have usable coordinates ({mapped.mean():.1%})."))
+        if camp:
+            blocks.append(("Mapped distribution", f"{camp} contributes the largest mapped volume with {camp_n:,} records. {gender_distribution(frame[mapped])}"))
+    elif section == "DQA":
+        checks = {"interview date": frame["interview_date"].notna(), "gender": ~frame["information_seeker_gender"].astype(str).isin(excluded), "age group": ~frame["age_group"].astype(str).isin(excluded), "helpdesk location": ~frame["helpdesk_location"].astype(str).isin(excluded)}
+        ordered = sorted(((label, int(mask.sum()) / total) for label, mask in checks.items()), key=lambda item: item[1])
+        blocks.append(("Completeness", f"Headline completeness ranges from {ordered[0][1]:.1%} for {ordered[0][0]} to {ordered[-1][1]:.1%} for {ordered[-1][0]}."))
+        blocks.append(("Corrections", f"Gender/age corrections affect {int(frame['gender_age_correction_flag'].sum()):,} records, while seeker-type/age corrections affect {int(frame['type_age_correction_flag'].sum()):,} records."))
+    else:
+        blocks.append(("Records", f"The table contains {total:,} filtered, non-PII dashboard records. {gender_distribution()}"))
+        blocks.append(("Export", "The standard download excludes configured direct identifiers; protected education follow-up data remain password-gated."))
+
+    blocks = [(heading, text.strip()) for heading, text in blocks if text and text.strip()]
+    return "\n\n".join(f"**{heading}.** {text}" for heading, text in blocks) if blocks else "The filtered tables do not support a sufficiently clear descriptive finding."
+
+
 # -----------------------------------------------------------------------------
 # App
 # -----------------------------------------------------------------------------
 load_css()
-source_signature = data_source_signature()
-records, secure_records, protection, information, referrals, kpis = load_data(source_signature)
+file_signature = data_file_signature(DATA_FILE_PATH)
+st.session_state.setdefault("helpdesk_kobo_refresh_nonce", 0)
+source_mode = "KoboToolbox API" if kobo_configured() else "Local Excel fallback"
 
+try:
+    if kobo_configured():
+        kobo_base_url = normalize_kobo_base_url(setting("KOBO_BASE_URL", "https://eu.kobotoolbox.org"))
+        kobo_asset_uid = normalize_kobo_asset_uid(setting("KOBO_ASSET_UID"))
+        source_signature = (
+            "kobo",
+            kobo_base_url,
+            kobo_asset_uid,
+            st.session_state.helpdesk_kobo_refresh_nonce,
+        )
+    else:
+        source_signature = ("local", *file_signature)
+    load_started_at = time.perf_counter()
+    records, secure_records, protection, information, referrals, kpis = load_data(source_signature)
+    load_elapsed_seconds = time.perf_counter() - load_started_at
+except requests.RequestException as error:
+    st.error(f"Kobo could not be reached: {error}")
+    st.info("Check the Kobo server URL, network access, asset UID, and token permissions.")
+    st.stop()
+except Exception as error:
+    st.error(f"The Helpdesk dashboard data could not be loaded: {error}")
+    if not kobo_configured():
+        st.info("Configure KOBO_TOKEN and KOBO_ASSET_UID in .streamlit/secrets.toml, or add the fallback workbook under data/.")
+    st.stop()
+
+source_metadata = records.attrs.get("source_metadata", {})
 if records.empty:
-    st.error("No valid dashboard records were found in the source file.")
+    st.error("No valid dashboard records were found in the configured source.")
     st.stop()
 
 min_date = records["interview_date"].min().date()
@@ -2713,30 +4843,121 @@ default_from_date = min_date
 calendar_min_date = pd.Timestamp(year=min_date.year, month=1, day=1).date()
 calendar_max_date = pd.Timestamp(year=max_date.year, month=12, day=31).date()
 
-if "from_date_filter" not in st.session_state:
-    st.session_state["from_date_filter"] = default_from_date
-if "to_date_filter" not in st.session_state:
-    st.session_state["to_date_filter"] = max_date
+if "from_date_filter" not in st.session_state or "to_date_filter" not in st.session_state:
+    legacy_date_range = st.session_state.pop("date_range_filter", None)
+    if isinstance(legacy_date_range, (tuple, list)) and len(legacy_date_range) == 2:
+        legacy_from_date, legacy_to_date = legacy_date_range
+    else:
+        legacy_from_date, legacy_to_date = default_from_date, max_date
+    st.session_state.setdefault("from_date_filter", legacy_from_date)
+    st.session_state.setdefault("to_date_filter", legacy_to_date)
 
 with st.sidebar:
-    st.header("Filters")
-    if st.button("Reset all", use_container_width=True, key="sidebar_reset_all"):
-        reset_filters(default_from_date, max_date)
-        st.rerun()
-    action_col1, action_col2 = st.columns(2)
-    with action_col1:
-        if st.button("↻ Refresh", use_container_width=True, help="Reload latest data from KoboToolbox"):
-            st.cache_data.clear()
-            st.rerun()
-    with action_col2:
-        st.button("Clear filters", use_container_width=True, on_click=reset_filters, args=(default_from_date, max_date))
+    st.header("Dashboard Controls")
 
+    st.markdown(
+        """
+        <div class="sidebar-filter-guide">
+            <div class="sidebar-filter-guide-title">Control the dashboard view</div>
+            <div class="sidebar-filter-guide-body">
+                Start with the date range, then choose camp location before selecting helpdesk location.
+                Other filters update based on the selections above them.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.button(
+        "↺ Reset view", use_container_width=True,
+        on_click=reset_filters, args=(default_from_date, max_date),
+        help="Clear filters and return to the Overview section.",
+    )
+
+    st.markdown('<div class="sidebar-nav-title">Explore dashboard</div>', unsafe_allow_html=True)
+    selected_tab = helpdesk_section_navigation()
+    with st.expander("How to use this dashboard", expanded=False):
+        st.markdown(
+            "1. Choose an **dashboard section** and **view**.\n"
+            "2. Apply filters below; they remain active across views.\n"
+            "3. Open **Findings from the current tables** for interpretation.\n\n"
+            "**CPV:** Community-based protection volunteer  \n"
+            "**Mention:** A selected response; one record may contain several mentions"
+        )
+    with st.expander("Live data & schema status", expanded=False):
+        st.caption(f"Source: {source_mode}")
+        if kobo_configured():
+            st.caption(f"Kobo form: {source_metadata.get('asset_name', kobo_asset_uid)}")
+            st.caption(f"Asset UID: {kobo_asset_uid}")
+            fetched = pd.to_datetime(source_metadata.get("fetched_at"), utc=True, errors="coerce")
+            if pd.notna(fetched):
+                st.caption(f"Last fetched: {fetched.tz_convert('Africa/Nairobi').strftime('%d %b %Y %H:%M EAT')}")
+            st.caption(f"API pages: {source_metadata.get('api_pages', 0):,}")
+            st.caption(f"Shared refresh window: {KOBO_CACHE_TTL_SECONDS // 60} minutes")
+        else:
+            st.caption(f"Workbook: {DATA_FILE_PATH.name}")
+            st.caption(f"Last modified: {file_signature[3] if file_signature[3] else 'Unknown'}")
+        st.caption(f"Transformation rules: {PROCESSED_CACHE_VERSION}")
+        st.caption(f"Source records: {source_metadata.get('raw_records', len(records)):,}")
+        st.caption(f"Analysable records: {len(records):,}")
+        st.caption(f"Load/cache lookup: {load_elapsed_seconds:.3f} seconds")
+        unmapped = source_metadata.get("unmapped_source_columns", [])
+        missing = source_metadata.get("missing_contract_columns", [])
+        st.caption(f"Unmapped new/source attributes: {len(unmapped):,}")
+        st.caption(f"Contract fields absent from source: {len(missing):,}")
+        if unmapped:
+            st.write("Unmapped attributes (do not shift existing fields):", unmapped)
+        if missing:
+            st.write("Absent contract fields:", missing)
+        button_label = "Fetch latest Kobo submissions" if kobo_configured() else "Refresh data cache"
+        if st.button(button_label, key="admin_refresh_helpdesk_cache", use_container_width=True):
+            if kobo_configured():
+                st.session_state.helpdesk_kobo_refresh_nonce += 1
+                fetch_kobo_submissions.clear()
+                fetch_kobo_form_contract.clear()
+            load_data.clear()
+            st.rerun()
+
+    filter_section_badge(
+        "01",
+        "Display",
+        "Choose what support panels appear above the dashboard.",
+        "slate",
+    )
+    with st.expander("Display options", expanded=False):
+        show_current_selection_summary = st.checkbox(
+            "Show current selection summary",
+            value=True,
+            key="show_current_selection_summary",
+            help="Show or hide the record count, date range, update time, and selected filter chips above the KPI cards.",
+        )
+
+    st.markdown('<div class="filter-divider"></div>', unsafe_allow_html=True)
+
+    filter_section_badge(
+        "02",
+        "Date range",
+        "Set the reporting period before applying other filters.",
+        "gold",
+    )
     with st.expander("Date range", expanded=True):
-        date_cols = st.columns(2)
-        with date_cols[0]:
-            selected_from_date = st.date_input("From", min_value=calendar_min_date, max_value=calendar_max_date, key="from_date_filter")
-        with date_cols[1]:
-            selected_to_date = st.date_input("To", min_value=calendar_min_date, max_value=calendar_max_date, key="to_date_filter")
+        st.caption("Click each date field to open its calendar and select the reporting period.")
+        selected_from_date = st.date_input(
+            "From",
+            min_value=calendar_min_date,
+            max_value=calendar_max_date,
+            format="DD/MM/YYYY",
+            key="from_date_filter",
+            help="Select the first date included in the reporting period.",
+        )
+        selected_to_date = st.date_input(
+            "To",
+            min_value=calendar_min_date,
+            max_value=calendar_max_date,
+            format="DD/MM/YYYY",
+            key="to_date_filter",
+            help="Select the last date included in the reporting period.",
+        )
 
     if selected_from_date > selected_to_date:
         st.error("From date cannot be after To date.")
@@ -2756,34 +4977,120 @@ with st.sidebar:
     selected_age_groups = []
     selected_request_categories = []
 
+    filter_section_badge(
+        "03",
+        "Location",
+        "Select camp first, then unlock helpdesk locations.",
+        "green",
+    )
     with st.expander("Location", expanded=True):
         camp_options = [v for v, _ in filter_options_with_counts(date_filtered_records["camp_location"])]
-        st.markdown("**Camp location**")
+        st.markdown('<div class="filter-label">Camp location</div>', unsafe_allow_html=True)
         selected_camp_locations = multi_choice_selector("Camp", camp_options, key="camp_location_filter", help_text="Select one or more camps")
-        camp_filtered_records = date_filtered_records[date_filtered_records["camp_location"].astype(str).isin(selected_camp_locations)].copy() if selected_camp_locations else date_filtered_records.copy()
-        helpdesk_options = [v for v, _ in filter_options_with_counts(camp_filtered_records["helpdesk_location"])]
-        st.markdown("**Helpdesk location**")
-        selected_helpdesk_locations = multi_choice_selector("Helpdesk location", helpdesk_options, key="helpdesk_location_filter", help_text="Select helpdesk locations")
+        filter_selection_feedback("camp", selected_camp_locations)
+
+        if selected_camp_locations:
+            camp_filtered_records = date_filtered_records[
+                date_filtered_records["camp_location"].astype(str).isin(selected_camp_locations)
+            ].copy()
+        else:
+            camp_filtered_records = date_filtered_records.copy()
+            st.session_state["helpdesk_location_filter"] = []
+
+        st.markdown('<div class="filter-label">Helpdesk location</div>', unsafe_allow_html=True)
+        if selected_camp_locations:
+            helpdesk_options = [v for v, _ in filter_options_with_counts(camp_filtered_records["helpdesk_location"])]
+            selected_helpdesk_locations = multi_choice_selector(
+                "Helpdesk location",
+                helpdesk_options,
+                key="helpdesk_location_filter",
+                help_text="Select helpdesk locations after choosing camp location",
+            )
+            filter_selection_feedback("helpdesk", selected_helpdesk_locations)
+        else:
+            selected_helpdesk_locations = []
+            st.markdown(
+                '<div class="filter-step-note">Select a camp location first to unlock helpdesk locations.</div>',
+                unsafe_allow_html=True,
+            )
 
     helpdesk_filtered_records = camp_filtered_records[camp_filtered_records["helpdesk_location"].astype(str).isin(selected_helpdesk_locations)].copy() if selected_helpdesk_locations else camp_filtered_records.copy()
 
-    with st.expander("Demographics", expanded=True):
+    filter_section_badge(
+        "04",
+        "Demographics",
+        "Narrow the dashboard by seeker type, gender, and age.",
+        "blue",
+    )
+    with st.expander("Demographics", expanded=False):
         type_options = [v for v, _ in filter_options_with_counts(helpdesk_filtered_records["information_seeker_type"])]
+        st.markdown('<div class="filter-label">Information seeker type</div>', unsafe_allow_html=True)
         selected_information_seeker_types = multi_choice_selector("Information seeker type", type_options, key="information_seeker_type_filter")
+        filter_selection_feedback("seeker type", selected_information_seeker_types)
         seeker_filtered_records = helpdesk_filtered_records[helpdesk_filtered_records["information_seeker_type"].astype(str).isin(selected_information_seeker_types)].copy() if selected_information_seeker_types else helpdesk_filtered_records.copy()
 
         gender_options = [v for v, _ in filter_options_with_counts(seeker_filtered_records["information_seeker_gender"], ordered_values=GENDER_ORDER)]
+        st.markdown('<div class="filter-label">Gender</div>', unsafe_allow_html=True)
         selected_genders = multi_choice_selector("Gender", gender_options, key="information_seeker_gender_filter")
+        filter_selection_feedback("gender", selected_genders)
         gender_filtered_records = seeker_filtered_records[seeker_filtered_records["information_seeker_gender"].astype(str).isin(selected_genders)].copy() if selected_genders else seeker_filtered_records.copy()
 
         age_options = [v for v, _ in filter_options_with_counts(gender_filtered_records["age_group"], ordered_values=AGE_GROUP_ORDER)]
+        st.markdown('<div class="filter-label">Age group</div>', unsafe_allow_html=True)
         selected_age_groups = multi_choice_selector("Age group", age_options, key="age_group_filter")
+        filter_selection_feedback("age group", selected_age_groups)
 
     age_filtered_records = gender_filtered_records[gender_filtered_records["age_group"].astype(str).isin(selected_age_groups)].copy() if selected_age_groups else gender_filtered_records.copy()
 
-    with st.expander("Request type", expanded=True):
+    filter_section_badge(
+        "05",
+        "Request",
+        "Filter protection concerns and information requests.",
+        "violet",
+    )
+    with st.expander("Request type", expanded=False):
         request_options = [v for v, _ in filter_options_with_counts(age_filtered_records["request_category"])]
+        st.markdown('<div class="filter-label">Request category</div>', unsafe_allow_html=True)
         selected_request_categories = multi_choice_selector("Request category", request_options, key="request_category_filter")
+        filter_selection_feedback("request category", selected_request_categories)
+
+    selected_filter_groups = [
+        selected_camp_locations,
+        selected_helpdesk_locations,
+        selected_information_seeker_types,
+        selected_genders,
+        selected_age_groups,
+        selected_request_categories,
+    ]
+    active_filter_count = sum(1 for selected in selected_filter_groups if selected)
+    if from_date != min_date or to_date != max_date:
+        active_filter_count += 1
+
+    sidebar_preview_records = (
+        age_filtered_records[
+            age_filtered_records["request_category"].astype(str).isin(selected_request_categories)
+        ].copy()
+        if selected_request_categories
+        else age_filtered_records.copy()
+    )
+    filter_status_class = "filter-status active" if active_filter_count else "filter-status"
+    filter_status_text = (
+        f"{active_filter_count} filter group{'s' if active_filter_count != 1 else ''} active"
+        if active_filter_count
+        else "No filters active"
+    )
+    st.markdown(
+        f"""
+        <div class="filter-status-panel">
+            <div class="{filter_status_class}">
+                <span class="filter-icon">Status</span>
+                <span>{escape_text(filter_status_text)}</span>
+            </div>
+            <div class="filter-status-hint">Estimated records after filters: {format_number(len(sidebar_preview_records))}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 filters = {
     "start_date": start_date,
@@ -2810,12 +5117,17 @@ information_records = filtered_records["request_category"].eq("Seeking general p
 partner_referrals = filtered_records["referral_status"].eq("Referred to partner agency").sum()
 follow_up = filtered_records["follow_up_required_clean"].eq("Yes").sum()
 disability_records = filtered_records["disability_status"].eq("Has Disability").sum()
+known_visit_records = filtered_records[
+    filtered_records["helpdesk_visit_history"].isin(["First-time visitor", "Repeat visitor"])
+]
+first_time_visitors = known_visit_records["helpdesk_visit_history"].eq("First-time visitor").sum()
+repeat_visitors = known_visit_records["helpdesk_visit_history"].eq("Repeat visitor").sum()
 if "staff_name" in filtered_records.columns:
     harmonized_staff = filtered_records["staff_name"].map(normalize_staff_name)
     staff_no = int(harmonized_staff[harmonized_staff.ne("[Not recorded]")].nunique())
 else:
     staff_no = 0
-last_updated = source_signature[3] if source_signature[3] else "Kobo live data"
+last_updated = file_signature[3] if file_signature[3] else "Unknown"
 
 st.markdown(
     f"""
@@ -2836,55 +5148,82 @@ selection_pills_html = "".join([
     selection_pill("Gender", selected_genders),
     selection_pill("Age", selected_age_groups),
 ])
-st.markdown(
-    f"""
-    <div class="app-infobar">
-        <div class="app-infobar-row">
-            <div class="app-pill">&#128202; {format_number(total_records)} of {format_number(all_records)} records</div>
-            <div class="app-pill">&#128197; {escape_text(from_date.strftime('%d %b %Y'))} &ndash; {escape_text(to_date.strftime('%d %b %Y'))}</div>
-            <div class="app-pill app-pill-muted">&#128260; Updated {escape_text(last_updated)}</div>
-        </div>
-        <div class="app-infobar-row"><span class="app-infobar-tag">&#128269; Current selection</span>{selection_pills_html}</div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-kpi_group_caption("Volume, staffing & request mix — request types are mutually exclusive")
-mix_cols = st.columns(4)
-show_kpi_card(mix_cols[0], "Staff No.", format_number(staff_no), "Unique harmonized CPVs in current selection", accent="#2F7D69")
-show_kpi_card(mix_cols[1], "Valid records", format_number(total_records), f"of {format_number(all_records)} in source", accent="#2F7D69")
-show_kpi_card(mix_cols[2], "Protection concerns", format_number(protection_records), f"{format_rate(protection_records, total_records)} of requests", share=safe_share(protection_records, total_records), accent="#2563EB")
-show_kpi_card(mix_cols[3], "Information requests", format_number(information_records), f"{format_rate(information_records, total_records)} of requests", share=safe_share(information_records, total_records), accent="#2563EB")
-
-kpi_group_caption("Case outcomes — overlapping subsets of records")
-outcome_cols = st.columns(3)
-show_kpi_card(outcome_cols[0], "Partner referrals", format_number(partner_referrals), f"{format_rate(partner_referrals, total_records)} of all records", share=safe_share(partner_referrals, total_records), accent="#2F7D69")
-show_kpi_card(outcome_cols[1], "Follow-up required", format_number(follow_up), f"{format_rate(follow_up, total_records)} of all records", share=safe_share(follow_up, total_records), accent="#D9A441")
-show_kpi_card(outcome_cols[2], "Disability records", format_number(disability_records), f"{format_rate(disability_records, total_records)} of all records", share=safe_share(disability_records, total_records), accent="#7C3AED")
+if selected_tab == "Overview" and st.session_state.get("show_current_selection_summary", True):
+    with st.expander("Current selection summary", expanded=False):
+        st.markdown(
+            f"""
+            <div class="app-infobar">
+                <div class="app-infobar-row">
+                    <div class="app-pill">&#128202; {format_number(total_records)} of {format_number(all_records)} records</div>
+                    <div class="app-pill">&#128197; {escape_text(from_date.strftime('%d %b %Y'))} &ndash; {escape_text(to_date.strftime('%d %b %Y'))}</div>
+                    <div class="app-pill app-pill-muted">&#128260; Updated {escape_text(last_updated)}</div>
+                </div>
+                <div class="app-infobar-row"><span class="app-infobar-tag">&#128269; Current selection</span>{selection_pills_html}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 if filtered_records.empty:
     st.info("No records match the selected filters.")
     show_footer()
     st.stop()
 
-# Quick insights
-disability_type_records = filtered_records[filtered_records["disability_status"].eq("Has Disability")]
-follow_up_records = filtered_records[filtered_records["follow_up_required_clean"].eq("Yes")]
-top_location, top_location_count = top_value(filtered_records, "helpdesk_location")
-top_concern, top_concern_count = top_value(filtered_protection, "protection_concern")
-top_disability, top_disability_count = top_value(disability_type_records, "disability_type")
-top_followup_site, top_followup_site_count = top_value(follow_up_records, "helpdesk_location")
-section_header("Quick Insights", "Leading categories within each dimension.")
-insight_cols = st.columns(4)
-show_insight_card(insight_cols[0], "Busiest helpdesk", top_location, insight_detail(top_location_count, total_records, denom_label="all records"), icon="🏢", count=top_location_count)
-show_insight_card(insight_cols[1], "Top protection concern", top_concern, insight_detail(top_concern_count, len(filtered_protection), unit="mentions", denom_label="concerns"), icon="🛡️", count=top_concern_count)
-show_insight_card(insight_cols[2], "Most common impairment", top_disability, insight_detail(top_disability_count, len(disability_type_records), denom_label="disability records"), icon="♿", count=top_disability_count)
-show_insight_card(insight_cols[3], "Most follow-up activity", top_followup_site, insight_detail(top_followup_site_count, len(follow_up_records), unit="follow-ups", denom_label="follow-ups"), icon="🔄", count=top_followup_site_count)
+# Keep the overview as a true landing page. Global KPIs and quick insights are
+# deliberately omitted from analytical sections so users reach their data
+# immediately without repeatedly scrolling past the same summary cards.
+if selected_tab == "Overview":
+    kpi_group_caption("Volume, staffing & request mix — request types are mutually exclusive")
+    mix_cols = st.columns(4)
+    show_kpi_card(mix_cols[0], "Staff No.", format_number(staff_no), "Unique harmonized CPVs in current selection", accent="#2F7D69")
+    show_kpi_card(mix_cols[1], "Valid records", format_number(total_records), f"of {format_number(all_records)} in source", accent="#2F7D69")
+    show_kpi_card(mix_cols[2], "Protection concerns", format_number(protection_records), f"{format_rate(protection_records, total_records)} of requests", share=safe_share(protection_records, total_records), accent="#2563EB")
+    show_kpi_card(mix_cols[3], "Information requests", format_number(information_records), f"{format_rate(information_records, total_records)} of requests", share=safe_share(information_records, total_records), accent="#2563EB")
 
-st.divider()
-section_header("Explore by Section", "Select a section below to dive into the detailed analysis.")
-selected_tab = st.radio("Dashboard section", ["Overview", "Disability", "Concerns", "Information", "Referrals", "Map", "CPV Work", "DQA", "Records"], horizontal=True, label_visibility="collapsed")
+    kpi_group_caption("Case outcomes — overlapping subsets of records")
+    outcome_cols = st.columns(3)
+    show_kpi_card(outcome_cols[0], "Partner referrals", format_number(partner_referrals), f"{format_rate(partner_referrals, total_records)} of all records", share=safe_share(partner_referrals, total_records), accent="#2F7D69")
+    show_kpi_card(outcome_cols[1], "Follow-up required", format_number(follow_up), f"{format_rate(follow_up, total_records)} of all records", share=safe_share(follow_up, total_records), accent="#D9A441")
+    show_kpi_card(outcome_cols[2], "Disability records", format_number(disability_records), f"{format_rate(disability_records, total_records)} of all records", share=safe_share(disability_records, total_records), accent="#7C3AED")
+
+    kpi_group_caption("Helpdesk entry point — prior visit history")
+    entry_cols = st.columns(2)
+    show_kpi_card(entry_cols[0], "First-time visitors", format_number(first_time_visitors), f"{format_rate(first_time_visitors, len(known_visit_records))} of records with known visit history", share=safe_share(first_time_visitors, len(known_visit_records)), accent="#1F6FB2")
+    show_kpi_card(entry_cols[1], "Repeat visitors", format_number(repeat_visitors), f"{format_rate(repeat_visitors, len(known_visit_records))} of records with known visit history", share=safe_share(repeat_visitors, len(known_visit_records)), accent="#D9A441")
+
+    disability_type_records = filtered_records[filtered_records["disability_status"].eq("Has Disability")]
+    follow_up_records = filtered_records[filtered_records["follow_up_required_clean"].eq("Yes")]
+    top_location, top_location_count = top_value(filtered_records, "helpdesk_location")
+    top_concern, top_concern_count = top_value(filtered_protection, "protection_concern")
+    top_disability, top_disability_count = top_value(disability_type_records, "disability_type")
+    top_followup_site, top_followup_site_count = top_value(follow_up_records, "helpdesk_location")
+    section_header("Quick Insights", "Leading categories within each dimension.")
+    insight_cols = st.columns(4)
+    show_insight_card(insight_cols[0], "Busiest helpdesk", top_location, insight_detail(top_location_count, total_records, denom_label="all records"), icon="🏢", count=top_location_count)
+    show_insight_card(insight_cols[1], "Top protection concern", top_concern, insight_detail(top_concern_count, len(filtered_protection), unit="mentions", denom_label="concerns"), icon="🛡️", count=top_concern_count)
+    show_insight_card(insight_cols[2], "Most common impairment", top_disability, insight_detail(top_disability_count, len(disability_type_records), denom_label="disability records"), icon="♿", count=top_disability_count)
+    show_insight_card(insight_cols[3], "Most follow-up activity", top_followup_site, insight_detail(top_followup_site_count, len(follow_up_records), unit="follow-ups", denom_label="follow-ups"), icon="🔄", count=top_followup_site_count)
+else:
+    st.markdown(
+        f"""
+        <div class="section-context-strip" aria-label="Current analytical context">
+            <span><strong>{format_number(total_records)}</strong> records in view</span>
+            <span>{escape_text(from_date.strftime('%d %b %Y'))} &ndash; {escape_text(to_date.strftime('%d %b %Y'))}</span>
+            <span>{active_filter_count} filter group{'s' if active_filter_count != 1 else ''} active</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+helpdesk_section_intro(selected_tab, total_records)
+if selected_tab != "Overview":
+    st.button("← Back to Overview", key="helpdesk_back_to_overview", on_click=helpdesk_go_to_overview)
+section_findings = build_helpdesk_findings(
+    selected_tab, filtered_records, filtered_protection, filtered_information, filtered_referrals
+)
+with st.expander("Findings from the current tables", expanded=(selected_tab == "Overview")):
+    st.caption("Automatically generated, filter-aware descriptive findings. They summarize observed patterns and do not establish causes.")
+    st.markdown(section_findings)
 
 # -----------------------------------------------------------------------------
 # Overview tab
@@ -2898,13 +5237,39 @@ if selected_tab == "Overview":
 
     st.subheader("Request Type Table")
     show_gender_table(filtered_records, "request_category", "Request type")
-    st.divider()
-    st.subheader("Demographics by gender")
-    st.caption("Information seeker type")
-    draw_gender_column_bar(filtered_records, "information_seeker_type", height=300)
-    show_gender_table(filtered_records, "information_seeker_type", "Information seeker type")
 
-    st.markdown("#### Age group")
+    st.divider()
+    st.subheader("First-time and Repeat Helpdesk Visits")
+    st.caption(
+        '"visited_tdh_helpdesk_before" establishes first-time versus repeat status. '
+        '"last_visit_within_current_month" is then applied only to repeat visitors.'
+    )
+    if known_visit_records.empty:
+        st.info("No usable prior-visit responses match the selected filters.")
+    else:
+        draw_gender_column_bar(known_visit_records, "helpdesk_visit_history", height=300)
+        show_gender_table(known_visit_records, "helpdesk_visit_history", "Visit history")
+
+        repeat_visit_records = known_visit_records[
+            known_visit_records["helpdesk_visit_history"].eq("Repeat visitor")
+        ].copy()
+        st.markdown("#### Repeat Visit Timing")
+        if repeat_visit_records.empty:
+            st.info("No repeat visitors match the selected filters.")
+        else:
+            draw_gender_column_bar(
+                repeat_visit_records,
+                "repeat_visit_timing",
+                height=300,
+            )
+            show_gender_table(
+                repeat_visit_records,
+                "repeat_visit_timing",
+                "Repeat visit timing",
+            )
+
+    st.divider()
+    st.subheader("Age Group by Gender")
     draw_gender_column_bar(filtered_records, "age_group", height=420)
     show_gender_table(filtered_records, "age_group", "Age group")
 
@@ -2937,6 +5302,8 @@ if selected_tab == "Disability":
         'Impairment types are standardized across adults and children.</div>',
         unsafe_allow_html=True,
     )
+
+    st.divider()
 
     # Strict disability-only slice for the entire tab.
     # This is the controlling filter for every chart/table in this menu.
@@ -3007,19 +5374,19 @@ if selected_tab == "Disability":
                 top_n=None,
             )
 
-            st.caption("Single vs Multiple Impairments")
+            st.caption("Single impairment vs multiple impairments (two or more)")
 
             draw_total_donut(
                 adult_person,
                 "adult_impairment_multiplicity",
-                "Number of impairments",
+                "Impairment multiplicity",
                 height=280,
             )
 
             show_gender_table(
                 adult_person,
                 "adult_impairment_multiplicity",
-                "Number of impairments",
+                "Impairment multiplicity",
             )
 
         else:
@@ -3083,6 +5450,106 @@ if selected_tab == "Concerns":
     draw_gender_bar(filtered_protection, "protection_concern", top_n=concern_top_n, height=640, ascending=concern_rank == "Lowest values")
     st.caption("Full table (all categories, unaffected by chart slicing)")
     show_gender_table(filtered_protection, "protection_concern", "Protection concern", top_n=None)
+    st.markdown("#### Protection Concern by Age Group")
+    st.caption("Select one or more protection concerns to view the age group and gender breakdown.")
+    concern_age_options = age_breakdown_options(filtered_protection, "protection_concern")
+
+    if not concern_age_options:
+        st.info("No protection concern records match the selected filters.")
+    else:
+        selected_concerns_for_age = st.multiselect(
+            "Protection concerns",
+            concern_age_options,
+            default=concern_age_options[: min(3, len(concern_age_options))],
+            key="selected_concerns_for_age",
+        )
+
+        if not selected_concerns_for_age:
+            st.info("Select at least one protection concern to view the age and gender breakdown.")
+        else:
+            draw_age_gender_breakdown_bar(
+                filtered_protection,
+                "protection_concern",
+                selected_concerns_for_age,
+                "Protection concern",
+                height=320,
+            )
+            show_age_gender_breakdown_table(
+                filtered_protection,
+                "protection_concern",
+                selected_concerns_for_age,
+                "Protection concern",
+            )
+
+            st.markdown("#### Disability Distribution by Age Group")
+            st.caption(
+                "Uses the same selected protection-concern rows as the table above, "
+                "then retains only mentions linked to records with disability."
+            )
+            selected_protection_rows = filtered_protection[
+                filtered_protection["protection_concern"]
+                .astype(str)
+                .isin(selected_concerns_for_age)
+            ].copy()
+            protection_disability_by_age = selected_protection_rows[
+                selected_protection_rows["disability_status"]
+                .astype(str)
+                .eq("Has Disability")
+            ].copy()
+
+            if protection_disability_by_age.empty:
+                st.info(
+                    "None of the selected protection-concern mentions are linked "
+                    "to records with disability."
+                )
+            else:
+                show_gender_table(
+                    protection_disability_by_age,
+                    "age_group",
+                    "Age group",
+                    top_n=None,
+                )
+
+    st.divider()
+    st.markdown("#### Child Accompaniment Status")
+    st.caption(
+        'Prioritizes "child_unaccompanied_minor". Where that field is blank, '
+        "the respondent relationship fields are used only when they clearly "
+        "identify an unaccompanied child or a caregiver."
+    )
+    child_accompaniment = filtered_records[
+        filtered_records["derived_life_stage"].astype(str).eq("Child")
+        & filtered_records["child_accompaniment_status"].isin(
+            ["Unaccompanied", "Not unaccompanied"]
+        )
+    ].copy()
+    if child_accompaniment.empty:
+        st.info("No determinable child accompaniment records match the selected filters.")
+    else:
+        draw_gender_column_bar(
+            child_accompaniment,
+            "child_accompaniment_status",
+            height=300,
+        )
+        show_gender_table(
+            child_accompaniment,
+            "child_accompaniment_status",
+            "Accompaniment status",
+        )
+
+        unaccompanied_children = child_accompaniment[
+            child_accompaniment["child_accompaniment_status"].eq("Unaccompanied")
+        ]
+        st.markdown("##### Unaccompanied Children by Age Group")
+        if unaccompanied_children.empty:
+            st.info("No unaccompanied children match the selected filters.")
+        else:
+            show_gender_table(
+                unaccompanied_children,
+                "age_group",
+                "Age group",
+                top_n=None,
+            )
 
 if selected_tab == "Information":
     st.subheader("Top General Information Needs by Gender")
@@ -3102,11 +5569,88 @@ if selected_tab == "Referrals":
     show_gender_table(filtered_records, "follow_up_required_clean", "Follow-up required")
     st.divider()
     st.subheader("Referral Partners by Gender")
+    referred_case_count = int(
+        filtered_records["referral_status"].astype(str).eq("Referred to partner agency").sum()
+    )
+    partner_record_count = int(filtered_referrals["record_id"].nunique()) if "record_id" in filtered_referrals.columns else 0
+    partner_assignment_count = len(filtered_referrals)
+    st.caption(
+        f"Reconciliation: {referred_case_count:,} referred cases; "
+        f"{partner_record_count:,} cases with a recorded partner; "
+        f"{partner_assignment_count:,} partner assignments."
+    )
+    if partner_record_count < referred_case_count:
+        st.warning(
+            f"{referred_case_count - partner_record_count:,} referred case(s) do not have a partner recorded."
+        )
+    if partner_assignment_count > partner_record_count:
+        st.info(
+            f"{partner_assignment_count - partner_record_count:,} additional assignment(s) arise because some cases were referred to more than one partner."
+        )
     referral_rank = st.radio("Rank", ["Highest values", "Lowest values"], horizontal=True, index=0, key="referral_rank")
     referral_top_n = st.radio("Number of categories", [10, 15, 25], horizontal=True, index=1, key="referral_top_n")
     draw_gender_bar(filtered_referrals, "referral_partner", top_n=referral_top_n, height=560, ascending=referral_rank == "Lowest values")
-    st.caption("Full table (all categories, unaffected by chart slicing)")
+    st.caption("Full partner-assignment table (all categories, unaffected by chart slicing)")
     show_gender_table(filtered_referrals, "referral_partner", "Referral partner", top_n=None)
+    st.markdown("#### Referral Partner by Age Group")
+    st.caption("Select one or more referral partners to view the age group and gender breakdown.")
+    referral_age_options = age_breakdown_options(filtered_referrals, "referral_partner")
+
+    if not referral_age_options:
+        st.info("No referral partner records match the selected filters.")
+    else:
+        selected_referral_partners_for_age = st.multiselect(
+            "Referral partners",
+            referral_age_options,
+            default=referral_age_options[: min(3, len(referral_age_options))],
+            key="selected_referral_partners_for_age",
+        )
+
+        if not selected_referral_partners_for_age:
+            st.info("Select at least one referral partner to view the age and gender breakdown.")
+        else:
+            draw_age_gender_breakdown_bar(
+                filtered_referrals,
+                "referral_partner",
+                selected_referral_partners_for_age,
+                "Referral partner",
+                height=320,
+            )
+            show_age_gender_breakdown_table(
+                filtered_referrals,
+                "referral_partner",
+                selected_referral_partners_for_age,
+                "Referral partner",
+            )
+
+            st.markdown("#### Disability Distribution by Age Group")
+            st.caption(
+                "Uses the same selected referral-partner assignments as the table "
+                "above, then retains only assignments linked to records with disability."
+            )
+            selected_referral_rows = filtered_referrals[
+                filtered_referrals["referral_partner"]
+                .astype(str)
+                .isin(selected_referral_partners_for_age)
+            ].copy()
+            referral_disability_by_age = selected_referral_rows[
+                selected_referral_rows["disability_status"]
+                .astype(str)
+                .eq("Has Disability")
+            ].copy()
+
+            if referral_disability_by_age.empty:
+                st.info(
+                    "None of the selected referral-partner assignments are linked "
+                    "to records with disability."
+                )
+            else:
+                show_gender_table(
+                    referral_disability_by_age,
+                    "age_group",
+                    "Age group",
+                    top_n=None,
+                )
 
 if selected_tab == "Map":
     st.subheader("Helpdesk Locations Map")
@@ -3198,10 +5742,18 @@ if selected_tab == "CPV Work":
         )
         cpv_order = cpv_chart_data["CPV"].astype(str).tolist()
         cpv_chart_height = max(280, min(760, 34 * len(cpv_order) + 80))
+        cpv_chart_color = CPV_METRIC_COLORS.get(cpv_chart_metric, "#2F7D69")
+        cpv_x_upper = chart_headroom(cpv_chart_data[cpv_chart_metric])
 
         cpv_chart = (
             alt.Chart(cpv_chart_data)
-            .mark_bar(cornerRadiusEnd=3, color="#2F7D69")
+            .mark_bar(
+                cornerRadiusEnd=6,
+                color=cpv_chart_color,
+                opacity=0.94,
+                stroke="#FFFFFF",
+                strokeWidth=0.7,
+            )
             .encode(
                 y=alt.Y(
                     "CPV:N",
@@ -3212,6 +5764,7 @@ if selected_tab == "CPV Work":
                 x=alt.X(
                     f"{cpv_chart_metric}:Q",
                     title=cpv_chart_metric,
+                    scale=alt.Scale(domain=[0, cpv_x_upper], nice=False),
                 ),
                 tooltip=[
                     alt.Tooltip("CPV:N", title="CPV"),
@@ -3235,11 +5788,11 @@ if selected_tab == "CPV Work":
                 dx=5,
                 fontSize=11,
                 fontWeight=700,
-                color="#1E293B",
+                color="#12312F",
             )
             .encode(
                 y=alt.Y("CPV:N", sort=cpv_order, title=None),
-                x=alt.X(f"{cpv_chart_metric}:Q"),
+                x=alt.X(f"{cpv_chart_metric}:Q", scale=alt.Scale(domain=[0, cpv_x_upper], nice=False)),
                 text=alt.Text(f"{cpv_chart_metric}:Q", format=","),
             )
         )
@@ -3249,8 +5802,11 @@ if selected_tab == "CPV Work":
             use_container_width=True,
         )
 
-        st.caption("Full table — all CPVs, unaffected by the chart slicers")
-        st.dataframe(style_records_table(cpv_summary), use_container_width=True, hide_index=True)
+        st.markdown(
+            '<div class="cpv-table-title">Full CPV Work Summary — all CPVs, unaffected by chart slicers</div>',
+            unsafe_allow_html=True,
+        )
+        render_dashboard_table(cpv_summary, label_column="CPV", max_height=620)
 
 if selected_tab == "DQA":
     st.subheader("Data Quality Assurance (DQA)")
@@ -3305,6 +5861,24 @@ if selected_tab == "DQA":
     st.dataframe(style_records_table(missing_table), use_container_width=True, hide_index=True)
 
     st.divider()
+    st.markdown("### Helpdesk visit-history consistency")
+    st.caption(
+        'Checks the dependency between "visited_tdh_helpdesk_before" and '
+        '"last_visit_within_current_month". The timing question should only be '
+        "answered for repeat visitors."
+    )
+    visit_consistency_table = basic_count_table(
+        filtered_records,
+        "visit_history_consistency",
+        "Consistency result",
+    )
+    render_dashboard_table(
+        visit_consistency_table,
+        label_column="Consistency result",
+        max_height=360,
+    )
+
+    st.divider()
     st.markdown("### Protected education-concern follow-up table")
     st.markdown(
         '<div class="section-note">Includes records where concern_educational_support and/or concern_school_dropout_risk_or_dropped_out was selected. This table contains PII and requires a password.</div>',
@@ -3342,7 +5916,8 @@ if selected_tab == "Records":
     preview_records = searched_records[selected_columns].head(RECORD_PREVIEW_LIMIT)
     st.caption(f"Showing {format_number(len(preview_records))} preview records from {format_number(len(searched_records))} matching records. The download still includes all matching records.")
     st.dataframe(style_records_table(preview_records), use_container_width=True, hide_index=True)
-    st.download_button("Download filtered records", data=searched_records.to_csv(index=False).encode("utf-8"), file_name="filtered_helpdesk_records.csv", mime="text/csv", use_container_width=True)
+    if st.checkbox("Prepare filtered CSV download", value=False, help="CSV bytes are generated only when requested to keep ordinary page opening fast."):
+        st.download_button("Download filtered records", data=searched_records.to_csv(index=False).encode("utf-8"), file_name="filtered_helpdesk_records.csv", mime="text/csv", use_container_width=True)
 
     with st.expander("Protected DQA table: education concerns with PII", expanded=False):
         st.markdown(
