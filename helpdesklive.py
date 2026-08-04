@@ -24,9 +24,10 @@ DEVELOPER_LOGO_PATH = BASE_DIR / "assets" / "developer-logo.png"
 STYLES_PATH = BASE_DIR / "assets" / "styles.css"
 DATA_FILE_PATH = Path(os.environ.get("HELPDESK_DATA_PATH") or (BASE_DIR / "data" / "HELPDESK_DashboardData_Tdh_Kenya_D2.xlsx"))
 PROCESSED_CACHE_PATH = BASE_DIR / "data" / "processed" / "helpdesk_processed_cache.pkl"
-PROCESSED_CACHE_VERSION = "2026-08-04-kobo-v1"
-KOBO_CACHE_TTL_SECONDS = 900
-KOBO_SCHEMA_CACHE_TTL_SECONDS = 3600
+PROCESSED_CACHE_VERSION = "2026-08-04-kobo-v2"
+KOBO_CACHE_TTL_SECONDS = 60
+KOBO_SCHEMA_CACHE_TTL_SECONDS = 300
+KOBO_AUTO_REFRESH_SECONDS = 60
 KOBO_REQUEST_TIMEOUT_SECONDS = 45
 KOBO_PAGE_SAFETY_LIMIT = 10000
 
@@ -2669,6 +2670,22 @@ def fetch_kobo_submissions(base_url, asset_uid, token, refresh_nonce=0):
     return raw, metadata
 
 
+if hasattr(st, "fragment"):
+    @st.fragment(run_every=f"{KOBO_AUTO_REFRESH_SECONDS}s")
+    def live_refresh_pulse():
+        """Rerun the full app once per interval while preserving filter state."""
+        current_bucket = int(time.time() // KOBO_AUTO_REFRESH_SECONDS)
+        previous_bucket = st.session_state.get("helpdesk_live_refresh_bucket")
+        if previous_bucket is None:
+            st.session_state.helpdesk_live_refresh_bucket = current_bucket
+        elif previous_bucket != current_bucket:
+            st.session_state.helpdesk_live_refresh_bucket = current_bucket
+            st.rerun()
+else:
+    def live_refresh_pulse():
+        return None
+
+
 # -----------------------------------------------------------------------------
 # Data loading
 # -----------------------------------------------------------------------------
@@ -4900,9 +4917,49 @@ with st.sidebar:
     )
 
     selected_tab = helpdesk_section_navigation()
+
+    if kobo_configured():
+        fetched_at = pd.to_datetime(
+            source_metadata.get("fetched_at"), utc=True, errors="coerce"
+        )
+        fetched_label = (
+            fetched_at.tz_convert("Africa/Nairobi").strftime("%d %b %Y %H:%M:%S EAT")
+            if pd.notna(fetched_at)
+            else "Not recorded"
+        )
+        st.markdown(
+            f'<div class="live-sync-card">'
+            f'<div class="live-sync-heading"><span class="live-sync-dot"></span>Live Kobo data</div>'
+            f'<div class="live-sync-time">Last synced: {escape_text(fetched_label)}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button(
+            "↻ Sync latest Kobo data",
+            key="primary_kobo_sync",
+            type="primary",
+            use_container_width=True,
+            help="Bypass the cache and retrieve all current Kobo submissions now.",
+        ):
+            st.session_state.helpdesk_kobo_refresh_nonce += 1
+            fetch_kobo_submissions.clear()
+            fetch_kobo_form_contract.clear()
+            load_data.clear()
+            st.rerun()
+        auto_sync_enabled = st.toggle(
+            "Auto-sync every minute",
+            value=True,
+            key="helpdesk_auto_sync_enabled",
+            help="Refresh the dashboard automatically every 60 seconds while preserving filters.",
+        )
+        if auto_sync_enabled:
+            live_refresh_pulse()
+    else:
+        st.caption("Using the local file fallback; live Kobo synchronization is unavailable.")
+
     with st.expander("How to use this dashboard", expanded=False):
         st.markdown(
-            "1. Choose an **dashboard section** and **view**.\n"
+            "1. Choose a view from **Explore dashboard**.\n"
             "2. Apply filters below; they remain active across views.\n"
             "3. Open **Findings from the current tables** for interpretation.\n\n"
             "**CPV:** Community-based protection volunteer  \n"
@@ -4917,7 +4974,7 @@ with st.sidebar:
             if pd.notna(fetched):
                 st.caption(f"Last fetched: {fetched.tz_convert('Africa/Nairobi').strftime('%d %b %Y %H:%M EAT')}")
             st.caption(f"API pages: {source_metadata.get('api_pages', 0):,}")
-            st.caption(f"Shared refresh window: {KOBO_CACHE_TTL_SECONDS // 60} minutes")
+            st.caption(f"Automatic data refresh: every {KOBO_AUTO_REFRESH_SECONDS} seconds")
         else:
             st.caption(f"Workbook: {DATA_FILE_PATH.name}")
             st.caption(f"Last modified: {file_signature[3] if file_signature[3] else 'Unknown'}")
@@ -4933,14 +4990,7 @@ with st.sidebar:
             st.write("Unmapped attributes (do not shift existing fields):", unmapped)
         if missing:
             st.write("Absent contract fields:", missing)
-        button_label = "Fetch latest Kobo submissions" if kobo_configured() else "Refresh data cache"
-        if st.button(button_label, key="admin_refresh_helpdesk_cache", use_container_width=True):
-            if kobo_configured():
-                st.session_state.helpdesk_kobo_refresh_nonce += 1
-                fetch_kobo_submissions.clear()
-                fetch_kobo_form_contract.clear()
-            load_data.clear()
-            st.rerun()
+        st.caption("Use the prominent synchronization controls above to refresh data.")
 
     filter_section_badge(
         "01",

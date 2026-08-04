@@ -1496,3 +1496,41 @@ section[data-testid="stSidebar"] [data-testid="stDateInput"] {
     font-size: 0.82rem;
     line-height: 1.4;
 }
+
+.live-sync-card {
+    margin: 0.15rem 0 0.45rem;
+    padding: 0.7rem 0.8rem;
+    border: 1px solid rgba(47, 125, 105, 0.28);
+    border-radius: 12px;
+    background: linear-gradient(135deg, #F1FAF6, var(--control-panel-strong));
+}
+
+.live-sync-heading {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    color: var(--tdh-green-dark);
+    font-size: 0.82rem;
+    font-weight: 850;
+}
+
+.live-sync-dot {
+    width: 0.55rem;
+    height: 0.55rem;
+    border-radius: 999px;
+    background: #16A34A;
+    box-shadow: 0 0 0 4px rgba(22, 163, 74, 0.12);
+}
+
+.live-sync-time {
+    margin-top: 0.25rem;
+    color: var(--muted-2);
+    font-size: 0.75rem;
+    line-height: 1.35;
+}
+
+@media (prefers-color-scheme: dark) {
+    .live-sync-card {
+        background: linear-gradient(135deg, #1B302A, var(--control-panel-strong));
+    }
+}
