@@ -1,5 +1,6 @@
 from pathlib import Path
 import base64
+import hashlib
 import html
 import json
 import os
@@ -27,7 +28,7 @@ PROCESSED_CACHE_PATH = BASE_DIR / "data" / "processed" / "helpdesk_processed_cac
 PROCESSED_CACHE_VERSION = "2026-08-04-kobo-v2"
 KOBO_CACHE_TTL_SECONDS = 60
 KOBO_SCHEMA_CACHE_TTL_SECONDS = 300
-KOBO_AUTO_REFRESH_SECONDS = 60
+KOBO_CHANGE_CHECK_SECONDS = 60
 KOBO_REQUEST_TIMEOUT_SECONDS = 45
 KOBO_PAGE_SAFETY_LIMIT = 10000
 
@@ -2622,6 +2623,23 @@ def fetch_kobo_submissions(base_url, asset_uid, token, refresh_nonce=0):
             if page_count > KOBO_PAGE_SAFETY_LIMIT:
                 raise RuntimeError("Kobo pagination exceeded the safety limit.")
 
+    # Hash the complete raw response so additions, edits, and deletions are all
+    # detected. The monitor can then avoid disrupting the page when nothing
+    # has changed.
+    canonical_submissions = sorted(
+        json.dumps(
+            submission,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        for submission in submissions
+    )
+    data_fingerprint = hashlib.sha256(
+        "\n".join(canonical_submissions).encode("utf-8")
+    ).hexdigest()
+
     flattened = [flatten_kobo_record(item) for item in submissions]
     raw = pd.json_normalize(flattened, sep="/") if flattened else pd.DataFrame()
     contract = fetch_kobo_form_contract(base_url, asset_uid, token)
@@ -2663,6 +2681,7 @@ def fetch_kobo_submissions(base_url, asset_uid, token, refresh_nonce=0):
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "api_pages": page_count,
         "raw_records": len(raw),
+        "data_fingerprint": data_fingerprint,
         "unmapped_source_columns": raw.attrs.get("unmapped_source_columns", []),
         "missing_contract_columns": raw.attrs.get("missing_contract_columns", []),
         "unresolved_schema_questions": contract["unresolved_questions"],
@@ -2671,18 +2690,31 @@ def fetch_kobo_submissions(base_url, asset_uid, token, refresh_nonce=0):
 
 
 if hasattr(st, "fragment"):
-    @st.fragment(run_every=f"{KOBO_AUTO_REFRESH_SECONDS}s")
-    def live_refresh_pulse():
-        """Rerun the full app once per interval while preserving filter state."""
-        current_bucket = int(time.time() // KOBO_AUTO_REFRESH_SECONDS)
-        previous_bucket = st.session_state.get("helpdesk_live_refresh_bucket")
-        if previous_bucket is None:
-            st.session_state.helpdesk_live_refresh_bucket = current_bucket
-        elif previous_bucket != current_bucket:
-            st.session_state.helpdesk_live_refresh_bucket = current_bucket
+    @st.fragment(run_every=f"{KOBO_CHANGE_CHECK_SECONDS}s")
+    def live_change_monitor(base_url, asset_uid, known_fingerprint):
+        """Check Kobo quietly and rerun the page only when its data changes."""
+        try:
+            _, current_metadata = fetch_kobo_submissions(
+                base_url,
+                asset_uid,
+                str(setting("KOBO_TOKEN")),
+                st.session_state.get("helpdesk_kobo_refresh_nonce", 0),
+            )
+        except Exception:
+            # A temporary monitoring failure must not interrupt dashboard use.
+            return
+
+        current_fingerprint = current_metadata.get("data_fingerprint")
+        if (
+            known_fingerprint
+            and current_fingerprint
+            and current_fingerprint != known_fingerprint
+        ):
+            load_data.clear()
             st.rerun()
 else:
-    def live_refresh_pulse():
+    def live_change_monitor(base_url, asset_uid, known_fingerprint):
+        del base_url, asset_uid, known_fingerprint
         return None
 
 
@@ -4946,8 +4978,13 @@ with st.sidebar:
             fetch_kobo_form_contract.clear()
             load_data.clear()
             st.rerun()
-        # Keep near-live refresh active without adding another sidebar control.
-        live_refresh_pulse()
+        # Monitor silently; the full page reruns only after an actual Kobo
+        # submission addition, edit, or deletion.
+        live_change_monitor(
+            kobo_base_url,
+            kobo_asset_uid,
+            source_metadata.get("data_fingerprint"),
+        )
     else:
         st.caption("Using the local file fallback; live Kobo synchronization is unavailable.")
 
@@ -4968,7 +5005,10 @@ with st.sidebar:
             if pd.notna(fetched):
                 st.caption(f"Last fetched: {fetched.tz_convert('Africa/Nairobi').strftime('%d %b %Y %H:%M EAT')}")
             st.caption(f"API pages: {source_metadata.get('api_pages', 0):,}")
-            st.caption(f"Automatic data refresh: every {KOBO_AUTO_REFRESH_SECONDS} seconds")
+            st.caption(
+                f"Background change check: every {KOBO_CHANGE_CHECK_SECONDS} seconds; "
+                "the page updates only when Kobo data changes"
+            )
         else:
             st.caption(f"Workbook: {DATA_FILE_PATH.name}")
             st.caption(f"Last modified: {file_signature[3] if file_signature[3] else 'Unknown'}")
@@ -5084,63 +5124,22 @@ with st.sidebar:
 
     helpdesk_filtered_records = camp_filtered_records[camp_filtered_records["helpdesk_location"].astype(str).isin(selected_helpdesk_locations)].copy() if selected_helpdesk_locations else camp_filtered_records.copy()
 
-    filter_section_badge(
-        "04",
-        "Demographics",
-        "Narrow the dashboard by seeker type, gender, and age.",
-        "blue",
-    )
-    with st.expander("Demographics", expanded=False):
-        type_options = [v for v, _ in filter_options_with_counts(helpdesk_filtered_records["information_seeker_type"])]
-        st.markdown('<div class="filter-label">Information seeker type</div>', unsafe_allow_html=True)
-        selected_information_seeker_types = multi_choice_selector("Information seeker type", type_options, key="information_seeker_type_filter")
-        filter_selection_feedback("seeker type", selected_information_seeker_types)
-        seeker_filtered_records = helpdesk_filtered_records[helpdesk_filtered_records["information_seeker_type"].astype(str).isin(selected_information_seeker_types)].copy() if selected_information_seeker_types else helpdesk_filtered_records.copy()
-
-        gender_options = [v for v, _ in filter_options_with_counts(seeker_filtered_records["information_seeker_gender"], ordered_values=GENDER_ORDER)]
-        st.markdown('<div class="filter-label">Gender</div>', unsafe_allow_html=True)
-        selected_genders = multi_choice_selector("Gender", gender_options, key="information_seeker_gender_filter")
-        filter_selection_feedback("gender", selected_genders)
-        gender_filtered_records = seeker_filtered_records[seeker_filtered_records["information_seeker_gender"].astype(str).isin(selected_genders)].copy() if selected_genders else seeker_filtered_records.copy()
-
-        age_options = [v for v, _ in filter_options_with_counts(gender_filtered_records["age_group"], ordered_values=AGE_GROUP_ORDER)]
-        st.markdown('<div class="filter-label">Age group</div>', unsafe_allow_html=True)
-        selected_age_groups = multi_choice_selector("Age group", age_options, key="age_group_filter")
-        filter_selection_feedback("age group", selected_age_groups)
-
-    age_filtered_records = gender_filtered_records[gender_filtered_records["age_group"].astype(str).isin(selected_age_groups)].copy() if selected_age_groups else gender_filtered_records.copy()
-
-    filter_section_badge(
-        "05",
-        "Request",
-        "Filter protection concerns and information requests.",
-        "violet",
-    )
-    with st.expander("Request type", expanded=False):
-        request_options = [v for v, _ in filter_options_with_counts(age_filtered_records["request_category"])]
-        st.markdown('<div class="filter-label">Request category</div>', unsafe_allow_html=True)
-        selected_request_categories = multi_choice_selector("Request category", request_options, key="request_category_filter")
-        filter_selection_feedback("request category", selected_request_categories)
+    # Demographic and request breakdowns remain available in the dashboard
+    # views; they are intentionally not duplicated as sidebar filters.
+    selected_information_seeker_types = []
+    selected_genders = []
+    selected_age_groups = []
+    selected_request_categories = []
 
     selected_filter_groups = [
         selected_camp_locations,
         selected_helpdesk_locations,
-        selected_information_seeker_types,
-        selected_genders,
-        selected_age_groups,
-        selected_request_categories,
     ]
     active_filter_count = sum(1 for selected in selected_filter_groups if selected)
     if from_date != min_date or to_date != max_date:
         active_filter_count += 1
 
-    sidebar_preview_records = (
-        age_filtered_records[
-            age_filtered_records["request_category"].astype(str).isin(selected_request_categories)
-        ].copy()
-        if selected_request_categories
-        else age_filtered_records.copy()
-    )
+    sidebar_preview_records = helpdesk_filtered_records.copy()
     filter_status_class = "filter-status active" if active_filter_count else "filter-status"
     filter_status_text = (
         f"{active_filter_count} filter group{'s' if active_filter_count != 1 else ''} active"
