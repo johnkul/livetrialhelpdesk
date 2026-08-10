@@ -25,7 +25,7 @@ DEVELOPER_LOGO_PATH = BASE_DIR / "assets" / "developer-logo.png"
 STYLES_PATH = BASE_DIR / "assets" / "styles.css"
 DATA_FILE_PATH = Path(os.environ.get("HELPDESK_DATA_PATH") or (BASE_DIR / "data" / "HELPDESK_DashboardData_Tdh_Kenya_D2.xlsx"))
 PROCESSED_CACHE_PATH = BASE_DIR / "data" / "processed" / "helpdesk_processed_cache.pkl"
-PROCESSED_CACHE_VERSION = "2026-08-04-kobo-v2"
+PROCESSED_CACHE_VERSION = "2026-08-10-kobo-v3-gps-geopoint"
 KOBO_CACHE_TTL_SECONDS = 60
 KOBO_SCHEMA_CACHE_TTL_SECONDS = 300
 KOBO_CHANGE_CHECK_SECONDS = 60
@@ -741,6 +741,9 @@ RAW_TO_TRANSFORMED_COLUMNS = {'Having understood the information provided, do yo
  'If External, please specify the name of the agency referred to.': 'external_agency_specify',
  'Any follow up action required ?': 'follow_up_required',
  'If Yes, what is the follow up action?': 'follow_up_action',
+ 'GPS / GPS Location': 'gps_latitude',
+ 'GPS Location': 'gps_latitude',
+ 'GPS/GPS Location': 'gps_latitude',
  '_GPS Location_latitude': 'gps_latitude',
  '_GPS Location_longitude': 'gps_longitude',
  '_id': 'kobo_submission_id',
@@ -2069,8 +2072,23 @@ def derive_linked_helpdesk_location(row):
 
 
 def extract_coordinate_numbers(value):
-    if pd.isna(value):
+    if value is None:
         return []
+    if isinstance(value, Mapping):
+        numbers = []
+        for nested_value in value.values():
+            numbers.extend(extract_coordinate_numbers(nested_value))
+        return numbers
+    if isinstance(value, (list, tuple, set)):
+        numbers = []
+        for nested_value in value:
+            numbers.extend(extract_coordinate_numbers(nested_value))
+        return numbers
+    try:
+        if pd.isna(value):
+            return []
+    except (TypeError, ValueError):
+        pass
     return [float(match) for match in re.findall(r"[-+]?\d+(?:\.\d+)?", str(value))]
 
 
@@ -2412,6 +2430,28 @@ def contract_norm(value):
     return re.sub(r"\s+", " ", value).strip()
 
 
+def gps_contract_target(value):
+    """Map Kobo's combined geopoint question or expanded GPS columns.
+
+    Kobo API responses normally store a geopoint as one value containing
+    ``latitude longitude altitude accuracy``. Excel exports may instead expose
+    separate latitude/longitude columns. The combined value is deliberately
+    routed through ``gps_latitude`` because derive_gps_coordinates() splits a
+    multi-number value into both final coordinate columns.
+    """
+    normalized = contract_norm(value)
+    tokens = set(normalized.split())
+    if "gps" not in tokens or "location" not in tokens:
+        return None
+    if "longitude" in tokens:
+        return "gps_longitude"
+    if "latitude" in tokens:
+        return "gps_latitude"
+    if tokens.intersection({"altitude", "accuracy", "precision"}):
+        return None
+    return "gps_latitude"
+
+
 def metadata_labels(value):
     if isinstance(value, dict):
         values = list(value.values())
@@ -2449,7 +2489,11 @@ def resolve_contract_target(candidates):
     normalized = {contract_norm(key): value for key, value in RAW_TO_TRANSFORMED_COLUMNS.items()}
     for candidate in candidates:
         raw = str(candidate or "").strip()
-        target = exact.get(raw) or normalized.get(contract_norm(raw))
+        target = (
+            exact.get(raw)
+            or normalized.get(contract_norm(raw))
+            or gps_contract_target(raw)
+        )
         if target:
             return target
         if raw in ANALYSIS_COLUMN_NAMES:
@@ -2582,7 +2626,11 @@ def harmonize_input_columns(frame):
     normalized = {contract_norm(key): value for key, value in RAW_TO_TRANSFORMED_COLUMNS.items()}
     rename_map = {}
     for column in out.columns:
-        target = exact.get(column) or normalized.get(contract_norm(column))
+        target = (
+            exact.get(column)
+            or normalized.get(contract_norm(column))
+            or gps_contract_target(column)
+        )
         if target:
             rename_map[column] = target
         elif column in ANALYSIS_COLUMN_NAMES:
@@ -5372,11 +5420,12 @@ if selected_tab == "Disability":
 
     st.divider()
 
-    # Strict disability-only slice for the entire tab.
-    # This is the controlling filter for every chart/table in this menu.
-    disability_only = filtered_records[
+    # Preserve the full disability-beneficiary population for age reporting.
+    # Impairment-specific analyses below use a stricter typed subset.
+    disability_beneficiaries = filtered_records[
         filtered_records["disability_status"].astype(str).eq("Has Disability")
     ].copy()
+    disability_only = disability_beneficiaries.copy()
 
     # Extra safety: remove any accidental non-disability type labels from the
     # combined impairment analysis. This protects the tab even if derivation
@@ -5388,7 +5437,7 @@ if selected_tab == "Disability":
         ].copy()
 
     if disability_only.empty:
-        st.info("No disability records match the current filters.")
+        st.info("No standardized impairment types match the current filters.")
         # Footer is still shown by the global show_footer() call later.
 
     else:
@@ -5398,6 +5447,21 @@ if selected_tab == "Disability":
             disability_only,
             "disability_type",
             "Impairment type",
+            top_n=None,
+        )
+
+    st.markdown("#### Beneficiaries with Disability by Age Group")
+    st.caption(
+        "Counts all beneficiaries recorded with disability under the current filters, "
+        "including records where the specific impairment type was not captured."
+    )
+    if disability_beneficiaries.empty:
+        st.info("No disability beneficiaries match the current filters.")
+    else:
+        show_gender_table(
+            disability_beneficiaries,
+            "age_group",
+            "Age group",
             top_n=None,
         )
 
