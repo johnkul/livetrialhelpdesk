@@ -27,9 +27,10 @@ STYLES_PATH = BASE_DIR / "assets" / "styles.css"
 DATA_FILE_PATH = Path(os.environ.get("HELPDESK_DATA_PATH") or (BASE_DIR / "data" / "HELPDESK_DashboardData_Tdh_Kenya_D2.xlsx"))
 PROCESSED_CACHE_PATH = BASE_DIR / "data" / "processed" / "helpdesk_processed_cache.pkl"
 PROCESSED_CACHE_VERSION = "2026-08-10-kobo-v3-gps-geopoint"
-KOBO_CACHE_TTL_SECONDS = 60
+KOBO_REFRESH_WINDOW_SECONDS = 1800
+KOBO_CACHE_TTL_SECONDS = KOBO_REFRESH_WINDOW_SECONDS
 KOBO_SCHEMA_CACHE_TTL_SECONDS = 300
-KOBO_CHANGE_CHECK_SECONDS = 60
+KOBO_CHANGE_CHECK_SECONDS = KOBO_REFRESH_WINDOW_SECONDS
 KOBO_REQUEST_TIMEOUT_SECONDS = 45
 KOBO_PAGE_SAFETY_LIMIT = 10000
 
@@ -4741,7 +4742,7 @@ def map_data(frame):
 
 
 def interactive_helpdesk_map_points(frame):
-    """Aggregate non-PII operational details for selectable map points."""
+    """Aggregate operational details and CPV submitters for selectable map points."""
     mapped = map_data(frame)
     if mapped.empty:
         return pd.DataFrame()
@@ -4771,7 +4772,8 @@ def interactive_helpdesk_map_points(frame):
             records=("record_id", "count"),
             camp_location=("camp_location", joined_labels),
             helpdesk_location=("helpdesk_location", joined_labels),
-            cpvs_represented=("staff_name", valid_staff_count),
+            cpv_submitters=("staff_name", joined_labels),
+            cpv_submitter_count=("staff_name", valid_staff_count),
             protection_concerns=(
                 "request_category",
                 lambda values: int(
@@ -4815,6 +4817,9 @@ def interactive_helpdesk_map_points(frame):
         lambda value: html.escape(str(value))
     )
     points["tooltip_camp_location"] = points["camp_location"].map(
+        lambda value: html.escape(str(value))
+    )
+    points["tooltip_cpv_submitters"] = points["cpv_submitters"].map(
         lambda value: html.escape(str(value))
     )
     points["point_radius"] = 120 + points["records"].pow(0.5) * 35
@@ -5128,10 +5133,8 @@ with st.sidebar:
             if pd.notna(fetched):
                 st.caption(f"Last fetched: {fetched.tz_convert('Africa/Nairobi').strftime('%d %b %Y %H:%M EAT')}")
             st.caption(f"API pages: {source_metadata.get('api_pages', 0):,}")
-            st.caption(
-                f"Background change check: every {KOBO_CHANGE_CHECK_SECONDS} seconds; "
-                "the page updates only when Kobo data changes"
-            )
+            st.caption(f"Refresh window: {KOBO_REFRESH_WINDOW_SECONDS} seconds")
+            st.caption("The page updates only when the Kobo data changes.")
         else:
             st.caption(f"Workbook: {DATA_FILE_PATH.name}")
             st.caption(f"Last modified: {file_signature[3] if file_signature[3] else 'Unknown'}")
@@ -5808,7 +5811,7 @@ if selected_tab == "Map":
                     "<b>{tooltip_point_label}</b><br/>"
                     "Camp: {tooltip_camp_location}<br/>"
                     "Records: {records}<br/>"
-                    "CPVs represented: {cpvs_represented}<br/>"
+                    "Submitted by: {tooltip_cpv_submitters}<br/>"
                     "Protection concerns: {protection_concerns}<br/>"
                     "Information requests: {information_requests}<br/>"
                     "Partner referrals: {partner_referrals}"
@@ -5857,9 +5860,9 @@ if selected_tab == "Map":
             )
             show_kpi_card(
                 selected_metric_cols[1],
-                "CPVs represented",
-                format_number(selected_point.get("cpvs_represented", 0)),
-                "Distinct recorded staff",
+                "Submitting CPVs",
+                format_number(selected_point.get("cpv_submitter_count", 0)),
+                "Distinct CPVs who entered data",
                 accent="#1F6FB2",
             )
             show_kpi_card(
@@ -5881,6 +5884,7 @@ if selected_tab == "Map":
                     {
                         "Helpdesk location": selected_point.get("helpdesk_location", "Not recorded"),
                         "Camp location": selected_point.get("camp_location", "Not recorded"),
+                        "Submitted by (CPV)": selected_point.get("cpv_submitters", "Not recorded"),
                         "Latitude": selected_point.get("lat"),
                         "Longitude": selected_point.get("lon"),
                         "Information requests": selected_point.get("information_requests", 0),
@@ -5905,7 +5909,8 @@ if selected_tab == "Map":
                 "lat": "Latitude",
                 "lon": "Longitude",
                 "records": "Records",
-                "cpvs_represented": "CPVs represented",
+                "cpv_submitters": "Submitted by (CPV)",
+                "cpv_submitter_count": "Submitting CPVs",
                 "protection_concerns": "Protection concerns",
                 "information_requests": "Information requests",
                 "partner_referrals": "Partner referrals",
@@ -5920,7 +5925,8 @@ if selected_tab == "Map":
                 "Latitude",
                 "Longitude",
                 "Records",
-                "CPVs represented",
+                "Submitted by (CPV)",
+                "Submitting CPVs",
                 "Protection concerns",
                 "Information requests",
                 "Partner referrals",

@@ -21,7 +21,7 @@ The token is read from Streamlit secrets or environment variables and is never s
 
 - The app maps fields by raw survey label, transformed name, XML name, or full group/XML path—not by ordinal column position.
 - Kobo's combined geopoint field labelled **GPS / GPS Location** is split automatically into `gps_latitude` and `gps_longitude`; older Excel exports with separate `_GPS Location_latitude` and `_GPS Location_longitude` columns remain supported.
-- The Helpdesk Locations Map supports hover summaries and single-point click selection. Selected points show aggregated operational details only; beneficiary PII is not included in map payloads or tooltips.
+- The Helpdesk Locations Map supports hover summaries and single-point click selection. Map points identify the harmonized CPV name(s) that submitted the records; beneficiary PII is not included in map payloads or tooltips.
 - All 98 fields in the supplied `Column Mapping` sheet are embedded as an immutable analysis contract.
 - Kobo select-multiple codes are expanded back into the existing `0/1` `concern_*`, `info_*`, and `ref_partner_*` columns.
 - New Kobo attributes are retained as unmapped diagnostics and cannot displace an established field.
@@ -31,9 +31,9 @@ After changing the deployed form, open **Live data & schema status**. Review “
 
 ## Refresh and performance
 
-- API downloads and fully transformed DataFrames are cached for 60 seconds and shared across users.
+- API downloads and fully transformed DataFrames use a 1,800-second (30-minute) refresh window shared across users.
 - **Sync latest Kobo data** bypasses the cache immediately.
-- A silent background check runs every minute, but the page reruns only when a Kobo submission is added, edited, or deleted.
+- A silent background check runs every 1,800 seconds, but the page reruns only when a Kobo submission is added, edited, or deleted.
 - The API loader follows every pagination link, so it is not limited to the first page.
 - Unchanged Kobo data never interrupts the current dashboard flow.
 
