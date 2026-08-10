@@ -3,3 +3,5 @@ pandas
 altair
 openpyxl
 requests
+pydeck
+openpyxl>=3.1,<4

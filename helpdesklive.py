@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 import altair as alt
 import pandas as pd
+import pydeck as pdk
 import requests
 import streamlit as st
 
@@ -4739,6 +4740,87 @@ def map_data(frame):
     return mapped.rename(columns={"gps_latitude": "lat", "gps_longitude": "lon"})
 
 
+def interactive_helpdesk_map_points(frame):
+    """Aggregate non-PII operational details for selectable map points."""
+    mapped = map_data(frame)
+    if mapped.empty:
+        return pd.DataFrame()
+
+    def joined_labels(series):
+        excluded = {"", "none", "nan", "nat", "[missing]", "[not recorded]"}
+        labels = {
+            str(value).strip()
+            for value in series
+            if pd.notna(value) and str(value).strip().casefold() not in excluded
+        }
+        return ", ".join(sorted(labels)) if labels else "Not recorded"
+
+    def valid_staff_count(series):
+        values = {
+            str(value).strip()
+            for value in series
+            if pd.notna(value)
+            and str(value).strip().casefold()
+            not in {"", "none", "nan", "[missing]", "[not recorded]"}
+        }
+        return len(values)
+
+    points = (
+        mapped.groupby(["lat", "lon"], dropna=False)
+        .agg(
+            records=("record_id", "count"),
+            camp_location=("camp_location", joined_labels),
+            helpdesk_location=("helpdesk_location", joined_labels),
+            cpvs_represented=("staff_name", valid_staff_count),
+            protection_concerns=(
+                "request_category",
+                lambda values: int(
+                    values.astype(str).eq("Reporting a protection concern").sum()
+                ),
+            ),
+            information_requests=(
+                "request_category",
+                lambda values: int(
+                    values.astype(str)
+                    .eq("Seeking general protection information")
+                    .sum()
+                ),
+            ),
+            partner_referrals=(
+                "referral_status",
+                lambda values: int(
+                    values.astype(str).eq("Referred to partner agency").sum()
+                ),
+            ),
+            disability_records=(
+                "disability_status",
+                lambda values: int(values.astype(str).eq("Has Disability").sum()),
+            ),
+            first_interview=("interview_date", "min"),
+            latest_interview=("interview_date", "max"),
+        )
+        .reset_index()
+        .sort_values("records", ascending=False)
+    )
+    for date_column in ["first_interview", "latest_interview"]:
+        points[date_column] = (
+            pd.to_datetime(points[date_column], errors="coerce")
+            .dt.strftime("%d %b %Y")
+            .fillna("Not recorded")
+        )
+    points["point_label"] = points["helpdesk_location"].where(
+        points["helpdesk_location"].ne("Not recorded"), points["camp_location"]
+    )
+    points["tooltip_point_label"] = points["point_label"].map(
+        lambda value: html.escape(str(value))
+    )
+    points["tooltip_camp_location"] = points["camp_location"].map(
+        lambda value: html.escape(str(value))
+    )
+    points["point_radius"] = 120 + points["records"].pow(0.5) * 35
+    return points
+
+
 def cpv_work_summary(frame):
     columns = ["CPV", "Records", "Protection concerns", "Information requests", "Partner referrals", "Follow-up required", "Disability records", "Mapped records", "Helpdesk locations", "First interview date", "Latest interview date"]
     if frame.empty or "staff_name" not in frame.columns:
@@ -5673,12 +5755,180 @@ if selected_tab == "Referrals":
 
 if selected_tab == "Map":
     st.subheader("Helpdesk Locations Map")
-    mapped_records = map_data(filtered_records)
-    if mapped_records.empty:
+    map_points = interactive_helpdesk_map_points(filtered_records)
+    if map_points.empty:
         st.info("No valid GPS coordinates are available for the selected filters.")
     else:
-        st.map(mapped_records[["lat", "lon"]], use_container_width=True)
-        map_summary = mapped_records.groupby(["camp_location", "helpdesk_location", "lat", "lon"], dropna=False).size().reset_index(name="records").sort_values("records", ascending=False)
+        st.caption(
+            "Hover over a point for a quick summary, or click it to open the full operational details below the map."
+        )
+        latitude_span = float(map_points["lat"].max() - map_points["lat"].min())
+        longitude_span = float(map_points["lon"].max() - map_points["lon"].min())
+        coordinate_span = max(latitude_span, longitude_span)
+        if coordinate_span > 8:
+            map_zoom = 4.5
+        elif coordinate_span > 4:
+            map_zoom = 5.5
+        elif coordinate_span > 2:
+            map_zoom = 6.5
+        elif coordinate_span > 0.8:
+            map_zoom = 7.5
+        elif coordinate_span > 0.2:
+            map_zoom = 9
+        else:
+            map_zoom = 11
+
+        point_layer = pdk.Layer(
+            "ScatterplotLayer",
+            id="helpdesk-points",
+            data=map_points,
+            get_position="[lon, lat]",
+            get_radius="point_radius",
+            radius_min_pixels=7,
+            radius_max_pixels=24,
+            get_fill_color=[47, 125, 105, 215],
+            get_line_color=[255, 255, 255, 245],
+            line_width_min_pixels=2,
+            pickable=True,
+            auto_highlight=True,
+            highlight_color=[217, 164, 65, 245],
+        )
+        map_deck = pdk.Deck(
+            map_style=None,
+            initial_view_state=pdk.ViewState(
+                latitude=float(map_points["lat"].mean()),
+                longitude=float(map_points["lon"].mean()),
+                zoom=map_zoom,
+                pitch=0,
+                bearing=0,
+            ),
+            layers=[point_layer],
+            tooltip={
+                "html": (
+                    "<b>{tooltip_point_label}</b><br/>"
+                    "Camp: {tooltip_camp_location}<br/>"
+                    "Records: {records}<br/>"
+                    "CPVs represented: {cpvs_represented}<br/>"
+                    "Protection concerns: {protection_concerns}<br/>"
+                    "Information requests: {information_requests}<br/>"
+                    "Partner referrals: {partner_referrals}"
+                ),
+                "style": {
+                    "backgroundColor": "#12312F",
+                    "color": "#FFFFFF",
+                    "fontSize": "13px",
+                    "padding": "10px 12px",
+                },
+            },
+        )
+        map_event = st.pydeck_chart(
+            map_deck,
+            use_container_width=True,
+            height=520,
+            on_select="rerun",
+            selection_mode="single-object",
+            key="interactive_helpdesk_locations_map",
+        )
+
+        selected_points = []
+        try:
+            selection_state = map_event.selection
+            selected_points = selection_state.objects.get("helpdesk-points", [])
+        except (AttributeError, KeyError, TypeError):
+            if isinstance(map_event, Mapping):
+                selection_state = map_event.get("selection", {})
+                selected_objects = (
+                    selection_state.get("objects", {})
+                    if isinstance(selection_state, Mapping)
+                    else {}
+                )
+                selected_points = selected_objects.get("helpdesk-points", [])
+
+        if selected_points:
+            selected_point = selected_points[0]
+            st.markdown("#### Selected Helpdesk Point")
+            selected_metric_cols = st.columns(4)
+            show_kpi_card(
+                selected_metric_cols[0],
+                "Records",
+                format_number(selected_point.get("records", 0)),
+                "Submissions at this point",
+                accent="#2F7D69",
+            )
+            show_kpi_card(
+                selected_metric_cols[1],
+                "CPVs represented",
+                format_number(selected_point.get("cpvs_represented", 0)),
+                "Distinct recorded staff",
+                accent="#1F6FB2",
+            )
+            show_kpi_card(
+                selected_metric_cols[2],
+                "Protection concerns",
+                format_number(selected_point.get("protection_concerns", 0)),
+                "Records at this point",
+                accent="#D9A441",
+            )
+            show_kpi_card(
+                selected_metric_cols[3],
+                "Partner referrals",
+                format_number(selected_point.get("partner_referrals", 0)),
+                "Records at this point",
+                accent="#7C3AED",
+            )
+            selected_details = pd.DataFrame(
+                [
+                    {
+                        "Helpdesk location": selected_point.get("helpdesk_location", "Not recorded"),
+                        "Camp location": selected_point.get("camp_location", "Not recorded"),
+                        "Latitude": selected_point.get("lat"),
+                        "Longitude": selected_point.get("lon"),
+                        "Information requests": selected_point.get("information_requests", 0),
+                        "Disability records": selected_point.get("disability_records", 0),
+                        "First interview": selected_point.get("first_interview", "Not recorded"),
+                        "Latest interview": selected_point.get("latest_interview", "Not recorded"),
+                    }
+                ]
+            )
+            st.dataframe(
+                style_records_table(selected_details),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("Click a map point to view its operational details here.")
+
+        map_summary = map_points.rename(
+            columns={
+                "camp_location": "Camp location",
+                "helpdesk_location": "Helpdesk location",
+                "lat": "Latitude",
+                "lon": "Longitude",
+                "records": "Records",
+                "cpvs_represented": "CPVs represented",
+                "protection_concerns": "Protection concerns",
+                "information_requests": "Information requests",
+                "partner_referrals": "Partner referrals",
+                "disability_records": "Disability records",
+                "first_interview": "First interview",
+                "latest_interview": "Latest interview",
+            }
+        )[
+            [
+                "Camp location",
+                "Helpdesk location",
+                "Latitude",
+                "Longitude",
+                "Records",
+                "CPVs represented",
+                "Protection concerns",
+                "Information requests",
+                "Partner referrals",
+                "Disability records",
+                "First interview",
+                "Latest interview",
+            ]
+        ]
         st.subheader("Mapped Helpdesk Points")
         st.dataframe(style_records_table(map_summary), use_container_width=True, hide_index=True)
 
