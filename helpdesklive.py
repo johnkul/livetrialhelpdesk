@@ -3411,8 +3411,12 @@ def polish_chart(chart):
             anchor="start",
             offset=10,
         )
-        .configure_view(strokeWidth=0)
-        .configure(background="transparent", font="Inter, Segoe UI, system-ui, sans-serif")
+        # Use explicit white fills rather than transparency. Streamlit's page
+        # supplies a light card behind the live chart, but Vega's PNG/SVG
+        # exporter has no such backdrop and otherwise renders transparent
+        # pixels against a dark image canvas.
+        .configure_view(strokeWidth=0, fill="#FFFFFF")
+        .configure(background="#FFFFFF", font="Inter, Segoe UI, system-ui, sans-serif")
     )
 
 
@@ -4863,17 +4867,6 @@ def build_helpdesk_findings(section, frame, protection_frame, information_frame,
         blocks.append(("Prevalence", f"Disability is recorded in {len(disability):,} of {total:,} records ({len(disability) / total:.1%}). {positive_gender_rates('disability_status', 'Has Disability', 'a disability')}"))
         if dtype:
             blocks.append(("Impairment profile", f"{dtype} is the most frequently recorded disability type ({dtype_n:,} records). {leaders_by_gender(disability, 'disability_type')}"))
-        if not disability.empty:
-            adult_disability = disability[disability["derived_life_stage"].astype(str).eq("Adult")]
-            adult_people = adult_person_impairment_frame(adult_disability)
-            if not adult_people.empty:
-                multiplicity = value_counts(adult_people, "adult_impairment_multiplicity")
-                single_n = int(multiplicity.get("Single Impairment", 0))
-                multiple_n = int(multiplicity.get("Multiple Impairments", 0))
-                blocks.append((
-                    "Adult impairment multiplicity",
-                    f"Among {len(adult_people):,} adults with disability, {single_n:,} have one impairment and {multiple_n:,} have two or more impairments.",
-                ))
     elif section == "Concerns":
         concern, concern_n = leading(protection_frame, "protection_concern")
         record_n = protection_frame["record_id"].nunique() if "record_id" in protection_frame.columns else 0
@@ -5464,112 +5457,6 @@ if selected_tab == "Disability":
             "Age group",
             top_n=None,
         )
-
-    st.divider()
-
-    st.markdown("### Adult Impairment Analysis")
-
-    adult_disability = disability_only[
-        disability_only["derived_life_stage"].astype(str).eq("Adult")
-    ].copy()
-
-    if not adult_disability.empty:
-
-        adult_person = adult_person_impairment_frame(adult_disability)
-
-        # Double safety filter: keep only adult rows confirmed as disability.
-        if not adult_person.empty:
-            adult_person = adult_person[
-                adult_person["adult_disability_status"].astype(str).eq("Has Disability")
-            ].copy()
-
-            adult_person = adult_person[
-                ~adult_person["adult_person_impairment_type"]
-                .astype(str)
-                .isin(non_disability_labels)
-            ].copy()
-
-        if not adult_person.empty:
-            st.caption("Most common impairments among adults with disability")
-
-            draw_gender_column_bar(
-                adult_person,
-                "adult_person_impairment_type",
-                height=360,
-            )
-
-            show_gender_table(
-                adult_person,
-                "adult_person_impairment_type",
-                "Adult impairment type",
-                top_n=None,
-            )
-
-            st.caption("Single impairment vs multiple impairments (two or more)")
-
-            draw_total_donut(
-                adult_person,
-                "adult_impairment_multiplicity",
-                "Impairment multiplicity",
-                height=280,
-            )
-
-            show_gender_table(
-                adult_person,
-                "adult_impairment_multiplicity",
-                "Impairment multiplicity",
-            )
-
-        else:
-            st.info("No adult disability records match the current filters.")
-
-    else:
-        st.info("No adult disability records match the current filters.")
-
-    st.divider()
-
-    st.markdown("### Child Impairment Analysis")
-
-    child_disability = disability_only[
-        disability_only["derived_life_stage"].astype(str).eq("Child")
-    ].copy()
-
-    if not child_disability.empty:
-
-        # Double safety filter: keep only child rows confirmed as disability.
-        if "child_disability_status" in child_disability.columns:
-            child_disability = child_disability[
-                child_disability["child_disability_status"].astype(str).eq("Has Disability")
-            ].copy()
-
-        if "child_disability_type" in child_disability.columns:
-            child_disability = child_disability[
-                ~child_disability["child_disability_type"]
-                .astype(str)
-                .isin(non_disability_labels)
-            ].copy()
-
-        if not child_disability.empty:
-            st.caption("Most common impairments among children with disability")
-
-            draw_gender_column_bar(
-                child_disability,
-                "child_disability_type",
-                height=340,
-            )
-
-            show_gender_table(
-                child_disability,
-                "child_disability_type",
-                "Child impairment type",
-                top_n=None,
-            )
-
-        else:
-            st.info("No child disability records match the current filters.")
-
-    else:
-        st.info("No child disability records match the current filters.")
 
 # -----------------------------------------------------------------------------
 # Other tabs
