@@ -16,6 +16,8 @@ import pandas as pd
 import pydeck as pdk
 import requests
 import streamlit as st
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # -----------------------------------------------------------------------------
 # Page configuration
@@ -26,13 +28,16 @@ DEVELOPER_LOGO_PATH = BASE_DIR / "assets" / "developer-logo.png"
 STYLES_PATH = BASE_DIR / "assets" / "styles.css"
 DATA_FILE_PATH = Path(os.environ.get("HELPDESK_DATA_PATH") or (BASE_DIR / "data" / "HELPDESK_DashboardData_Tdh_Kenya_D2.xlsx"))
 PROCESSED_CACHE_PATH = BASE_DIR / "data" / "processed" / "helpdesk_processed_cache.pkl"
-PROCESSED_CACHE_VERSION = "2026-08-10-kobo-v3-gps-geopoint"
+PROCESSED_CACHE_VERSION = "2026-08-25-kobo-v5-submission-reporting-date"
 KOBO_REFRESH_WINDOW_SECONDS = 1800
 KOBO_CACHE_TTL_SECONDS = KOBO_REFRESH_WINDOW_SECONDS
 KOBO_SCHEMA_CACHE_TTL_SECONDS = 300
 KOBO_CHANGE_CHECK_SECONDS = KOBO_REFRESH_WINDOW_SECONDS
 KOBO_REQUEST_TIMEOUT_SECONDS = 45
 KOBO_PAGE_SAFETY_LIMIT = 10000
+KOBO_RETRY_TOTAL = 4
+KOBO_RETRY_BACKOFF_FACTOR = 0.75
+KOBO_RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
 
 # Immutable schema contract: Kobo fields are matched by XML name/path or by
 # their survey label, never by column position. New form attributes remain
@@ -894,15 +899,6 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 # Constants
 # -----------------------------------------------------------------------------
-PII_COLUMNS = [
-    "information_seeker_name",
-    "residence_neighborhood_compound_house",
-    "information_seeker_phone",
-    "alternative_phone",
-    "information_seeker_individual_number",
-    "information_seeker_ration_or_wristband_number",
-]
-
 AGE_GROUP_ORDER = [
     "0-5 Years",
     "6-11 Years",
@@ -1038,6 +1034,8 @@ FILTER_KEYS = [
 
 CORE_RECORD_COLUMNS = [
     "record_id",
+    "reporting_date",
+    "reporting_date_source",
     "interview_date",
     "camp_location",
     "helpdesk_location",
@@ -1084,6 +1082,40 @@ CORE_RECORD_COLUMNS = [
     "referral_status",
     "follow_up_required_clean",
 ]
+
+# Fail closed: normal views and CSV exports may only receive fields explicitly
+# approved here. New Kobo/form columns are therefore private by default until
+# they are reviewed and intentionally added to this contract.
+PUBLIC_RECORD_COLUMNS = tuple(CORE_RECORD_COLUMNS)
+
+# This non-PII operational contract is preserved before dashboard eligibility
+# rules are applied so DQA can account for incomplete and excluded submissions.
+DQA_RECORD_COLUMNS = (
+    "record_id",
+    "reporting_date",
+    "reporting_date_source",
+    "interview_date",
+    "kobo_submission_time",
+    "kobo_today",
+    "kobo_status",
+    "kobo_validation_status",
+    "staff_name",
+    "camp_location",
+    "helpdesk_location",
+    "information_seeker_type",
+    "information_seeker_gender",
+    "age_group",
+    "request_category",
+    "gps_latitude",
+    "gps_longitude",
+    "consent_declined",
+    "dashboard_eligible",
+    "dashboard_exclusion_reason",
+    "dqa_missing_required_fields",
+    "dqa_duplicate_record_id",
+    "dqa_missing_gps",
+    "dqa_status",
+)
 
 RECORD_PREVIEW_LIMIT = 1000
 SMALL_N_THRESHOLD = 5
@@ -1137,6 +1169,85 @@ def clean_text(value):
         return pd.NA
     value = str(value).strip()
     return pd.NA if value == "" else " ".join(value.split())
+
+
+def stable_dashboard_record_id(row):
+    """Return a stable pseudonymous key backed by Kobo UUID/ID when available."""
+    for source_name in ("kobo_submission_uuid", "kobo_submission_id"):
+        source_value = clean_text(row.get(source_name))
+        if pd.notna(source_value):
+            digest = hashlib.sha256(
+                f"{source_name}:{source_value}".encode("utf-8")
+            ).hexdigest()[:16].upper()
+            return f"HD-{digest}"
+
+    # Local workbooks do not always contain Kobo metadata. Preserve the legacy
+    # row locator only as a clearly identified fallback for those files.
+    source_row = row.get("source_row_number")
+    try:
+        return f"HD-LOCAL-{int(source_row):05d}"
+    except (TypeError, ValueError):
+        fallback = hashlib.sha256(
+            json.dumps(row.to_dict(), sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16].upper()
+        return f"HD-LOCAL-{fallback}"
+
+
+def quality_value_missing(value):
+    if pd.isna(value):
+        return True
+    return str(value).strip().casefold() in {
+        "",
+        "none",
+        "nan",
+        "nat",
+        "[missing]",
+        "[not recorded]",
+    }
+
+
+def derive_reporting_dates(frame):
+    """Build the dashboard reporting date without overwriting activity dates.
+
+    Kobo's server-side submission timestamp is authoritative for reporting
+    receipt. The form's ``today`` value is a compatibility fallback, followed
+    by the manually entered interview/activity date for older local files.
+    """
+    index = frame.index
+    interview_date = pd.to_datetime(
+        frame.get("interview_date", pd.Series(pd.NaT, index=index)),
+        errors="coerce",
+    )
+    kobo_today = pd.to_datetime(
+        frame.get("kobo_today", pd.Series(pd.NaT, index=index)),
+        errors="coerce",
+    ).dt.normalize()
+    submission_utc = pd.to_datetime(
+        frame.get("kobo_submission_time", pd.Series(pd.NaT, index=index)),
+        errors="coerce",
+        utc=True,
+    )
+    submission_local = submission_utc.dt.tz_convert("Africa/Nairobi").dt.tz_localize(None)
+    submission_date = submission_local.dt.normalize()
+
+    reporting_date = submission_date.combine_first(kobo_today).combine_first(
+        interview_date.dt.normalize()
+    )
+    source = pd.Series("[Not recorded]", index=index, dtype="object")
+    source = source.mask(interview_date.notna(), "Enter a date fallback")
+    source = source.mask(kobo_today.notna(), "Kobo today fallback")
+    source = source.mask(submission_date.notna(), "Kobo submission time")
+
+    return pd.DataFrame(
+        {
+            "interview_date": interview_date,
+            "kobo_submission_datetime": submission_local,
+            "kobo_today": kobo_today,
+            "reporting_date": reporting_date,
+            "reporting_date_source": source,
+        },
+        index=index,
+    )
 
 
 def normalize_response(value):
@@ -1770,9 +1881,13 @@ def standardize_protection_concern_label(value):
 
 def migrate_processed_cache_data(processed_data):
     """Apply display-rule migrations even when the fast processed cache is used."""
-    if not isinstance(processed_data, tuple) or len(processed_data) != 6:
+    if not isinstance(processed_data, tuple) or len(processed_data) not in {6, 7}:
         return processed_data
-    dashboard_records, secure_records, protection, information, referrals, kpis = processed_data
+    if len(processed_data) == 6:
+        dashboard_records, secure_records, protection, information, referrals, kpis = processed_data
+        dqa_records = pd.DataFrame(columns=DQA_RECORD_COLUMNS)
+    else:
+        dashboard_records, secure_records, dqa_records, protection, information, referrals, kpis = processed_data
     if isinstance(protection, pd.DataFrame) and "protection_concern" in protection.columns:
         protection = protection.copy()
         protection["protection_concern"] = protection["protection_concern"].map(
@@ -1783,7 +1898,7 @@ def migrate_processed_cache_data(processed_data):
         information["general_information_need"] = information["general_information_need"].map(
             standardize_information_need_label
         )
-    return dashboard_records, secure_records, protection, information, referrals, kpis
+    return dashboard_records, secure_records, dqa_records, protection, information, referrals, kpis
 
 
 def standardize_information_need_label(value):
@@ -2390,6 +2505,90 @@ def setting(name, default=None):
     return os.environ.get(name, value)
 
 
+def boolean_setting(name, default=False):
+    value = setting(name, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def list_setting(name):
+    value = setting(name, [])
+    if isinstance(value, str):
+        return [item.strip().casefold() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip().casefold() for item in value if str(item).strip()]
+    return []
+
+
+def enforce_app_authentication():
+    """Require Streamlit OIDC login when AUTH_REQUIRED is enabled."""
+    if not boolean_setting("AUTH_REQUIRED", False):
+        return {}
+
+    try:
+        auth_configured = isinstance(st.secrets.get("auth", None), Mapping)
+    except Exception:
+        auth_configured = False
+    if not auth_configured:
+        st.error("Authentication is required but the Streamlit [auth] configuration is missing.")
+        st.info("Configure the OIDC settings in .streamlit/secrets.toml before publishing the app.")
+        st.stop()
+
+    user = st.user.to_dict()
+    if not bool(user.get("is_logged_in", False)):
+        st.title("Tdh Kenya Helpdesk Dashboard")
+        st.info("Sign in with an approved Google account to continue.")
+        provider = str(setting("AUTH_PROVIDER", "google") or "").strip()
+        if st.button("Sign in with Google", type="primary", use_container_width=True):
+            st.login(provider or None)
+        st.stop()
+
+    try:
+        token_expiry = int(user.get("exp", 0) or 0)
+    except (TypeError, ValueError):
+        token_expiry = 0
+    if token_expiry and int(time.time()) >= token_expiry:
+        st.warning("Your authentication session has expired. Please sign in again.")
+        st.logout()
+
+    email = str(
+        user.get("email")
+        or user.get("preferred_username")
+        or user.get("upn")
+        or ""
+    ).strip().casefold()
+    allowed_emails = set(list_setting("AUTH_ALLOWED_EMAILS"))
+    allowed_domains = set(list_setting("AUTH_ALLOWED_DOMAINS"))
+    domain = email.rsplit("@", 1)[-1] if "@" in email else ""
+    if (allowed_emails or allowed_domains) and email not in allowed_emails and domain not in allowed_domains:
+        st.error("Your account is authenticated but is not authorised to use this dashboard.")
+        if st.button("Sign out"):
+            st.logout()
+        st.stop()
+    return user
+
+
+def kobo_http_session():
+    """Create a bounded retrying session for idempotent Kobo GET requests."""
+    retries = Retry(
+        total=KOBO_RETRY_TOTAL,
+        connect=KOBO_RETRY_TOTAL,
+        read=KOBO_RETRY_TOTAL,
+        status=KOBO_RETRY_TOTAL,
+        allowed_methods=frozenset({"GET"}),
+        status_forcelist=KOBO_RETRY_STATUS_CODES,
+        backoff_factor=KOBO_RETRY_BACKOFF_FACTOR,
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries, pool_connections=4, pool_maxsize=8)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 def normalize_kobo_base_url(value):
     """Accept a Kobo server URL or a copied form page and retain only its host."""
     raw = str(value or "https://eu.kobotoolbox.org").strip()
@@ -2518,11 +2717,12 @@ def flatten_kobo_record(record, prefix=""):
 def fetch_kobo_form_contract(base_url, asset_uid, token):
     """Build field and choice mappings from the currently deployed XLSForm."""
     url = f"{base_url.rstrip('/')}/api/v2/assets/{asset_uid}/"
-    response = requests.get(
-        url,
-        headers={"Authorization": f"Token {token}", "Accept": "application/json"},
-        timeout=KOBO_REQUEST_TIMEOUT_SECONDS,
-    )
+    with kobo_http_session() as session:
+        response = session.get(
+            url,
+            headers={"Authorization": f"Token {token}", "Accept": "application/json"},
+            timeout=KOBO_REQUEST_TIMEOUT_SECONDS,
+        )
     if response.status_code in {401, 403}:
         raise RuntimeError("Kobo rejected the token or this account cannot view the form schema.")
     response.raise_for_status()
@@ -2656,7 +2856,7 @@ def fetch_kobo_submissions(base_url, asset_uid, token, refresh_nonce=0):
     headers = {"Authorization": f"Token {token}", "Accept": "application/json"}
     submissions = []
     page_count = 0
-    with requests.Session() as session:
+    with kobo_http_session() as session:
         while url:
             response = session.get(url, headers=headers, timeout=KOBO_REQUEST_TIMEOUT_SECONDS)
             if response.status_code in {401, 403}:
@@ -2857,8 +3057,14 @@ def load_data(source_signature):
             }
         )
 
-    # Consent is an eligibility gate, not a dashboard category. Exclude only
-    # explicit refusals before deriving fields or calculating any result.
+    records["source_row_number"] = pd.Series(
+        range(2, len(records) + 2), index=records.index, dtype="int64"
+    )
+    records["record_id"] = records.apply(stable_dashboard_record_id, axis=1)
+
+    # Consent is an eligibility gate, not a dashboard category. Keep refusals
+    # through transformation so the separate DQA stream can account for them;
+    # they are excluded from analytical records at the final eligibility gate.
     consent_priority = [
         "consent",
         "do_you_consent",
@@ -2874,7 +3080,6 @@ def load_data(source_signature):
     if consent_column is not None:
         records["consent_raw"] = records[consent_column].map(clean_text)
         records["consent_declined"] = records[consent_column].map(consent_is_declined)
-        records = records.loc[~records["consent_declined"]].copy()
     else:
         records["consent_raw"] = pd.NA
         records["consent_declined"] = False
@@ -2883,6 +3088,8 @@ def load_data(source_signature):
 
     required_columns = [
         "interview_date",
+        "kobo_today",
+        "kobo_submission_time",
         "staff_name",
         "gps_latitude",
         "gps_longitude",
@@ -2912,13 +3119,13 @@ def load_data(source_signature):
         if column not in records.columns:
             records[column] = pd.NA
 
-    records["source_row_number"] = records.index + 2
-    records["record_id"] = records["source_row_number"].map(lambda row: f"HD-{row:05d}")
-    records["interview_date"] = pd.to_datetime(records["interview_date"], errors="coerce")
-    records["year"] = records["interview_date"].dt.year
-    records["month_number"] = records["interview_date"].dt.month
-    records["year_month"] = records["interview_date"].dt.to_period("M").astype(str)
-    records["month_label"] = records["interview_date"].dt.strftime("%b %Y")
+    reporting_dates = derive_reporting_dates(records)
+    for date_column in reporting_dates.columns:
+        records[date_column] = reporting_dates[date_column]
+    records["year"] = records["reporting_date"].dt.year
+    records["month_number"] = records["reporting_date"].dt.month
+    records["year_month"] = records["reporting_date"].dt.to_period("M").astype(str)
+    records["month_label"] = records["reporting_date"].dt.strftime("%b %Y")
 
     parsed_gps = records.apply(derive_gps_coordinates, axis=1)
     records["gps_latitude"] = pd.to_numeric(parsed_gps["gps_latitude"], errors="coerce")
@@ -3027,7 +3234,47 @@ def load_data(source_signature):
     for col in core_fields:
         if col not in records.columns:
             records[col] = pd.NA
-    records = records[records[core_fields].notna().all(axis=1)].copy()
+
+    records["dqa_missing_required_fields"] = records.apply(
+        lambda row: "; ".join(
+            field for field in core_fields if quality_value_missing(row.get(field))
+        ),
+        axis=1,
+    )
+    records["dqa_duplicate_record_id"] = records["record_id"].duplicated(keep=False)
+    records["dqa_missing_gps"] = records[["gps_latitude", "gps_longitude"]].isna().any(axis=1)
+    records["dashboard_eligible"] = (
+        ~records["consent_declined"].fillna(False).astype(bool)
+        & records["dqa_missing_required_fields"].eq("")
+    )
+
+    def exclusion_reason(row):
+        reasons = []
+        if bool(row.get("consent_declined", False)):
+            reasons.append("Consent declined")
+        missing_fields = str(row.get("dqa_missing_required_fields", "") or "").strip()
+        if missing_fields:
+            reasons.append(f"Missing required fields: {missing_fields}")
+        return "; ".join(reasons) if reasons else "Included"
+
+    def dqa_status(row):
+        exclusion = exclusion_reason(row)
+        if exclusion != "Included":
+            return f"Excluded — {exclusion}"
+        warnings = []
+        if bool(row.get("dqa_duplicate_record_id", False)):
+            warnings.append("Duplicate stable ID")
+        if bool(row.get("dqa_missing_gps", False)):
+            warnings.append("Missing GPS")
+        return f"Included — Review: {'; '.join(warnings)}" if warnings else "Included"
+
+    records["dashboard_exclusion_reason"] = records.apply(exclusion_reason, axis=1)
+    records["dqa_status"] = records.apply(dqa_status, axis=1)
+    for column in DQA_RECORD_COLUMNS:
+        if column not in records.columns:
+            records[column] = pd.NA
+    dqa_records = records[list(DQA_RECORD_COLUMNS)].copy()
+    records = records.loc[records["dashboard_eligible"]].copy()
 
     id_cols = [col for col in CORE_RECORD_COLUMNS if col in records.columns]
     protection_cols = [col for col in records.columns if col.startswith("concern_") and not col.endswith("_specify")]
@@ -3201,9 +3448,12 @@ def load_data(source_signature):
 
     # Keep two record frames:
     # - secure_records keeps PII for password-protected DQA follow-up tables.
-    # - dashboard_records removes PII and is used by normal dashboard views/downloads.
+    # - dashboard_records is a fail-closed allowlist used by normal views/downloads.
     secure_records = records.copy()
-    dashboard_records = records.drop(columns=[col for col in PII_COLUMNS if col in records.columns], errors="ignore")
+    approved_public_columns = [
+        column for column in PUBLIC_RECORD_COLUMNS if column in records.columns
+    ]
+    dashboard_records = records[approved_public_columns].copy()
     kpis = pd.DataFrame(
         {
             "metric": [
@@ -3249,7 +3499,15 @@ def load_data(source_signature):
         }
     )
 
-    processed_data = (dashboard_records, secure_records, protection, information, referrals, kpis)
+    processed_data = (
+        dashboard_records,
+        secure_records,
+        dqa_records,
+        protection,
+        information,
+        referrals,
+        kpis,
+    )
     if source_mode == "local":
         try:
             PROCESSED_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -3307,10 +3565,14 @@ def reset_filters(default_from_date, max_date):
 
 def apply_filters(frame, filters):
     filtered = frame.copy()
-    if "interview_date" in filtered.columns:
+    date_column = "reporting_date" if "reporting_date" in filtered.columns else "interview_date"
+    if date_column in filtered.columns:
         start_date = filters["start_date"]
         end_exclusive = filters["end_date"] + pd.Timedelta(days=1)
-        filtered = filtered[filtered["interview_date"].ge(start_date) & filtered["interview_date"].lt(end_exclusive)]
+        filtered = filtered[
+            filtered[date_column].ge(start_date)
+            & filtered[date_column].lt(end_exclusive)
+        ]
     for column, selected in [
         ("camp_location", filters["camp_location"]),
         ("helpdesk_location", filters["helpdesk_location"]),
@@ -5005,6 +5267,7 @@ def build_helpdesk_findings(section, frame, protection_frame, information_frame,
 # App
 # -----------------------------------------------------------------------------
 load_css()
+current_user = enforce_app_authentication()
 file_signature = data_file_signature(DATA_FILE_PATH)
 st.session_state.setdefault("helpdesk_kobo_refresh_nonce", 0)
 source_mode = "KoboToolbox API" if kobo_configured() else "Local Excel fallback"
@@ -5022,7 +5285,7 @@ try:
     else:
         source_signature = ("local", *file_signature)
     load_started_at = time.perf_counter()
-    records, secure_records, protection, information, referrals, kpis = load_data(source_signature)
+    records, secure_records, dqa_records, protection, information, referrals, kpis = load_data(source_signature)
     load_elapsed_seconds = time.perf_counter() - load_started_at
 except requests.RequestException as error:
     st.error(f"Kobo could not be reached: {error}")
@@ -5037,10 +5300,37 @@ except Exception as error:
 source_metadata = records.attrs.get("source_metadata", {})
 if records.empty:
     st.error("No valid dashboard records were found in the configured source.")
+    if not dqa_records.empty:
+        st.warning(
+            "Source submissions were received, but none passed the dashboard eligibility rules. "
+            "Review the non-PII DQA audit below."
+        )
+        empty_dashboard_audit = dqa_records[
+            [
+                column
+                for column in [
+                    "record_id",
+                    "staff_name",
+                    "dashboard_exclusion_reason",
+                    "dqa_status",
+                ]
+                if column in dqa_records.columns
+            ]
+        ]
+        st.dataframe(
+            style_records_table(empty_dashboard_audit.head(RECORD_PREVIEW_LIMIT)),
+            use_container_width=True,
+            hide_index=True,
+        )
     st.stop()
 
-min_date = records["interview_date"].min().date()
-max_date = records["interview_date"].max().date()
+available_reporting_dates = records["reporting_date"].dropna()
+if available_reporting_dates.empty:
+    st.error("No usable submission or fallback reporting dates were found in the configured source.")
+    st.stop()
+
+min_date = available_reporting_dates.min().date()
+max_date = available_reporting_dates.max().date()
 default_from_date = min_date
 calendar_min_date = pd.Timestamp(year=min_date.year, month=1, day=1).date()
 calendar_max_date = pd.Timestamp(year=max_date.year, month=12, day=31).date()
@@ -5054,8 +5344,33 @@ if "from_date_filter" not in st.session_state or "to_date_filter" not in st.sess
     st.session_state.setdefault("from_date_filter", legacy_from_date)
     st.session_state.setdefault("to_date_filter", legacy_to_date)
 
+# A deployment may retain date-widget state from the former interview-date
+# filter. Clamp it to the new submission-date calendar before rendering.
+for state_key, fallback_date in (
+    ("from_date_filter", default_from_date),
+    ("to_date_filter", max_date),
+):
+    try:
+        state_date = pd.to_datetime(st.session_state.get(state_key)).date()
+    except (TypeError, ValueError):
+        state_date = fallback_date
+    st.session_state[state_key] = min(
+        max(state_date, calendar_min_date), calendar_max_date
+    )
+
 with st.sidebar:
     st.header("Dashboard Controls")
+
+    if current_user:
+        signed_in_as = (
+            current_user.get("email")
+            or current_user.get("preferred_username")
+            or current_user.get("name")
+            or "Authenticated user"
+        )
+        st.caption(f"Signed in as {signed_in_as}")
+        if st.button("Sign out", key="oidc_sign_out", use_container_width=True):
+            st.logout()
 
     st.markdown(
         """
@@ -5141,6 +5456,12 @@ with st.sidebar:
         st.caption(f"Transformation rules: {PROCESSED_CACHE_VERSION}")
         st.caption(f"Source records: {source_metadata.get('raw_records', len(records)):,}")
         st.caption(f"Analysable records: {len(records):,}")
+        if "reporting_date_source" in records.columns:
+            reporting_source_summary = ", ".join(
+                f"{label}: {count:,}"
+                for label, count in records["reporting_date_source"].value_counts().items()
+            )
+            st.caption(f"Date filter sources: {reporting_source_summary or 'Not recorded'}")
         st.caption(f"Load/cache lookup: {load_elapsed_seconds:.3f} seconds")
         unmapped = source_metadata.get("unmapped_source_columns", [])
         missing = source_metadata.get("missing_contract_columns", [])
@@ -5170,19 +5491,22 @@ with st.sidebar:
 
     filter_section_badge(
         "02",
-        "Date range",
-        "Set the reporting period before applying other filters.",
+        "Submission date range",
+        "Filter by when Kobo received the submission, with safe fallbacks for legacy records.",
         "gold",
     )
-    with st.expander("Date range", expanded=True):
-        st.caption("Click each date field to open its calendar and select the reporting period.")
+    with st.expander("Submission date range", expanded=True):
+        st.caption(
+            "Primary basis: Kobo _submission_time in East Africa Time. "
+            "Fallbacks: Kobo today, then Enter a date for older records."
+        )
         selected_from_date = st.date_input(
             "From",
             min_value=calendar_min_date,
             max_value=calendar_max_date,
             format="DD/MM/YYYY",
             key="from_date_filter",
-            help="Select the first date included in the reporting period.",
+            help="Select the first Kobo receipt/submission date included in the reporting period.",
         )
         selected_to_date = st.date_input(
             "To",
@@ -5190,7 +5514,7 @@ with st.sidebar:
             max_value=calendar_max_date,
             format="DD/MM/YYYY",
             key="to_date_filter",
-            help="Select the last date included in the reporting period.",
+            help="Select the last Kobo receipt/submission date included in the reporting period.",
         )
 
     if selected_from_date > selected_to_date:
@@ -5202,7 +5526,10 @@ with st.sidebar:
     start_date = pd.to_datetime(from_date)
     end_date = pd.to_datetime(to_date)
 
-    date_filtered_records = records[records["interview_date"].ge(start_date) & records["interview_date"].lt(end_date + pd.Timedelta(days=1))].copy()
+    date_filtered_records = records[
+        records["reporting_date"].ge(start_date)
+        & records["reporting_date"].lt(end_date + pd.Timedelta(days=1))
+    ].copy()
 
     selected_camp_locations = []
     selected_helpdesk_locations = []
@@ -5320,7 +5647,17 @@ if "staff_name" in filtered_records.columns:
     staff_no = int(harmonized_staff[harmonized_staff.ne("[Not recorded]")].nunique())
 else:
     staff_no = 0
-last_updated = file_signature[3] if file_signature[3] else "Unknown"
+if kobo_configured():
+    last_fetch_timestamp = pd.to_datetime(
+        source_metadata.get("fetched_at"), utc=True, errors="coerce"
+    )
+    last_updated = (
+        last_fetch_timestamp.tz_convert("Africa/Nairobi").strftime("%d %b %Y %H:%M EAT")
+        if pd.notna(last_fetch_timestamp)
+        else "Unknown"
+    )
+else:
+    last_updated = file_signature[3] if file_signature[3] else "Unknown"
 
 header_html = (
     '<div class="app-header">'
@@ -5348,7 +5685,7 @@ if selected_tab == "Overview" and st.session_state.get("show_current_selection_s
             <div class="app-infobar">
                 <div class="app-infobar-row">
                     <div class="app-pill">&#128202; {format_number(total_records)} of {format_number(all_records)} records</div>
-                    <div class="app-pill">&#128197; {escape_text(from_date.strftime('%d %b %Y'))} &ndash; {escape_text(to_date.strftime('%d %b %Y'))}</div>
+                    <div class="app-pill">&#128197; Submission period: {escape_text(from_date.strftime('%d %b %Y'))} &ndash; {escape_text(to_date.strftime('%d %b %Y'))}</div>
                     <div class="app-pill app-pill-muted">&#128260; Updated {escape_text(last_updated)}</div>
                 </div>
                 <div class="app-infobar-row"><span class="app-infobar-tag">&#128269; Current selection</span>{selection_pills_html}</div>
@@ -6086,26 +6423,58 @@ if selected_tab == "CPV Work":
 if selected_tab == "DQA":
     st.subheader("Data Quality Assurance (DQA)")
     st.markdown(
-        '<div class="section-note">DQA checks use the current dashboard filters. PII-sensitive follow-up tables are password-protected.</div>',
+        '<div class="section-note">The intake audit covers every source submission, including records excluded from dashboard statistics. Beneficiary PII is not included in this audit frame; PII-sensitive follow-up tables remain password-protected.</div>',
         unsafe_allow_html=True,
     )
 
-    dqa_total = len(filtered_records)
-    duplicate_records = int(filtered_records["record_id"].duplicated().sum()) if "record_id" in filtered_records.columns else 0
-    gps_missing = int(filtered_records[["gps_latitude", "gps_longitude"]].isna().any(axis=1).sum()) if {"gps_latitude", "gps_longitude"}.issubset(filtered_records.columns) else 0
-    staff_missing = int(filtered_records["staff_name"].astype(str).eq("[Not recorded]").sum()) if "staff_name" in filtered_records.columns else 0
-    followup_missing = int(filtered_records["follow_up_required_clean"].isna().sum()) if "follow_up_required_clean" in filtered_records.columns else 0
+    dqa_total = len(dqa_records)
+    dqa_eligible = int(dqa_records["dashboard_eligible"].fillna(False).astype(bool).sum()) if "dashboard_eligible" in dqa_records.columns else 0
+    dqa_excluded = max(dqa_total - dqa_eligible, 0)
+    duplicate_records = int(dqa_records["dqa_duplicate_record_id"].fillna(False).astype(bool).sum()) if "dqa_duplicate_record_id" in dqa_records.columns else 0
+    gps_missing = int(dqa_records["dqa_missing_gps"].fillna(False).astype(bool).sum()) if "dqa_missing_gps" in dqa_records.columns else 0
+    consent_declined = int(dqa_records["consent_declined"].fillna(False).astype(bool).sum()) if "consent_declined" in dqa_records.columns else 0
 
     dqa_cols = st.columns(5)
-    show_kpi_card(dqa_cols[0], "Filtered records", format_number(dqa_total), "Records in current selection", accent="#2F7D69")
-    show_kpi_card(dqa_cols[1], "Duplicate IDs", format_number(duplicate_records), "Repeated record_id values", accent="#D9A441")
-    show_kpi_card(dqa_cols[2], "Missing GPS", format_number(gps_missing), f"{format_rate(gps_missing, dqa_total)} of records", share=safe_share(gps_missing, dqa_total), accent="#D9A441")
-    show_kpi_card(dqa_cols[3], "Missing staff", format_number(staff_missing), f"{format_rate(staff_missing, dqa_total)} of records", share=safe_share(staff_missing, dqa_total), accent="#DB2777")
-    show_kpi_card(dqa_cols[4], "Missing follow-up", format_number(followup_missing), f"{format_rate(followup_missing, dqa_total)} of records", share=safe_share(followup_missing, dqa_total), accent="#7C3AED")
+    show_kpi_card(dqa_cols[0], "Source submissions", format_number(dqa_total), "All records received from the source", accent="#1F6FB2")
+    show_kpi_card(dqa_cols[1], "Dashboard eligible", format_number(dqa_eligible), f"{format_rate(dqa_eligible, dqa_total)} of submissions", share=safe_share(dqa_eligible, dqa_total), accent="#2F7D69")
+    show_kpi_card(dqa_cols[2], "Excluded", format_number(dqa_excluded), f"{format_rate(dqa_excluded, dqa_total)} of submissions", share=safe_share(dqa_excluded, dqa_total), accent="#DB2777")
+    show_kpi_card(dqa_cols[3], "Consent declined", format_number(consent_declined), "Excluded from all analysis", accent="#7C3AED")
+    show_kpi_card(dqa_cols[4], "Duplicate stable IDs", format_number(duplicate_records), "All affected source rows", accent="#D9A441")
+
+    st.markdown("### Submission eligibility audit")
+    if dqa_records.empty:
+        st.info("No source submissions are available for DQA.")
+    else:
+        eligibility_summary = (
+            dqa_records.groupby(
+                ["dashboard_eligible", "dashboard_exclusion_reason"],
+                dropna=False,
+            )
+            .size()
+            .reset_index(name="Submissions")
+            .rename(
+                columns={
+                    "dashboard_eligible": "Dashboard eligible",
+                    "dashboard_exclusion_reason": "Eligibility result",
+                }
+            )
+            .sort_values("Submissions", ascending=False)
+        )
+        eligibility_summary["Dashboard eligible"] = eligibility_summary["Dashboard eligible"].map(
+            {True: "Yes", False: "No"}
+        ).fillna("No")
+        render_dashboard_table(
+            eligibility_summary,
+            label_column="Eligibility result",
+            max_height=380,
+        )
 
     st.divider()
-    st.markdown("### Missingness by core DQA field")
+    st.markdown("### Missingness across all source submissions")
     dqa_fields = [
+        "reporting_date",
+        "kobo_submission_time",
+        "kobo_today",
         "interview_date",
         "staff_name",
         "camp_location",
@@ -6114,17 +6483,13 @@ if selected_tab == "DQA":
         "information_seeker_gender",
         "age_group",
         "request_category",
-        "referral_status",
-        "follow_up_required_clean",
         "gps_latitude",
         "gps_longitude",
     ]
     missing_rows = []
     for col in dqa_fields:
-        if col in filtered_records.columns:
-            missing_count = int(filtered_records[col].isna().sum())
-            if col == "staff_name":
-                missing_count += int(filtered_records[col].astype(str).eq("[Not recorded]").sum())
+        if col in dqa_records.columns:
+            missing_count = int(dqa_records[col].map(quality_value_missing).sum())
             missing_rows.append(
                 {
                     "Field": col,
@@ -6135,12 +6500,37 @@ if selected_tab == "DQA":
     missing_table = pd.DataFrame(missing_rows).sort_values("Missing / not recorded", ascending=False)
     st.dataframe(style_records_table(missing_table), use_container_width=True, hide_index=True)
 
+    st.markdown("### Source submission DQA records")
+    st.caption("Read-only operational audit. Direct beneficiary identifiers and free-text PII are excluded by contract.")
+    available_statuses = sorted(dqa_records["dqa_status"].dropna().astype(str).unique().tolist()) if "dqa_status" in dqa_records.columns else []
+    selected_dqa_statuses = st.multiselect(
+        "DQA status",
+        available_statuses,
+        placeholder="All DQA statuses",
+        key="dqa_status_filter",
+    )
+    dqa_view = dqa_records.copy()
+    if selected_dqa_statuses:
+        dqa_view = dqa_view[dqa_view["dqa_status"].astype(str).isin(selected_dqa_statuses)]
+    dqa_query = st.text_input(
+        "Search DQA records",
+        placeholder="Search record ID, CPV, location, missing field or status...",
+        key="dqa_records_search",
+    )
+    dqa_view = search_records(dqa_view, dqa_query)
+    st.caption(f"Showing {format_number(min(len(dqa_view), RECORD_PREVIEW_LIMIT))} of {format_number(len(dqa_view))} matching source submissions.")
+    st.dataframe(
+        style_records_table(dqa_view.head(RECORD_PREVIEW_LIMIT)),
+        use_container_width=True,
+        hide_index=True,
+    )
+
     st.divider()
     st.markdown("### Helpdesk visit-history consistency")
     st.caption(
         'Checks the dependency between "visited_tdh_helpdesk_before" and '
         '"last_visit_within_current_month". The timing question should only be '
-        "answered for repeat visitors."
+        "answered for repeat visitors. This check uses dashboard-eligible records under the current filters."
     )
     visit_consistency_table = basic_count_table(
         filtered_records,
@@ -6178,6 +6568,7 @@ if selected_tab == "DQA":
 
 if selected_tab == "Records":
     st.subheader("Filtered Records")
+    st.caption("Read-only view. Columns are restricted to the approved public-data contract.")
     ordered_columns = [col for col in CORE_RECORD_COLUMNS if col in filtered_records.columns] + [col for col in filtered_records.columns if col not in CORE_RECORD_COLUMNS]
     default_columns = [col for col in CORE_RECORD_COLUMNS if col in ordered_columns]
     if "record_columns" not in st.session_state:
@@ -6189,10 +6580,8 @@ if selected_tab == "Records":
     query = st.text_input("Search filtered records", placeholder="Search by record ID, location, category, status...", key="records_search")
     searched_records = search_records(filtered_records, query)
     preview_records = searched_records[selected_columns].head(RECORD_PREVIEW_LIMIT)
-    st.caption(f"Showing {format_number(len(preview_records))} preview records from {format_number(len(searched_records))} matching records. The download still includes all matching records.")
+    st.caption(f"Showing {format_number(len(preview_records))} preview records from {format_number(len(searched_records))} matching records.")
     st.dataframe(style_records_table(preview_records), use_container_width=True, hide_index=True)
-    if st.checkbox("Prepare filtered CSV download", value=False, help="CSV bytes are generated only when requested to keep ordinary page opening fast."):
-        st.download_button("Download filtered records", data=searched_records.to_csv(index=False).encode("utf-8"), file_name="filtered_helpdesk_records.csv", mime="text/csv", use_container_width=True)
 
     with st.expander("Protected DQA table: education concerns with PII", expanded=False):
         st.markdown(
