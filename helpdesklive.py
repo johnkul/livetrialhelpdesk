@@ -4534,12 +4534,31 @@ def draw_status_donut_pair(frame, status_column, height=300):
 
 
 def draw_monthly_gender_column_bar(frame, height=340):
-    if frame.empty:
+    if frame.empty or "information_seeker_gender" not in frame.columns:
         st.info("No records match the selected filters.")
         return
 
+    date_column = (
+        "reporting_date"
+        if "reporting_date" in frame.columns
+        else "interview_date"
+        if "interview_date" in frame.columns
+        else None
+    )
+    if date_column is None:
+        st.info("No reporting dates are available for the monthly trend.")
+        return
+
+    monthly_source = frame[[date_column, "information_seeker_gender"]].copy()
+    monthly_source["year_month"] = pd.to_datetime(
+        monthly_source[date_column], errors="coerce"
+    ).dt.strftime("%Y-%m")
+    monthly_source = monthly_source.dropna(subset=["year_month"])
+
     monthly = (
-        frame.groupby(["year_month", "information_seeker_gender"], dropna=False)
+        monthly_source.groupby(
+            ["year_month", "information_seeker_gender"], dropna=False
+        )
         .size()
         .reset_index(name="Records")
     )
@@ -5496,10 +5515,6 @@ with st.sidebar:
         "gold",
     )
     with st.expander("Submission date range", expanded=True):
-        st.caption(
-            "Primary basis: Kobo _submission_time in East Africa Time. "
-            "Fallbacks: Kobo today, then Enter a date for older records."
-        )
         selected_from_date = st.date_input(
             "From",
             min_value=calendar_min_date,
