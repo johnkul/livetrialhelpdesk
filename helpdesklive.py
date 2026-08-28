@@ -6339,17 +6339,43 @@ if selected_tab == "CPV Work":
             )
 
         with slicer_col3:
-            max_cpv_display = max(1, len(cpv_summary))
+            max_cpv_display = len(cpv_summary)
             default_cpv_display = min(15, max_cpv_display)
-            cpv_top_n = st.slider(
-                "Number of CPVs",
-                min_value=1,
-                max_value=max_cpv_display,
-                value=default_cpv_display,
-                step=1,
-                key="cpv_chart_top_n",
-                help="Limit the number of CPVs shown in the chart for easier visualization.",
-            )
+            cpv_top_n_key = "cpv_chart_top_n"
+
+            if max_cpv_display == 1:
+                # Streamlit sliders require the maximum to be greater than the
+                # minimum. A single filtered CPV therefore needs no control.
+                cpv_top_n = 1
+                st.caption("Number of CPVs: 1 (all available)")
+            else:
+                # A previous selection can become invalid when dashboard
+                # filters reduce the number of available CPVs. Clamp the saved
+                # widget value before Streamlit validates the slider bounds.
+                slider_options = {
+                    "min_value": 1,
+                    "max_value": max_cpv_display,
+                    "step": 1,
+                    "key": cpv_top_n_key,
+                    "help": "Limit the number of CPVs shown in the chart for easier visualization.",
+                }
+                if cpv_top_n_key in st.session_state:
+                    saved_cpv_top_n = st.session_state[cpv_top_n_key]
+                    try:
+                        saved_cpv_top_n = int(saved_cpv_top_n)
+                    except (TypeError, ValueError):
+                        saved_cpv_top_n = default_cpv_display
+                    st.session_state[cpv_top_n_key] = min(
+                        max(saved_cpv_top_n, 1),
+                        max_cpv_display,
+                    )
+                else:
+                    slider_options["value"] = default_cpv_display
+
+                cpv_top_n = st.slider(
+                    "Number of CPVs",
+                    **slider_options,
+                )
 
         cpv_ascending = cpv_rank == "Lowest values"
         cpv_chart_data = cpv_summary.copy()
