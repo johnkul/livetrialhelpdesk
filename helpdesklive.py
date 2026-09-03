@@ -3599,8 +3599,6 @@ def reset_filters(default_from_date, max_date):
     for key in FILTER_KEYS:
         st.session_state[key] = []
     st.session_state["records_search"] = ""
-    st.session_state["helpdesk_section_category"] = "Summary"
-    st.session_state["helpdesk_section"] = "Overview"
 
 
 def apply_filters(frame, filters):
@@ -3652,6 +3650,19 @@ def previous_reporting_period(start, end):
 
 def clear_exploration():
     st.session_state["exploration_epoch"] = st.session_state.get("exploration_epoch", 0) + 1
+    st.session_state.pop("selection_reset_epochs", None)
+
+
+def clear_local_selection(base_key):
+    """Reset only the originating chart/table, leaving report filters untouched."""
+    epochs = dict(st.session_state.get("selection_reset_epochs", {}))
+    epochs[base_key] = epochs.get(base_key, 0) + 1
+    st.session_state["selection_reset_epochs"] = epochs
+
+
+def selection_widget_key(base_key):
+    epoch = st.session_state.get("selection_reset_epochs", {}).get(base_key, 0)
+    return f"{base_key}_selection_{epoch}"
 
 
 INTERACTION_COUNTS = {}
@@ -4219,7 +4230,7 @@ def render_dashboard_table(table, label_column=None, max_height=560):
     event = st.dataframe(
         style_records_table(view), width="stretch", hide_index=True,
         height=min(max_height, max(110, 38 + 64 * len(view))), row_height=64,
-        column_config=config, key=key + row_signature,
+        column_config=config, key=selection_widget_key(key + row_signature),
         on_select="rerun" if label_column in view.columns else "ignore",
         selection_mode="single-row",
     )
@@ -4228,19 +4239,25 @@ def render_dashboard_table(table, label_column=None, max_height=560):
         rows = event.selection.rows
         if rows and 0 <= rows[0] < len(view):
             value = view.iloc[rows[0]][label_column]
+            if str(value) != "Total":
+                st.button("Clear selection", key=key + "_clear",
+                          on_click=clear_local_selection, args=(key + row_signature,))
             return None if str(value) == "Total" else value
     return None
 
 
-def show_selection_details(frame, category_column, values, key):
+def show_selection_details(frame, category_column, values, key, selection_key=None):
     detail = public_drilldown_records(frame, category_column, values)
     if detail.empty:
         st.info("No approved records match this selection.")
         return
     with st.container(border=True):
-        st.markdown("**Selected: " + ", ".join(str(v) for v in values) + "**")
+        st.markdown("**Details for " + ", ".join(str(v) for v in values) + "**")
         st.caption(f"{len(detail):,} distinct submissions · current reporting and location filters · not unique beneficiaries")
-        st.button("Clear selection", key=key + "_clear", on_click=clear_exploration)
+        st.caption("Only these details follow your selection. The rest of the report is unchanged.")
+        if selection_key is not None:
+            st.button("Clear selection", key=key + "_clear",
+                      on_click=clear_local_selection, args=(selection_key,))
         age_tab, referral_tab, location_tab, trend_tab, record_tab = st.tabs(
             ["Age & gender", "Referrals", "Locations", "Submission trend", "Records"]
         )
@@ -4287,13 +4304,13 @@ def render_selectable_chart(chart, frame, category_column, chart_field=None):
     key = interaction_key("chart:" + category_column) + chart_signature
     point = alt.selection_point(name="detail_pick", fields=[field], toggle=False, on="click", clear="dblclick")
     event = st.altair_chart(
-        polish_chart(chart.add_params(point)), width="stretch", key=key,
+        polish_chart(chart.add_params(point)), width="stretch", key=selection_widget_key(key),
         on_select="rerun", selection_mode="detail_pick",
     )
     st.caption("Click a bar, slice or point for details. Double-click to deselect.")
     selected = selection_values(event, "detail_pick", field)
     if selected:
-        show_selection_details(frame, category_column, selected, key)
+        show_selection_details(frame, category_column, selected, key, selection_key=key)
 
 
 def show_gender_table(frame, category_column, category_label, top_n=None):
@@ -5021,7 +5038,7 @@ def helpdesk_section_navigation():
         st.session_state[section_key] = "Overview"
 
     selected = st.selectbox(
-        "**Explore dashboard**",
+        "Dashboard section",
         list(HELPDESK_SECTION_META),
         key=section_key,
         format_func=lambda value: (
@@ -5037,25 +5054,45 @@ def helpdesk_section_navigation():
     # Keep the legacy category state synchronized for saved sessions and reset
     # behaviour, although navigation now uses one user-facing control.
     st.session_state[category_key] = category
-    description = HELPDESK_SECTION_META[selected][2]
-    st.markdown(
-        f'<div class="sidebar-view-context">'
-        f'<div class="sidebar-view-group">{escape_text(category)}</div>'
-        f'<div class="sidebar-view-description">{escape_text(description)}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
     return selected
 
 
 def helpdesk_section_intro(section, filtered_count):
     icon, label, description = HELPDESK_SECTION_META[section]
     category = next(category for category, views in HELPDESK_SECTION_GROUPS.items() if section in views)
-    st.caption(f"Dashboard › {category} › {label} · {filtered_count:,} records in view")
     st.markdown(
         f'<div class="section-intro-card"><div class="section-intro-icon">{icon}</div>'
         f'<div><div class="section-intro-title">{escape_text(label)}</div>'
         f'<div class="section-intro-desc">{escape_text(description)}</div></div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_report_context(section, count, from_date, to_date, camps, helpdesks, audit_count=0):
+    """Visible context for every view; audit scope must not imply filtering."""
+    period = f"{from_date:%d %b %Y} – {to_date:%d %b %Y}"
+    camp_label = ", ".join(camps) if camps else "All camps"
+    helpdesk_label = ", ".join(helpdesks) if helpdesks else "All helpdesks"
+    title = "Current report selection"
+    count_label = f"{count:,} matching submissions"
+    note = "These dates and locations apply across report sections."
+    if section == "DQA":
+        title = "Source audit · all submissions"
+        count_label = f"{audit_count:,} source submissions"
+        note = (
+            f"The source audit is not limited by report dates or locations. "
+            f"The report filters below match {count:,} dashboard submissions "
+            "and still apply to visit-history checks and protected follow-up tables."
+        )
+    st.markdown(
+        '<div class="report-selection" role="region" aria-label="Report selection">'
+        '<div class="report-selection-heading">'
+        f'<strong>{escape_text(title)}</strong><span>{escape_text(count_label)}</span></div>'
+        '<div class="report-selection-values">'
+        f'<span><b>Submission period</b> {escape_text(period)}</span>'
+        f'<span><b>Camp</b> {escape_text(camp_label)}</span>'
+        f'<span><b>Helpdesk</b> {escape_text(helpdesk_label)}</span></div>'
+        f'<div class="report-selection-note">{escape_text(note)}</div></div>',
         unsafe_allow_html=True,
     )
 
@@ -5670,40 +5707,72 @@ for state_key, fallback_date in (
 
 with st.sidebar:
     st.header("Dashboard Controls")
-
-    if current_user:
-        signed_in_as = (
-            current_user.get("email")
-            or current_user.get("preferred_username")
-            or current_user.get("name")
-            or "Authenticated user"
-        )
-        st.caption(f"Signed in as {signed_in_as}")
-        if st.button("Sign out", key="oidc_sign_out", use_container_width=True):
-            st.session_state.clear()
-            st.logout()
-
-    st.markdown(
-        """
-        <div class="sidebar-filter-guide">
-            <div class="sidebar-filter-guide-title">Control the dashboard view</div>
-            <div class="sidebar-filter-guide-body">
-                Start with the date range, then choose camp location before selecting helpdesk location.
-                Other filters update based on the selections above them.
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.button(
-        "↺ Reset view", use_container_width=True,
-        on_click=reset_filters, args=(default_from_date, max_date),
-        help="Clear filters and return to the Overview section.",
-    )
-
     selected_tab = helpdesk_section_navigation()
 
+    preset = st.selectbox(
+        "Reporting period", ["All dates", "Today", "This week", "This month", "Last 30 days", "Custom"],
+        key="reporting_period_preset",
+        help="Dates refer to when Kobo received submissions.",
+    )
+    if preset != "Custom":
+        selected_from_date, selected_to_date = reporting_period(preset, today_eat, min_date)
+        if preset == "All dates":
+            selected_to_date = max(selected_to_date, max_date)
+        # Assign every run so hidden custom widgets cannot discard these dates.
+        st.session_state["from_date_filter"] = selected_from_date
+        st.session_state["to_date_filter"] = selected_to_date
+        st.caption(f"{selected_from_date:%d %b %Y} – {selected_to_date:%d %b %Y}")
+    else:
+        selected_from_date = st.date_input(
+            "From", min_value=calendar_min_date, max_value=calendar_max_date,
+            format="DD/MM/YYYY", key="from_date_filter",
+        )
+        selected_to_date = st.date_input(
+            "To", min_value=calendar_min_date, max_value=calendar_max_date,
+            format="DD/MM/YYYY", key="to_date_filter",
+        )
+
+    if selected_from_date > selected_to_date:
+        st.error("From date cannot be after To date.")
+        st.stop()
+
+    from_date, to_date = selected_from_date, selected_to_date
+    start_date, end_date = pd.to_datetime(from_date), pd.to_datetime(to_date)
+
+    # Location choices span the snapshot, not just this date range. This keeps
+    # an empty reporting period from silently removing an active location.
+    camp_options = sorted(records["camp_location"].dropna().astype(str).unique().tolist())
+    sanitize_multiselect_state("camp_location_filter", camp_options)
+    selected_camp_locations = st.multiselect(
+        "Camp", camp_options, key="camp_location_filter", placeholder="All camps",
+        help="Optional. Select camps to narrow the available helpdesks.",
+    )
+    location_source = records[
+        records["camp_location"].astype(str).isin(selected_camp_locations)
+    ] if selected_camp_locations else records
+    helpdesk_options = sorted(location_source["helpdesk_location"].dropna().astype(str).unique().tolist())
+    prior_helpdesks = list(st.session_state.get("helpdesk_location_filter", []))
+    sanitize_multiselect_state("helpdesk_location_filter", helpdesk_options)
+    selected_helpdesk_locations = st.multiselect(
+        "Helpdesk", helpdesk_options, key="helpdesk_location_filter", placeholder="All helpdesks",
+        help="Type to search directly. A camp selection is optional.",
+    )
+    removed_helpdesks = [v for v in prior_helpdesks if v not in helpdesk_options]
+    if removed_helpdesks:
+        st.caption("Cleared unavailable helpdesks: " + ", ".join(removed_helpdesks))
+
+    # Demographics and request breakdowns stay within the dashboard views.
+    selected_information_seeker_types = []
+    selected_genders = []
+    selected_age_groups = []
+    selected_request_categories = []
+
+    st.button(
+        "Reset filters", key="reset_report_filters", width="stretch",
+        on_click=reset_filters, args=(default_from_date, max_date),
+        help="Clear report filters and selections. Stay in this dashboard section.",
+    )
+    st.divider()
     if kobo_configured():
         fetched_at = pd.to_datetime(
             source_metadata.get("fetched_at"), utc=True, errors="coerce"
@@ -5713,18 +5782,11 @@ with st.sidebar:
             if pd.notna(fetched_at)
             else "Not recorded"
         )
-        st.markdown(
-            f'<div class="live-sync-card">'
-            f'<div class="live-sync-heading"><span class="live-sync-dot"></span>Live Kobo data</div>'
-            f'<div class="live-sync-time">Last synced: {escape_text(fetched_label)}</div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+        st.caption(f"Last synced: {fetched_label}")
         if st.button(
             "↻ Sync latest Kobo data",
             key="primary_kobo_sync",
-            type="primary",
-            use_container_width=True,
+            width="stretch",
             help="Bypass the cache and retrieve all current Kobo submissions now.",
         ):
             request_dashboard_sync()
@@ -5742,7 +5804,7 @@ with st.sidebar:
     with st.expander("How to use this dashboard", expanded=False):
         st.markdown(
             "1. Choose a dashboard section.\n"
-            "2. Apply filters below; they remain active across views.\n"
+            "2. Set the reporting period and locations above; they remain active across views.\n"
             "3. Click a chart or select a summary row to inspect matching submissions.\n"
             "4. Use **Apply update** when new Kobo data is available.\n\n"
             "**CPV:** Community-based protection volunteer  \n"
@@ -5780,155 +5842,19 @@ with st.sidebar:
             st.write("Unmapped attributes (do not shift existing fields):", unmapped)
         if missing:
             st.write("Absent contract fields:", missing)
-        st.caption("Use the prominent synchronization controls above to refresh data.")
+        st.caption("Use Sync latest Kobo data to fetch changes immediately.")
 
-    filter_section_badge(
-        "01",
-        "Display",
-        "Choose what support panels appear above the dashboard.",
-        "slate",
-    )
-    with st.expander("Display options", expanded=False):
-        show_current_selection_summary = st.checkbox(
-            "Show current selection summary",
-            value=True,
-            key="show_current_selection_summary",
-            help="Show or hide the record count, date range, update time, and selected filter chips above the KPI cards.",
+    if current_user:
+        signed_in_as = (
+            current_user.get("email")
+            or current_user.get("preferred_username")
+            or current_user.get("name")
+            or "Authenticated user"
         )
-
-    st.markdown('<div class="filter-divider"></div>', unsafe_allow_html=True)
-
-    filter_section_badge(
-        "02",
-        "Submission date range",
-        "Filter by when Kobo received the submission, with safe fallbacks for legacy records.",
-        "gold",
-    )
-    with st.expander("Submission date range", expanded=True):
-        preset = st.selectbox(
-            "Reporting period", ["All dates", "Today", "This week", "This month", "Last 30 days", "Custom"],
-            key="reporting_period_preset",
-        )
-        if preset != "Custom":
-            period_start, period_end = reporting_period(preset, today_eat, min_date)
-            if preset == "All dates":
-                period_end = max(period_end, max_date)
-            st.session_state["from_date_filter"] = period_start
-            st.session_state["to_date_filter"] = period_end
-        selected_from_date = st.date_input(
-            "From",
-            min_value=calendar_min_date,
-            max_value=calendar_max_date,
-            format="DD/MM/YYYY",
-            key="from_date_filter",
-            disabled=preset != "Custom",
-            help="Select the first Kobo receipt/submission date included in the reporting period.",
-        )
-        selected_to_date = st.date_input(
-            "To",
-            min_value=calendar_min_date,
-            max_value=calendar_max_date,
-            format="DD/MM/YYYY",
-            key="to_date_filter",
-            disabled=preset != "Custom",
-            help="Select the last Kobo receipt/submission date included in the reporting period.",
-        )
-
-    if selected_from_date > selected_to_date:
-        st.error("From date cannot be after To date.")
-        st.stop()
-
-    # Do not silently shorten an empty/partial period to the dates in the data.
-    from_date = selected_from_date
-    to_date = selected_to_date
-    start_date = pd.to_datetime(from_date)
-    end_date = pd.to_datetime(to_date)
-
-    date_filtered_records = records[
-        records["reporting_date"].ge(start_date)
-        & records["reporting_date"].lt(end_date + pd.Timedelta(days=1))
-    ].copy()
-
-    selected_camp_locations = []
-    selected_helpdesk_locations = []
-    selected_information_seeker_types = []
-    selected_genders = []
-    selected_age_groups = []
-    selected_request_categories = []
-
-    filter_section_badge(
-        "03",
-        "Location",
-        "Select camp first, then unlock helpdesk locations.",
-        "green",
-    )
-    with st.expander("Location", expanded=True):
-        camp_options = [v for v, _ in filter_options_with_counts(date_filtered_records["camp_location"])]
-        st.markdown('<div class="filter-label">Camp location</div>', unsafe_allow_html=True)
-        selected_camp_locations = multi_choice_selector("Camp", camp_options, key="camp_location_filter", help_text="Select one or more camps")
-        filter_selection_feedback("camp", selected_camp_locations)
-
-        if selected_camp_locations:
-            camp_filtered_records = date_filtered_records[
-                date_filtered_records["camp_location"].astype(str).isin(selected_camp_locations)
-            ].copy()
-        else:
-            camp_filtered_records = date_filtered_records.copy()
-            st.session_state["helpdesk_location_filter"] = []
-
-        st.markdown('<div class="filter-label">Helpdesk location</div>', unsafe_allow_html=True)
-        if selected_camp_locations:
-            helpdesk_options = [v for v, _ in filter_options_with_counts(camp_filtered_records["helpdesk_location"])]
-            selected_helpdesk_locations = multi_choice_selector(
-                "Helpdesk location",
-                helpdesk_options,
-                key="helpdesk_location_filter",
-                help_text="Select helpdesk locations after choosing camp location",
-            )
-            filter_selection_feedback("helpdesk", selected_helpdesk_locations)
-        else:
-            selected_helpdesk_locations = []
-            st.markdown(
-                '<div class="filter-step-note">Select a camp location first to unlock helpdesk locations.</div>',
-                unsafe_allow_html=True,
-            )
-
-    helpdesk_filtered_records = camp_filtered_records[camp_filtered_records["helpdesk_location"].astype(str).isin(selected_helpdesk_locations)].copy() if selected_helpdesk_locations else camp_filtered_records.copy()
-
-    # Demographic and request breakdowns remain available in the dashboard
-    # views; they are intentionally not duplicated as sidebar filters.
-    selected_information_seeker_types = []
-    selected_genders = []
-    selected_age_groups = []
-    selected_request_categories = []
-
-    selected_filter_groups = [
-        selected_camp_locations,
-        selected_helpdesk_locations,
-    ]
-    active_filter_count = sum(1 for selected in selected_filter_groups if selected)
-    if from_date > min_date or to_date < max_date:
-        active_filter_count += 1
-
-    sidebar_preview_records = helpdesk_filtered_records.copy()
-    filter_status_class = "filter-status active" if active_filter_count else "filter-status"
-    filter_status_text = (
-        f"{active_filter_count} filter group{'s' if active_filter_count != 1 else ''} active"
-        if active_filter_count
-        else "No filters active"
-    )
-    st.markdown(
-        f"""
-        <div class="filter-status-panel">
-            <div class="{filter_status_class}">
-                <span class="filter-icon">Status</span>
-                <span>{escape_text(filter_status_text)}</span>
-            </div>
-            <div class="filter-status-hint">Estimated records after filters: {format_number(len(sidebar_preview_records))}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        st.caption(f"Signed in as {signed_in_as}")
+        if st.button("Sign out", key="oidc_sign_out", width="stretch"):
+            st.session_state.clear()
+            st.logout()
 
 filters = {
     "start_date": start_date,
@@ -5951,10 +5877,6 @@ filtered_referrals = apply_filters(referrals, filters)
 st.session_state["interaction_context"] = hashlib.sha256(
     repr((selected_tab, filters, source_metadata.get("data_fingerprint"), file_signature if not kobo_configured() else None)).encode()
 ).hexdigest()[:18]
-with st.sidebar:
-    st.button("Clear chart & table selections", on_click=clear_exploration, key="clear_all_exploration",
-              help="Clear drill-down selections without changing reporting dates or location filters.")
-
 total_records = len(filtered_records)
 all_records = len(records)
 protection_records = filtered_records["request_category"].eq("Reporting a protection concern").sum()
@@ -5997,27 +5919,11 @@ if hasattr(st, "html"):
 else:
     st.markdown(header_html, unsafe_allow_html=True)
 
-selection_pills_html = "".join([
-    selection_pill("Camp", selected_camp_locations),
-    selection_pill("Helpdesk", selected_helpdesk_locations),
-    selection_pill("Gender", selected_genders),
-    selection_pill("Age", selected_age_groups),
-])
-if selected_tab == "Overview" and st.session_state.get("show_current_selection_summary", True):
-    with st.expander("Current selection summary", expanded=False):
-        st.markdown(
-            f"""
-            <div class="app-infobar">
-                <div class="app-infobar-row">
-                    <div class="app-pill">&#128202; {format_number(total_records)} of {format_number(all_records)} records</div>
-                    <div class="app-pill">&#128197; Submission period: {escape_text(from_date.strftime('%d %b %Y'))} &ndash; {escape_text(to_date.strftime('%d %b %Y'))}</div>
-                    <div class="app-pill app-pill-muted">&#128260; Updated {escape_text(last_updated)}</div>
-                </div>
-                <div class="app-infobar-row"><span class="app-infobar-tag">&#128269; Current selection</span>{selection_pills_html}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+helpdesk_section_intro(selected_tab, total_records)
+render_report_context(
+    selected_tab, total_records, from_date, to_date,
+    selected_camp_locations, selected_helpdesk_locations, audit_count=len(dqa_records),
+)
 
 if filtered_records.empty and selected_tab not in {"DQA", "Overview"}:
     st.info("No records match the selected filters.")
@@ -6059,19 +5965,6 @@ if selected_tab == "Overview":
     show_insight_card(insight_cols[1], "Top protection concern", top_concern, insight_detail(top_concern_count, len(filtered_protection), unit="mentions", denom_label="concerns"), icon="🛡️", count=top_concern_count)
     show_insight_card(insight_cols[2], "Most common impairment", top_disability, insight_detail(top_disability_count, len(disability_type_records), denom_label="disability records"), icon="♿", count=top_disability_count)
     show_insight_card(insight_cols[3], "Most follow-up activity", top_followup_site, insight_detail(top_followup_site_count, len(follow_up_records), unit="follow-ups", denom_label="follow-ups"), icon="🔄", count=top_followup_site_count)
-else:
-    st.markdown(
-        f"""
-        <div class="section-context-strip" aria-label="Current analytical context">
-            <span><strong>{format_number(total_records)}</strong> records in view</span>
-            <span>{escape_text(from_date.strftime('%d %b %Y'))} &ndash; {escape_text(to_date.strftime('%d %b %Y'))}</span>
-            <span>{active_filter_count} filter group{'s' if active_filter_count != 1 else ''} active</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-helpdesk_section_intro(selected_tab, total_records)
 if selected_tab != "Overview":
     st.button("← Back to Overview", key="helpdesk_back_to_overview", on_click=helpdesk_go_to_overview)
 section_findings = build_helpdesk_findings(

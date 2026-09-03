@@ -895,7 +895,7 @@ section[data-testid="stSidebar"] .stMultiSelect {
 }
 
 section[data-testid="stSidebar"] .stMultiSelect > label {
-    display: none; /* we use custom .filter-label */
+    display: flex; /* Keep native labels visible after removing duplicate headings. */
 }
 
 /* Count display in multiselect options */
@@ -1471,6 +1471,45 @@ section[data-testid="stSidebar"] [data-testid="stDateInput"] {
     height: 1px;
     margin: 1.35rem 0 0.8rem;
     border-top: 1px solid var(--line-soft);
+}
+
+/* Always-visible report context: full selections wrap on narrow screens. */
+.report-selection {
+    margin: .2rem 0 1rem;
+    padding: .8rem 1rem;
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--tdh-green);
+    border-radius: 12px;
+    background: var(--surface);
+    color: var(--ink);
+}
+.report-selection-heading, .report-selection-values {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: .5rem 1rem;
+}
+.report-selection-heading { justify-content: space-between; }
+.report-selection-heading strong { color: var(--heading); }
+.report-selection-heading > span { font-weight: 750; color: var(--brand-text); }
+.report-selection-values { margin-top: .5rem; font-size: .86rem; }
+.report-selection-values > span { min-width: 0; overflow-wrap: anywhere; }
+.report-selection-values b { color: var(--muted); margin-right: .3rem; }
+.report-selection-note { margin-top: .45rem; color: var(--muted-2); font-size: .78rem; }
+
+/* Navigation is distinct without repeating a category/description card. */
+section[data-testid="stSidebar"] .st-key-helpdesk_section {
+    padding: .45rem .6rem .6rem;
+    border-left: 4px solid var(--tdh-green);
+    border-radius: 10px;
+    background: var(--control-accent-soft);
+}
+section[data-testid="stSidebar"] .st-key-helpdesk_section [data-baseweb="select"] {
+    border: 2px solid var(--tdh-green) !important;
+}
+section[data-testid="stSidebar"] .st-key-helpdesk_section [data-testid="stWidgetLabel"] p {
+    font-weight: 800 !important;
+    color: var(--heading) !important;
 }
 
 /* Compact single-control dashboard navigation. */
