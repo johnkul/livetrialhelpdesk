@@ -878,8 +878,8 @@ ANALYSIS_COLUMN_NAMES = frozenset(['action_taken',
  'staff_name',
  'visited_tdh_helpdesk_before'])
 
-APP_VERSION = "Version 1.0"
-APP_VERSION_DATE = "June 2026"
+APP_VERSION = "Version 1.1"
+APP_VERSION_DATE = "September 2026"
 
 _logo_for_icon = LOGO_PATH
 st.set_page_config(
@@ -2939,28 +2939,66 @@ def fetch_kobo_submissions(base_url, asset_uid, token, refresh_nonce=0):
     return raw, metadata
 
 
+def request_dashboard_sync():
+    """Fetch a fresh snapshot on the next full run, without discarding the old one."""
+    st.session_state["helpdesk_kobo_refresh_nonce"] = st.session_state.get("helpdesk_kobo_refresh_nonce", 0) + 1
+    st.session_state["dashboard_sync_requested"] = True
+
+
+def session_dashboard_snapshot(source_signature):
+    """Keep all seven related frames on one version until an explicit sync."""
+    identity = (source_signature[:3], source_signature[4:])
+    saved = st.session_state.get("dashboard_snapshot")
+    if saved is not None and saved[0] != identity:
+        saved = None
+        st.session_state.pop("dashboard_snapshot", None)
+    if saved is None or st.session_state.get("dashboard_sync_requested", False):
+        try:
+            frames = load_data(source_signature)
+        except Exception:
+            if saved is None:
+                raise
+            st.session_state["dashboard_sync_error"] = True
+        else:
+            saved = (identity, frames)
+            st.session_state["dashboard_snapshot"] = saved
+            st.session_state.pop("dashboard_sync_error", None)
+            st.session_state.pop("dashboard_pending_fingerprint", None)
+            st.session_state["dashboard_last_check"] = time.time()
+        finally:
+            st.session_state["dashboard_sync_requested"] = False
+    return saved[1]
+
+
 if hasattr(st, "fragment"):
     @st.fragment(run_every=f"{KOBO_CHANGE_CHECK_SECONDS}s")
     def live_change_monitor(base_url, asset_uid, known_fingerprint):
-        """Check Kobo quietly and rerun the page only when its data changes."""
-        try:
-            _, current_metadata = fetch_kobo_submissions(
-                base_url,
-                asset_uid,
-                str(setting("KOBO_TOKEN")),
-                st.session_state.get("helpdesk_kobo_refresh_nonce", 0),
-            )
-        except Exception:
-            # A temporary monitoring failure must not interrupt dashboard use.
-            return
-
-        current_fingerprint = current_metadata.get("data_fingerprint")
-        if (
-            known_fingerprint
-            and current_fingerprint
-            and current_fingerprint != known_fingerprint
+        """Detect changes without replacing the report a user is analysing."""
+        now = time.time()
+        if now - st.session_state.get("dashboard_last_check", 0) >= KOBO_CHANGE_CHECK_SECONDS:
+            st.session_state["dashboard_last_check"] = now
+            try:
+                _, current_metadata = fetch_kobo_submissions(
+                    base_url, asset_uid, str(setting("KOBO_TOKEN")),
+                    st.session_state.get("helpdesk_kobo_refresh_nonce", 0),
+                )
+            except Exception:
+                # Do not include exception text or source data in the notice.
+                st.session_state["dashboard_sync_error"] = True
+            else:
+                st.session_state.pop("dashboard_sync_error", None)
+                current_fingerprint = current_metadata.get("data_fingerprint")
+                if known_fingerprint and current_fingerprint != known_fingerprint:
+                    st.session_state["dashboard_pending_fingerprint"] = current_fingerprint
+                else:
+                    st.session_state.pop("dashboard_pending_fingerprint", None)
+        if st.session_state.get("dashboard_sync_error"):
+            st.warning("Kobo could not be checked. Showing the last successful snapshot; use Sync to retry.")
+        if st.session_state.get("dashboard_pending_fingerprint"):
+            st.info("New or changed Kobo data is available. Your current view has been kept.")
+        if st.session_state.get("dashboard_pending_fingerprint") and st.button(
+            "Apply update", key="apply_kobo_update", on_click=request_dashboard_sync,
         ):
-            load_data.clear()
             st.rerun()
 else:
     def live_change_monitor(base_url, asset_uid, known_fingerprint):
@@ -3553,6 +3591,8 @@ def sanitize_multiselect_state(key, options):
 
 
 def reset_filters(default_from_date, max_date):
+    st.session_state["reporting_period_preset"] = "All dates"
+    clear_exploration()
     st.session_state["from_date_filter"] = default_from_date
     st.session_state["to_date_filter"] = max_date
     st.session_state.pop("date_range_filter", None)
@@ -3584,6 +3624,90 @@ def apply_filters(frame, filters):
         if selected and column in filtered.columns:
             filtered = filtered[filtered[column].astype(str).isin(selected)]
     return filtered
+
+
+def reporting_period(preset, today, earliest):
+    """Inclusive reporting dates; today is supplied explicitly in East Africa Time."""
+    end = pd.Timestamp(today).normalize()
+    if preset == "Today":
+        start = end
+    elif preset == "This week":
+        start = end - pd.Timedelta(days=end.weekday())
+    elif preset == "This month":
+        start = end.replace(day=1)
+    elif preset == "Last 30 days":
+        start = end - pd.Timedelta(days=29)
+    elif preset == "All dates":
+        start = pd.Timestamp(earliest).normalize()
+    else:
+        raise ValueError("Custom periods use the selected dates")
+    return start.date(), end.date()
+
+
+def previous_reporting_period(start, end):
+    days = (pd.Timestamp(end) - pd.Timestamp(start)).days + 1
+    previous_end = pd.Timestamp(start) - pd.Timedelta(days=1)
+    return previous_end - pd.Timedelta(days=days - 1), previous_end
+
+
+def clear_exploration():
+    st.session_state["exploration_epoch"] = st.session_state.get("exploration_epoch", 0) + 1
+
+
+INTERACTION_COUNTS = {}
+
+
+def interaction_key(label):
+    # Deterministic per view, with distinct identities for repeated tables.
+    ordinal = INTERACTION_COUNTS.get(label, 0)
+    INTERACTION_COUNTS[label] = ordinal + 1
+    seed = (st.session_state.get("interaction_context", ""), label, ordinal,
+            st.session_state.get("exploration_epoch", 0))
+    return "explore_" + hashlib.sha256(repr(seed).encode()).hexdigest()[:18]
+
+
+def show_period_comparison(frame, filters, earliest_date):
+    previous_start, previous_end = previous_reporting_period(filters["start_date"], filters["end_date"])
+    previous_filters = {**filters, "start_date": previous_start, "end_date": previous_end}
+    current = apply_filters(frame, filters)
+    previous = apply_filters(frame, previous_filters)
+    with st.expander("Compare with the previous period", expanded=False):
+        st.caption(
+            f"Current: {filters['start_date']:%d %b %Y} – {filters['end_date']:%d %b %Y} · "
+            f"Previous: {previous_start:%d %b %Y} – {previous_end:%d %b %Y}. Same location filters and number of calendar days."
+        )
+        if previous_start.date() < earliest_date:
+            st.warning("The previous period begins before the earliest available submission. Its count may be incomplete.")
+        specs = [("Submissions", None, None),
+                 ("Protection concerns", "request_category", "Reporting a protection concern"),
+                 ("Information requests", "request_category", "Seeking general protection information"),
+                 ("Follow-up required", "follow_up_required_clean", "Yes")]
+        columns = st.columns(len(specs))
+        for container, (label, field, value) in zip(columns, specs):
+            now_count = len(current) if field is None else int(current[field].eq(value).sum())
+            old_count = len(previous) if field is None else int(previous[field].eq(value).sum())
+            change = now_count - old_count
+            percent = f"{change / old_count:+.1%}" if old_count else "no previous baseline"
+            container.metric(label, f"{now_count:,}", delta=f"{change:+,} ({percent})", delta_color="off")
+        st.caption("These are submission counts, not unique beneficiaries. An increase is not automatically an improvement.")
+
+
+def dqa_issue_records(frame, issue):
+    """Select operational audit rows; never add secure-record columns."""
+    if issue == "Missing required fields":
+        mask = frame["dqa_missing_required_fields"].fillna("").astype(str).str.strip().ne("")
+    elif issue == "Missing GPS":
+        mask = frame["dqa_missing_gps"].fillna(False).astype(bool)
+    elif issue == "Duplicate IDs":
+        mask = frame["dqa_duplicate_record_id"].fillna(False).astype(bool)
+    elif issue == "Excluded submissions":
+        mask = ~frame["dashboard_eligible"].fillna(False).astype(bool)
+    elif issue == "CPV names to review":
+        names = frame["staff_name"].fillna("[Not recorded]").astype(str)
+        mask = ~names.isin(set(CPV_NAME_STANDARD_MAP.values()))
+    else:
+        mask = pd.Series(True, index=frame.index)
+    return frame.loc[mask, [c for c in DQA_RECORD_COLUMNS if c in frame.columns]].copy()
 
 
 def gender_color(field, available=None):
@@ -3853,7 +3977,7 @@ def records_table_date_columns(table):
 
 
 def style_records_table(table):
-    display_table = table.copy()
+    display_table = table.copy().reset_index(drop=True)
     date_columns = records_table_date_columns(display_table)
     numeric_columns = display_table.select_dtypes(include="number").columns.tolist()
     gps_columns = [col for col in display_table.columns if col in ["gps_latitude", "gps_longitude", "lat", "lon"]]
@@ -3980,7 +4104,7 @@ def display_table_value(value):
     return str(value)
 
 
-def render_dashboard_table(table, label_column=None, max_height=560):
+def render_wrapped_table(table, label_column=None, max_height=560):
     if table.empty:
         st.info("No records match the selected filters.")
         return
@@ -4047,12 +4171,139 @@ def render_dashboard_table(table, label_column=None, max_height=560):
         st.markdown(table_html, unsafe_allow_html=True)
 
 
+def public_drilldown_records(frame, category_column, values):
+    """Filter on displayed categories, deduplicate submissions, then fail closed."""
+    if category_column not in frame.columns or not values:
+        return pd.DataFrame(columns=[c for c in PUBLIC_RECORD_COLUMNS if c in frame.columns])
+    candidates = frame[category_column].map(clean_text).fillna("[Missing]").astype(str)
+    selected = {str(value) for value in values}
+    matched = frame[candidates.isin(selected) | candidates.map(display_category_value).isin(selected)]
+    approved = matched[[c for c in PUBLIC_RECORD_COLUMNS if c in matched.columns]].copy()
+    if "record_id" in approved.columns:
+        approved = approved.drop_duplicates("record_id")
+    return approved.reset_index(drop=True)
+
+
+def selection_values(event, parameter, field):
+    selection = event.get("selection", {}) if isinstance(event, Mapping) else getattr(event, "selection", {})
+    points = selection.get(parameter, [])
+    if not isinstance(points, list):
+        return []
+    return list(dict.fromkeys(str(point[field]) for point in points if isinstance(point, Mapping) and field in point))
+
+
+def render_dashboard_table(table, label_column=None, max_height=560):
+    """Read-only, searchable grid. Return the selected category, not a row index."""
+    if table.empty:
+        st.info("No records match the selected filters.")
+        return None
+    key = interaction_key("table:" + str(label_column) + repr(list(table.columns)))
+    with st.expander("Table options", expanded=False):
+        query = st.text_input("Search this table", key=key + "_search")
+        wrapped = st.checkbox("Wrapped reading view", key=key + "_wrapped",
+                              help="Fit long descriptions to the page. Switch off to select rows.")
+    view = search_records(table, query).reset_index(drop=True)
+    if view.empty:
+        st.info("No table rows match your search.")
+        return None
+    if wrapped:
+        render_wrapped_table(view, label_column=label_column, max_height=max_height)
+        return None
+    config = {column: st.column_config.NumberColumn(width="small")
+              if pd.api.types.is_numeric_dtype(view[column])
+              else st.column_config.TextColumn(width="large" if column == label_column else "medium")
+              for column in view.columns}
+    # Include the searched row identity so an old row position cannot select a
+    # different category after searching, ranking or changing the snapshot.
+    row_signature = hashlib.sha256(view.to_json(date_format="iso").encode()).hexdigest()[:12]
+    event = st.dataframe(
+        style_records_table(view), width="stretch", hide_index=True,
+        height=min(max_height, max(110, 38 + 64 * len(view))), row_height=64,
+        column_config=config, key=key + row_signature,
+        on_select="rerun" if label_column in view.columns else "ignore",
+        selection_mode="single-row",
+    )
+    if label_column in view.columns:
+        st.caption("Select a row to inspect it. Report totals stay unchanged.")
+        rows = event.selection.rows
+        if rows and 0 <= rows[0] < len(view):
+            value = view.iloc[rows[0]][label_column]
+            return None if str(value) == "Total" else value
+    return None
+
+
+def show_selection_details(frame, category_column, values, key):
+    detail = public_drilldown_records(frame, category_column, values)
+    if detail.empty:
+        st.info("No approved records match this selection.")
+        return
+    with st.container(border=True):
+        st.markdown("**Selected: " + ", ".join(str(v) for v in values) + "**")
+        st.caption(f"{len(detail):,} distinct submissions · current reporting and location filters · not unique beneficiaries")
+        st.button("Clear selection", key=key + "_clear", on_click=clear_exploration)
+        age_tab, referral_tab, location_tab, trend_tab, record_tab = st.tabs(
+            ["Age & gender", "Referrals", "Locations", "Submission trend", "Records"]
+        )
+        with age_tab:
+            if {"age_group", "information_seeker_gender"}.issubset(detail.columns):
+                age_table = gender_pivot_table(detail, "age_group", "Age group")
+                st.dataframe(style_records_table(age_table.reset_index(drop=True)), width="stretch", hide_index=True)
+        with referral_tab:
+            source = globals().get("filtered_referrals", pd.DataFrame())
+            if {"record_id", "referral_partner"}.issubset(source.columns) and "record_id" in detail.columns:
+                linked = source[source["record_id"].isin(detail["record_id"])].drop_duplicates(["record_id", "referral_partner"])
+                summary = basic_count_table(linked, "referral_partner", "Referral partner")
+                st.dataframe(summary, width="stretch", hide_index=True)
+                st.caption("Referral mentions; one submission may include several partners.")
+            else:
+                st.info("No linked referral information is available.")
+        with location_tab:
+            if "helpdesk_location" in detail.columns:
+                locations = basic_count_table(detail, "helpdesk_location", "Helpdesk location")
+                st.dataframe(locations, width="stretch", hide_index=True)
+        with trend_tab:
+            if "reporting_date" in detail.columns:
+                days = pd.to_datetime(detail["reporting_date"], errors="coerce").dropna().dt.normalize()
+                counts = days.value_counts().sort_index()
+                if not counts.empty:
+                    counts = counts.reindex(pd.date_range(counts.index.min(), counts.index.max()), fill_value=0)
+                    trend = counts.rename_axis("Date").reset_index(name="Submissions")
+                    chart = alt.Chart(trend).mark_line(point=True, color="#2F7D69").encode(
+                        x=alt.X("Date:T"), y=alt.Y("Submissions:Q"), tooltip=["Date:T", "Submissions:Q"],
+                    ).properties(height=230)
+                    st.altair_chart(polish_chart(chart), width="stretch")
+                else:
+                    st.info("No usable reporting dates for this selection.")
+        with record_tab:
+            query = st.text_input("Search selected records", key=key + "_records_search")
+            preview = search_records(detail, query).head(RECORD_PREVIEW_LIMIT).reset_index(drop=True)
+            st.caption(f"Read-only · showing {len(preview):,} records · raw export disabled")
+            st.dataframe(style_records_table(preview), width="stretch", hide_index=True, row_height=64)
+
+
+def render_selectable_chart(chart, frame, category_column, chart_field=None):
+    field = chart_field or category_column
+    chart_signature = hashlib.sha256(chart.to_json().encode()).hexdigest()[:12]
+    key = interaction_key("chart:" + category_column) + chart_signature
+    point = alt.selection_point(name="detail_pick", fields=[field], toggle=False, on="click", clear="dblclick")
+    event = st.altair_chart(
+        polish_chart(chart.add_params(point)), width="stretch", key=key,
+        on_select="rerun", selection_mode="detail_pick",
+    )
+    st.caption("Click a bar, slice or point for details. Double-click to deselect.")
+    selected = selection_values(event, "detail_pick", field)
+    if selected:
+        show_selection_details(frame, category_column, selected, key)
+
+
 def show_gender_table(frame, category_column, category_label, top_n=None):
     table = gender_pivot_table(frame, category_column, category_label, top_n=top_n)
     if table.empty:
         st.info("No records match the selected filters.")
         return
-    render_dashboard_table(table, label_column=category_label)
+    selected = render_dashboard_table(table, label_column=category_label)
+    if selected is not None:
+        show_selection_details(frame, category_column, [selected], interaction_key("detail:" + category_column))
 
 
 def age_breakdown_options(frame, category_column):
@@ -4199,7 +4450,8 @@ def draw_age_gender_breakdown_bar(
         .properties(height=chart_height)
     )
 
-    st.altair_chart(polish_chart(chart), use_container_width=True)
+    selected_frame = frame[frame[category_column].map(clean_text).fillna("[Missing]").astype(str).isin(selected_categories)]
+    render_selectable_chart(chart, selected_frame, "age_group", "Age group")
 
 
 def show_age_gender_breakdown_table(frame, category_column, selected_categories, category_label):
@@ -4214,7 +4466,10 @@ def show_age_gender_breakdown_table(frame, category_column, selected_categories,
         st.info("No age breakdown is available for the selected option.")
         return
 
-    render_dashboard_table(table, label_column="Age group")
+    selected_age = render_dashboard_table(table, label_column="Age group")
+    if selected_age is not None:
+        selected_frame = frame[frame[category_column].map(clean_text).fillna("[Missing]").astype(str).isin(selected_categories)]
+        show_selection_details(selected_frame, "age_group", [selected_age], interaction_key("age_details"))
 
 
 def gender_wide_chart_data(frame, category_column, top_n=None, ascending=False):
@@ -4274,7 +4529,7 @@ def draw_gender_bar(frame, category_column, top_n=None, height=430, ascending=Fa
             text=alt.Text("_total:Q", format=","),
         )
     )
-    st.altair_chart(polish_chart(chart + totals_layer), use_container_width=True)
+    render_selectable_chart(chart + totals_layer, frame, category_column)
 
 
 def draw_gender_column_bar(frame, category_column, top_n=None, height=360):
@@ -4333,7 +4588,7 @@ def draw_gender_column_bar(frame, category_column, top_n=None, height=360):
             )
             .properties(height=height)
         )
-        st.altair_chart(polish_chart(age_chart), use_container_width=True)
+        render_selectable_chart(age_chart, frame, category_column)
         return
     else:
         category_order = chart_data.sort_values("Total", ascending=False)[category_column].astype(str).tolist()
@@ -4361,7 +4616,7 @@ def draw_gender_column_bar(frame, category_column, top_n=None, height=360):
             text=alt.Text("Total:Q", format=","),
         )
     )
-    st.altair_chart(polish_chart(chart + total_labels), use_container_width=True)
+    render_selectable_chart(chart + total_labels, frame, category_column)
 
 
 def draw_total_donut(frame, category_column, category_label, height=320, min_label_share=0.04):
@@ -4433,14 +4688,11 @@ def draw_total_donut(frame, category_column, category_label, height=320, min_lab
             text=alt.Text("Share label:N"),
         )
     )
-    st.altair_chart(
-        polish_chart(
-            (donut + labels).properties(
-                height=chart_height,
-                padding={"top": 10, "right": 10, "bottom": 10, "left": 10},
-            )
-        ),
-        use_container_width=True,
+    render_selectable_chart(
+        (donut + labels).properties(
+            height=chart_height,
+            padding={"top": 10, "right": 10, "bottom": 10, "left": 10},
+        ), frame, category_column,
     )
 
 
@@ -4511,7 +4763,7 @@ def draw_request_type_bar(frame, height=190):
         text=alt.Text("Label:N"),
     )
 
-    st.altair_chart(polish_chart((bars + labels).properties(height=height)), use_container_width=True)
+    render_selectable_chart((bars + labels).properties(height=height), frame, "request_category")
 
 
 def draw_status_donut_pair(frame, status_column, height=300):
@@ -4560,7 +4812,7 @@ def draw_status_donut_pair(frame, status_column, height=300):
             tooltip=[alt.Tooltip("Gender:N", title="Gender"), alt.Tooltip(f"{status_column}:N", title="Status"), alt.Tooltip("Records:Q", title="Records", format=","), alt.Tooltip("Share:Q", title="Share within gender", format=".1%")],
         )
     )
-    st.altair_chart(polish_chart(status_chart + status_labels), use_container_width=True)
+    render_selectable_chart(status_chart + status_labels, frame, status_column)
 
 
 def draw_monthly_gender_column_bar(frame, height=340):
@@ -4636,7 +4888,9 @@ def draw_monthly_gender_column_bar(frame, height=340):
         .properties(height=height)
     )
 
-    st.altair_chart(polish_chart(line), use_container_width=True)
+    detail_frame = frame.copy()
+    detail_frame["year_month"] = pd.to_datetime(detail_frame[date_column], errors="coerce").dt.strftime("%Y-%m")
+    render_selectable_chart(line, detail_frame, "year_month")
 
 def draw_count_bar(frame, category_column, category_label, height=360):
     if frame.empty or category_column not in frame.columns:
@@ -4649,7 +4903,7 @@ def draw_count_bar(frame, category_column, category_label, height=360):
     base = alt.Chart(chart_data).encode(x=alt.X("axis_label:N", sort=axis_order, title=None, axis=alt.Axis(labelAngle=-20, labelLimit=120, labelFontSize=11, labelBound=True, labelOverlap="parity")), y=alt.Y("Records:Q", title="Records", scale=alt.Scale(domain=[0, y_upper], nice=False)))
     bars = base.mark_bar(cornerRadiusEnd=6, color="#2F7D69", opacity=0.94, stroke="#FFFFFF", strokeWidth=0.7).encode(tooltip=[alt.Tooltip(f"{category_label}:N", title=category_label), alt.Tooltip("Records:Q", title="Records", format=",")])
     labels = base.mark_text(dy=-6, fontSize=11, fontWeight=700, color="#1E293B").encode(text=alt.Text("Records:Q", format=","))
-    st.altair_chart(polish_chart((bars + labels).properties(height=height)), use_container_width=True)
+    render_selectable_chart((bars + labels).properties(height=height), frame, category_column, category_label)
 
 
 def basic_count_table(frame, category_column, category_label):
@@ -4745,7 +4999,7 @@ HELPDESK_SECTION_META = {
     "Referrals": ("🔁", "Referrals", "Review referral partners, destinations and demographic patterns."),
     "Map": ("🗺️", "Service Map", "Locate mapped helpdesk records and assess geographic coverage."),
     "DQA": ("✅", "Data Quality", "Review completeness, corrections and protected follow-up records."),
-    "Records": ("📄", "Records & Export", "Inspect filtered records and prepare privacy-safe downloads."),
+    "Records": ("📄", "Records", "Search and inspect approved records in a read-only view."),
 }
 HELPDESK_SECTION_GROUPS = {
     "Summary": ["Overview"],
@@ -5316,6 +5570,8 @@ def build_helpdesk_findings(section, frame, protection_frame, information_frame,
 # App
 # -----------------------------------------------------------------------------
 load_css()
+# Enforce this even when the deployment omits the example config file.
+st.set_option("client.disableDataExport", True)
 current_user = enforce_app_authentication()
 file_signature = data_file_signature(DATA_FILE_PATH)
 st.session_state.setdefault("helpdesk_kobo_refresh_nonce", 0)
@@ -5330,11 +5586,14 @@ try:
             kobo_base_url,
             kobo_asset_uid,
             st.session_state.helpdesk_kobo_refresh_nonce,
+            hashlib.sha256(str(setting("KOBO_TOKEN")).encode()).hexdigest(),
+            PROCESSED_CACHE_VERSION,
         )
     else:
         source_signature = ("local", *file_signature)
     load_started_at = time.perf_counter()
-    records, secure_records, dqa_records, protection, information, referrals, kpis = load_data(source_signature)
+    frames = session_dashboard_snapshot(source_signature) if kobo_configured() else load_data(source_signature)
+    records, secure_records, dqa_records, protection, information, referrals, kpis = frames
     load_elapsed_seconds = time.perf_counter() - load_started_at
 except requests.RequestException as error:
     st.error(f"Kobo could not be reached: {error}")
@@ -5381,8 +5640,10 @@ if available_reporting_dates.empty:
 min_date = available_reporting_dates.min().date()
 max_date = available_reporting_dates.max().date()
 default_from_date = min_date
-calendar_min_date = pd.Timestamp(year=min_date.year, month=1, day=1).date()
-calendar_max_date = pd.Timestamp(year=max_date.year, month=12, day=31).date()
+today_eat = pd.Timestamp.now(tz="Africa/Nairobi").date()
+calendar_min_date = pd.Timestamp(year=min(min_date.year, today_eat.year - 1), month=1, day=1).date()
+calendar_max_date = pd.Timestamp(year=max(max_date.year, today_eat.year), month=12, day=31).date()
+st.session_state.setdefault("reporting_period_preset", "Custom" if "from_date_filter" in st.session_state else "All dates")
 
 if "from_date_filter" not in st.session_state or "to_date_filter" not in st.session_state:
     legacy_date_range = st.session_state.pop("date_range_filter", None)
@@ -5419,6 +5680,7 @@ with st.sidebar:
         )
         st.caption(f"Signed in as {signed_in_as}")
         if st.button("Sign out", key="oidc_sign_out", use_container_width=True):
+            st.session_state.clear()
             st.logout()
 
     st.markdown(
@@ -5465,13 +5727,10 @@ with st.sidebar:
             use_container_width=True,
             help="Bypass the cache and retrieve all current Kobo submissions now.",
         ):
-            st.session_state.helpdesk_kobo_refresh_nonce += 1
-            fetch_kobo_submissions.clear()
+            request_dashboard_sync()
             fetch_kobo_form_contract.clear()
-            load_data.clear()
             st.rerun()
-        # Monitor silently; the full page reruns only after an actual Kobo
-        # submission addition, edit, or deletion.
+        # Changes are offered as an update; they never replace the active view.
         live_change_monitor(
             kobo_base_url,
             kobo_asset_uid,
@@ -5482,9 +5741,10 @@ with st.sidebar:
 
     with st.expander("How to use this dashboard", expanded=False):
         st.markdown(
-            "1. Choose a view from **Explore dashboard**.\n"
+            "1. Choose a dashboard section.\n"
             "2. Apply filters below; they remain active across views.\n"
-            "3. Open **Findings from the current tables** for interpretation.\n\n"
+            "3. Click a chart or select a summary row to inspect matching submissions.\n"
+            "4. Use **Apply update** when new Kobo data is available.\n\n"
             "**CPV:** Community-based protection volunteer  \n"
             "**Mention:** A selected response; one record may contain several mentions"
         )
@@ -5498,7 +5758,7 @@ with st.sidebar:
                 st.caption(f"Last fetched: {fetched.tz_convert('Africa/Nairobi').strftime('%d %b %Y %H:%M EAT')}")
             st.caption(f"API pages: {source_metadata.get('api_pages', 0):,}")
             st.caption(f"Refresh window: {KOBO_REFRESH_WINDOW_SECONDS} seconds")
-            st.caption("The page updates only when the Kobo data changes.")
+            st.caption("Changes are checked while the dashboard is open. Apply update to replace the current snapshot.")
         else:
             st.caption(f"Workbook: {DATA_FILE_PATH.name}")
             st.caption(f"Last modified: {file_signature[3] if file_signature[3] else 'Unknown'}")
@@ -5545,12 +5805,23 @@ with st.sidebar:
         "gold",
     )
     with st.expander("Submission date range", expanded=True):
+        preset = st.selectbox(
+            "Reporting period", ["All dates", "Today", "This week", "This month", "Last 30 days", "Custom"],
+            key="reporting_period_preset",
+        )
+        if preset != "Custom":
+            period_start, period_end = reporting_period(preset, today_eat, min_date)
+            if preset == "All dates":
+                period_end = max(period_end, max_date)
+            st.session_state["from_date_filter"] = period_start
+            st.session_state["to_date_filter"] = period_end
         selected_from_date = st.date_input(
             "From",
             min_value=calendar_min_date,
             max_value=calendar_max_date,
             format="DD/MM/YYYY",
             key="from_date_filter",
+            disabled=preset != "Custom",
             help="Select the first Kobo receipt/submission date included in the reporting period.",
         )
         selected_to_date = st.date_input(
@@ -5559,6 +5830,7 @@ with st.sidebar:
             max_value=calendar_max_date,
             format="DD/MM/YYYY",
             key="to_date_filter",
+            disabled=preset != "Custom",
             help="Select the last Kobo receipt/submission date included in the reporting period.",
         )
 
@@ -5566,8 +5838,9 @@ with st.sidebar:
         st.error("From date cannot be after To date.")
         st.stop()
 
-    from_date = max(selected_from_date, min_date)
-    to_date = min(selected_to_date, max_date)
+    # Do not silently shorten an empty/partial period to the dates in the data.
+    from_date = selected_from_date
+    to_date = selected_to_date
     start_date = pd.to_datetime(from_date)
     end_date = pd.to_datetime(to_date)
 
@@ -5634,7 +5907,7 @@ with st.sidebar:
         selected_helpdesk_locations,
     ]
     active_filter_count = sum(1 for selected in selected_filter_groups if selected)
-    if from_date != min_date or to_date != max_date:
+    if from_date > min_date or to_date < max_date:
         active_filter_count += 1
 
     sidebar_preview_records = helpdesk_filtered_records.copy()
@@ -5674,6 +5947,13 @@ filtered_records = apply_filters(records, filters)
 filtered_protection = apply_filters(protection, filters)
 filtered_information = apply_filters(information, filters)
 filtered_referrals = apply_filters(referrals, filters)
+
+st.session_state["interaction_context"] = hashlib.sha256(
+    repr((selected_tab, filters, source_metadata.get("data_fingerprint"), file_signature if not kobo_configured() else None)).encode()
+).hexdigest()[:18]
+with st.sidebar:
+    st.button("Clear chart & table selections", on_click=clear_exploration, key="clear_all_exploration",
+              help="Clear drill-down selections without changing reporting dates or location filters.")
 
 total_records = len(filtered_records)
 all_records = len(records)
@@ -5739,7 +6019,7 @@ if selected_tab == "Overview" and st.session_state.get("show_current_selection_s
             unsafe_allow_html=True,
         )
 
-if filtered_records.empty:
+if filtered_records.empty and selected_tab not in {"DQA", "Overview"}:
     st.info("No records match the selected filters.")
     show_footer()
     st.stop()
@@ -5748,6 +6028,7 @@ if filtered_records.empty:
 # deliberately omitted from analytical sections so users reach their data
 # immediately without repeatedly scrolling past the same summary cards.
 if selected_tab == "Overview":
+    show_period_comparison(records, filters, min_date)
     kpi_group_caption("Volume, staffing & request mix — request types are mutually exclusive")
     mix_cols = st.columns(4)
     show_kpi_card(mix_cols[0], "Staff No.", format_number(staff_no), "Unique harmonized CPVs in current selection", accent="#2F7D69")
@@ -6318,7 +6599,9 @@ if selected_tab == "Map":
             ]
         ]
         st.subheader("Mapped Helpdesk Points")
-        st.dataframe(style_records_table(map_summary), use_container_width=True, hide_index=True)
+        selected_map_location = render_dashboard_table(map_summary, label_column="Helpdesk location")
+        if selected_map_location is not None:
+            show_selection_details(filtered_records, "helpdesk_location", [selected_map_location], interaction_key("map_table_detail"))
 
 if selected_tab == "CPV Work":
     st.subheader("CPV Work Summary")
@@ -6480,16 +6763,16 @@ if selected_tab == "CPV Work":
             )
         )
 
-        st.altair_chart(
-            polish_chart(cpv_chart + cpv_labels),
-            use_container_width=True,
-        )
+        render_selectable_chart(cpv_chart + cpv_labels, filtered_records, "staff_name", "CPV")
+        st.caption("Submission volume describes recorded workload, not service quality.")
 
         st.markdown(
             '<div class="cpv-table-title">Full CPV Work Summary — all CPVs, unaffected by chart slicers</div>',
             unsafe_allow_html=True,
         )
-        render_dashboard_table(cpv_summary, label_column="CPV", max_height=620)
+        selected_cpv = render_dashboard_table(cpv_summary, label_column="CPV", max_height=620)
+        if selected_cpv is not None:
+            show_selection_details(filtered_records, "staff_name", [selected_cpv], interaction_key("cpv_table_detail"))
 
 if selected_tab == "DQA":
     st.subheader("Data Quality Assurance (DQA)")
@@ -6499,6 +6782,25 @@ if selected_tab == "DQA":
     )
 
     dqa_total = len(dqa_records)
+    issues = ["All submissions", "Missing required fields", "Missing GPS", "Duplicate IDs", "Excluded submissions", "CPV names to review"]
+    with st.container(border=True):
+        st.markdown("**Data quality quick check**")
+        st.caption("All source submissions, including incomplete and excluded records; dashboard date/location filters do not limit this audit.")
+        issue_table = pd.DataFrame([
+            {"Issue": issue, "Submissions": len(dqa_issue_records(dqa_records, issue))}
+            for issue in issues[1:]
+        ])
+        chosen_issue = render_dashboard_table(issue_table, label_column="Issue", max_height=400)
+        if chosen_issue is not None:
+            issue_view = dqa_issue_records(dqa_records, chosen_issue)
+            st.markdown(f"**{chosen_issue} · {len(issue_view):,} source submissions**")
+            if chosen_issue == "CPV names to review":
+                st.caption("Names absent from the current harmonization map, including missing names. This is a review list, not proof of a naming error.")
+            issue_query = st.text_input("Search issue records", key=interaction_key("dqa_issue_search"))
+            st.dataframe(
+                style_records_table(search_records(issue_view, issue_query).head(RECORD_PREVIEW_LIMIT).reset_index(drop=True)),
+                width="stretch", hide_index=True, row_height=64,
+            )
     dqa_eligible = int(dqa_records["dashboard_eligible"].fillna(False).astype(bool).sum()) if "dashboard_eligible" in dqa_records.columns else 0
     dqa_excluded = max(dqa_total - dqa_eligible, 0)
     duplicate_records = int(dqa_records["dqa_duplicate_record_id"].fillna(False).astype(bool).sum()) if "dqa_duplicate_record_id" in dqa_records.columns else 0
