@@ -1,7 +1,9 @@
 streamlit>=1.63,<1.64
 Authlib>=1.3.2,<2
 pandas>=2.1,<3
-altair>=5,<6
+# Altair 5.5 cannot import on Python 3.14 (TypedDict closed=True).
+altair>=6.0,<7
+typing_extensions>=4.15,<5
 pydeck>=0.9,<1
 requests>=2.31,<3
 urllib3>=2.2,<3

@@ -23,7 +23,7 @@ For local development without an identity provider, set `AUTH_REQUIRED = false`.
 ## Production safety controls
 
 - Normal dashboard views are generated from `PUBLIC_RECORD_COLUMNS`, an explicit fail-closed allowlist. A newly added Kobo column is private by default and cannot automatically appear in the Records view or its data flow.
-- **Filtered Records** is read-only and has no standard CSV download.
+- **Filtered Records** and new drill-down records are read-only. Built-in CSV/clipboard export is disabled in code and `.streamlit/config.toml`; existing password-authorised explicit downloads remain available. On-screen content can still be captured, so this is a UI restriction, not a replacement for authentication and the public-column allowlist.
 - The separate non-PII DQA stream is captured before consent and completeness exclusions. It reconciles all source submissions to dashboard-eligible or excluded records and records the exclusion reason.
 - Public dashboard record IDs are stable pseudonymous SHA-256-derived identifiers based on Kobo `_uuid`, with `_id` as the secondary source. Local workbooks use a clearly marked row-based fallback.
 - Kobo form-schema and submission requests retry bounded transient failures (`429`, `500`, `502`, `503`, and `504`) with exponential backoff and `Retry-After` support. Authentication failures are still reported immediately.
@@ -45,12 +45,38 @@ After changing the deployed form, open **Live data & schema status**. Review “
 
 - The dashboard date range and monthly trend use Kobo `_submission_time` converted to East Africa Time, so delayed offline uploads enter the reporting period when Kobo actually receives them. Kobo `today` is the first fallback and `Enter a date` is retained as the final legacy fallback and as the original activity/interview date.
 - API downloads and fully transformed DataFrames use a 1,800-second (30-minute) refresh window shared across users.
-- **Sync latest Kobo data** bypasses the cache immediately.
-- A silent background check runs every 1,800 seconds, but the page reruns only when a Kobo submission is added, edited, or deleted.
+- **Sync latest Kobo data** bypasses the cache immediately. It replaces the current snapshot only after a successful fetch and transformation; failures retain the last successful version.
+- A background check runs every 1,800 seconds while a browser session is active. Additions, edits and deletions produce an **Apply update** notice, not an automatic full-page rerun.
+- Each session pins all related tables to the same snapshot until the user applies an update or explicitly synchronizes. Dates and location filters are retained. Chart/table selections reset when their underlying snapshot or report context changes, preventing stale row positions from identifying a different record.
+- A failed check shows a controlled warning without exposing API responses or credentials.
 - The API loader follows every pagination link, so it is not limited to the first page.
 - Unchanged Kobo data never interrupts the current dashboard flow.
 
-Kobo is a pull API, so this is near-live rather than a permanent streaming connection. For sub-minute updates or much larger volumes, use a Kobo webhook or scheduled incremental process to stage submissions in PostgreSQL, then point the dashboard at indexed database views.
+This is a 30-minute change-checking dashboard, not instantaneous streaming. A separate receiving service/data store would be needed for faster push ingestion. Kobo REST Services sends newly created submissions but not edits, so that future architecture must also reconcile edits and deletions periodically. No receiving service is provisioned by this upgrade.
+
+## Interactive reporting (September 2026)
+
+- Click a chart category, slice or monthly point, or select a summary-table row, to open linked **Age & gender**, **Referrals**, **Locations**, **Submission trend**, and **Records** panels. Main report totals remain unchanged. Drill-down records are deduplicated by stable submission ID; they are not unique-beneficiary counts.
+- Referral details count distinct submission/partner pairs. One submission may include multiple partners. CPV charts represent submission volume, not service quality.
+- Use **Table options** to search a summary or switch to a page-width **Wrapped reading view** for long descriptions. Interactive grids support sorting, resizing and native column controls. Row selection is disabled in the wrapped reading view.
+- **Clear selection** clears exploration; **Reset view** also resets report filters and navigation. Selection keys are invalidated when search results, chart contents or the underlying report context change.
+- **All dates**, **Today**, **This week** (Monday onward), **This month**, **Last 30 days**, and **Custom** are available. Presets use the East Africa calendar and recalculate on a full interaction or applied update. Custom dates stay fixed. Empty periods are not silently shortened to match available data.
+- The Overview includes an expandable comparison against the preceding equal-length calendar period, using the same location filters. A warning identifies incomplete historical coverage. Zero baselines do not produce infinite percentage changes.
+- The DQA quick check links issues to non-PII audit records across all source submissions, including exclusions. CPV names outside the existing harmonization map are flagged for review, not automatically merged or classified as incorrect.
+
+### Update the deployed app
+
+Replace `helpdesklive.py` and `requirements.txt`, and add `.streamlit/config.toml` (merge its `[client]` setting if a config already exists). This upgrade is tested with Streamlit 1.63 and requires `streamlit>=1.63,<1.64` for the export control and current interactive-table APIs. Keep the existing assets, data files and real secrets unchanged. It does not require new secrets.
+
+Run `python -m unittest discover -s tests -v` after installing requirements. The interaction tests use synthetic data and stub the source loader and authentication; they never call Kobo or load a real beneficiary workbook. Live authentication and API permissions must still be verified in the deployment.
+
+### Python 3.14 startup compatibility
+
+Use the updated `requirements.txt`, which requires Altair 6 and `typing_extensions>=4.15`. Altair 5.5 can fail at import on Python 3.14 in `StepKwds(TypedDict, closed=True, ...)`; this is fixed in [Altair 6](https://github.com/vega/altair/releases/tag/v6.0.0). Updating only `helpdesklive.py` or only `typing_extensions` does not resolve the Altair 5 import path.
+
+Verified locally on Windows with Python 3.14.7, Altair 6.2.2, Streamlit 1.63.0 and pandas 2.3.3: all 22 synthetic-data regression tests pass, compilation succeeds and `pip check` reports no dependency conflicts. These checks do not connect to the live Kobo database or deploy the app.
+
+For Streamlit Community Cloud, commit the updated `requirements.txt` beside `helpdesklive.py` and let dependency installation finish. If the app still uses the old environment, reboot it from **Manage app**. No Python downgrade or new secrets are needed for this fix. See [Streamlit's dependency update guidance](https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app/upgrade-streamlit). If another dependency file such as `uv.lock` or `Pipfile` controls your deployment, update that file too; Community Cloud uses only the first supported dependency file it finds.
 
 ## Further production enhancements
 
