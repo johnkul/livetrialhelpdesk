@@ -3822,12 +3822,42 @@ def style_total_table(table, label_column):
     )
 
 
+def format_records_date(value):
+    """Format a table date without allowing malformed source data to crash the UI."""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        return str(value)
+
+    parsed_value = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed_value):
+        # Preserve unexpected values so they remain visible during DQA rather
+        # than silently hiding the source-data problem.
+        return str(value)
+    return parsed_value.strftime("%d %b %Y")
+
+
+def records_table_date_columns(table):
+    """Return genuine date fields, excluding descriptors such as date_source."""
+    date_columns = []
+    for column in table.columns:
+        normalized_name = str(column).strip().casefold().replace(" ", "_")
+        if (
+            pd.api.types.is_datetime64_any_dtype(table[column])
+            or normalized_name == "date"
+            or normalized_name.endswith("_date")
+        ):
+            date_columns.append(column)
+    return date_columns
+
+
 def style_records_table(table):
     display_table = table.copy()
-    date_columns = [col for col in display_table.columns if "date" in col.lower()]
+    date_columns = records_table_date_columns(display_table)
     numeric_columns = display_table.select_dtypes(include="number").columns.tolist()
     gps_columns = [col for col in display_table.columns if col in ["gps_latitude", "gps_longitude", "lat", "lon"]]
-    formatters = {col: (lambda value: "" if pd.isna(value) else pd.to_datetime(value).strftime("%d %b %Y")) for col in date_columns}
+    formatters = {col: format_records_date for col in date_columns}
     for col in numeric_columns:
         if col in gps_columns:
             formatters[col] = "{:,.6f}"
