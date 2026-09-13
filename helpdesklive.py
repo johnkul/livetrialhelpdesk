@@ -4433,29 +4433,30 @@ def render_selection_panel(detail, values, key, referrals, selection_key=None):
                 st.altair_chart(polish_chart(chart), width="stretch")
 
 
-def render_selectable_chart(chart, frame, category_column, chart_field=None):
+def render_selectable_chart(chart, frame, category_column, chart_field=None, compact_controls=False):
     field = chart_field or category_column
     chart_signature = hashlib.sha256(chart.to_json().encode()).hexdigest()[:12]
     key = interaction_key("chart:" + category_column) + chart_signature
-    render_chart_panel(chart, frame, category_column, field, key)
+    render_chart_panel(chart, frame, category_column, field, key, compact_controls)
 
 
 @st.fragment
-def render_chart_panel(chart, frame, category_column, field, key):
+def render_chart_panel(chart, frame, category_column, field, key, compact_controls=False):
     point = alt.selection_point(name="detail_pick", fields=[field], toggle=False, on="click", clear="dblclick")
     event = st.altair_chart(
         polish_chart(chart.add_params(point)), width="stretch", key=selection_widget_key(key),
         on_select=lambda: clear_keyboard_selection(selection_widget_key(key)), selection_mode="detail_pick",
     )
-    st.caption("Click a bar, slice or point for details. Double-click to deselect.")
     selected = selection_values(event, "detail_pick", field)
-    with st.popover("Explore chart"):
-        st.caption("Search all categories in the current report, including those outside the displayed ranking.")
-        choices = sorted(frame[category_column].dropna().astype(str).unique().tolist())
-        keyboard_choice = st.selectbox("Find a category", choices, index=None,
-                                        key=selection_widget_key(key) + "_picker")
-    if keyboard_choice is not None:
-        selected = [keyboard_choice]
+    if not compact_controls:
+        st.caption("Click a bar, slice or point for details. Double-click to deselect.")
+        with st.popover("Explore chart"):
+            st.caption("Search all categories in the current report, including those outside the displayed ranking.")
+            choices = sorted(frame[category_column].dropna().astype(str).unique().tolist())
+            keyboard_choice = st.selectbox("Find a category", choices, index=None,
+                                            key=selection_widget_key(key) + "_picker")
+        if keyboard_choice is not None:
+            selected = [keyboard_choice]
     if selected:
         show_selection_details(frame, category_column, selected, key, selection_key=key)
 
@@ -4530,26 +4531,49 @@ def submission_trend_table(frame):
 
 
 def render_overview_panels(frame):
-    trend_column, intervention_column = st.columns([1.15, 1], gap="medium")
-    with trend_column, st.container(border=True, key="overview_trend_card"):
+    """A report-first landing page: one wide trend, then exact intervention totals."""
+    with st.container(key="overview_trend_report"):
         st.subheader("Submission trend")
-        if chart_table_view("overview_trend") == "Chart":
-            draw_submission_trend(frame)
-        else:
-            trend = submission_trend_table(frame)
-            selected = render_dashboard_table(trend, label_column="Month", compact_panel=True)
-            if selected is not None:
-                detail = frame.assign(report_month=pd.to_datetime(frame["reporting_date"], errors="coerce").dt.strftime("%Y-%m"))
-                show_selection_details(detail, "report_month", [selected], interaction_key("overview_month_detail"))
-    with intervention_column, st.container(border=True, key="overview_intervention_card"):
+        st.caption("Monthly submissions · select a point to inspect its records")
+        draw_submission_trend(frame, compact_controls=True)
+        with st.expander("View monthly totals", on_change="rerun", key="overview_monthly_totals") as panel:
+            if panel.open:
+                trend = submission_trend_table(frame)
+                selected = render_dashboard_table(trend, label_column="Month", compact_panel=True)
+                if selected is not None:
+                    detail = frame.assign(report_month=pd.to_datetime(frame["reporting_date"], errors="coerce").dt.strftime("%Y-%m"))
+                    show_selection_details(detail, "report_month", [selected], interaction_key("overview_month_detail"))
+    with st.container(key="overview_intervention_report"):
         st.subheader("Type of Intervention Sort")
-        if chart_table_view("overview_intervention") == "Chart":
-            draw_request_type_bar(frame, height=280)
-        else:
-            selected = render_dashboard_table(intervention_summary_table(frame), label_column="Intervention", selection_column="_category", compact_panel=True)
-            st.caption("Share is based on all submissions in the current report filters. Open details for age and gender breakdowns.")
-            if selected is not None:
-                show_selection_details(frame, "request_category", [selected], interaction_key("overview_intervention_detail"))
+        st.caption("Each submission contributes once. Share is of all submissions in the selected dates and locations.")
+        table = intervention_summary_table(frame)
+        if table.empty:
+            st.info("No interventions match the selected filters.")
+            return
+        rows = []
+        for _, row in table.iterrows():
+            total = row["_category"] == "Total"
+            share = float(row["Share (%)"])
+            bar = "" if total else f'<span class="intervention-share-track" aria-hidden="true"><span style="width:{max(0, min(100, share)):.2f}%"></span></span>'
+            rows.append(
+                f'<tr class="{"intervention-total" if total else "intervention-row"}">'
+                f'<th scope="row">{escape_text(row["Intervention"])}</th>'
+                f'<td class="intervention-count">{int(row["Submissions"]):,}</td>'
+                f'<td><div class="intervention-share">{bar}<span>{share:.1f}%</span></div></td></tr>'
+            )
+        st.html('<div class="intervention-report-table"><table><caption class="table-accessible-caption">Intervention submissions and share for the current report filters</caption>'
+                '<thead><tr><th scope="col">Intervention</th><th scope="col">Submissions</th><th scope="col">Share (%)</th></tr></thead>'
+                f'<tbody>{"".join(rows)}</tbody></table></div>')
+        picker_key = interaction_key("overview_intervention_pick")
+        with st.popover("View intervention details"):
+            options = table.loc[table["_category"].ne("Total"), "_category"].tolist()
+            labels = dict(zip(table["_category"], table["Intervention"]))
+            selected = st.selectbox("Intervention", options, index=None, format_func=lambda v: labels[v],
+                                    key=picker_key)
+        if selected is not None:
+            st.button("Clear intervention selection", key=picker_key + "_clear",
+                      on_click=st.session_state.pop, args=(picker_key, None))
+            show_selection_details(frame, "request_category", [selected], interaction_key("overview_intervention_detail"))
 
 
 def show_section_findings(section, frame, protection_frame, information_frame, referral_frame):
@@ -5072,7 +5096,7 @@ def draw_status_donut_pair(frame, status_column, height=300):
     render_selectable_chart(status_chart + status_labels, frame, status_column)
 
 
-def draw_submission_trend(frame):
+def draw_submission_trend(frame, compact_controls=False):
     if frame.empty:
         st.info("No submissions in this period.")
         return
@@ -5082,12 +5106,13 @@ def draw_submission_trend(frame):
     if chart_data.empty:
         st.info("No usable submission dates.")
         return
-    chart = alt.Chart(chart_data).mark_line(point=True, color="#2F7D69").encode(
-        x=alt.X("Month:N", title=None, sort=chart_data["Month"].tolist(), axis=alt.Axis(labelAngle=0, labelOverlap=True)),
+    chart_data["Month label"] = pd.to_datetime(chart_data["Month"], format="%Y-%m").dt.strftime("%b %Y")
+    chart = alt.Chart(chart_data).mark_line(point=alt.OverlayMarkDef(size=48, filled=True), color="#2F7D69", strokeWidth=2.5).encode(
+        x=alt.X("Month label:N", title=None, sort=chart_data["Month label"].tolist(), axis=alt.Axis(labelAngle=0, labelOverlap=True)),
         y=alt.Y("Submissions:Q", axis=alt.Axis(tickMinStep=1)),
-        tooltip=["Month:N", "Submissions:Q"],
-    ).properties(height=280)
-    render_selectable_chart(chart, detail, "report_month", "Month")
+        tooltip=[alt.Tooltip("Month label:N", title="Month"), "Submissions:Q"],
+    ).properties(height=220 if compact_controls else 280)
+    render_selectable_chart(chart, detail, "report_month", "Month", compact_controls=compact_controls)
 
 
 def draw_monthly_gender_column_bar(frame, height=340):
@@ -5336,6 +5361,17 @@ def render_report_context(section, count, from_date, to_date, camps, helpdesks, 
     title = "Current report selection"
     count_label = f"{count:,} matching submissions"
     note = "These dates and locations apply across report sections."
+    if section == "Overview":
+        st.markdown(
+            '<div class="report-selection" role="region" aria-label="Report selection">'
+            '<div class="overview-filter-line">'
+            f'<span><b>Submission period</b> {escape_text(period)}</span>'
+            f'<span><b>Camp</b> {escape_text(camp_label)}</span>'
+            f'<span><b>Helpdesk</b> {escape_text(helpdesk_label)}</span></div>'
+            f'<span class="table-accessible-caption">{count:,} matching submissions</span></div>',
+            unsafe_allow_html=True,
+        )
+        return
     if section == "DQA":
         title = "Source audit · all submissions"
         count_label = f"{audit_count:,} source submissions"
@@ -5368,6 +5404,17 @@ def navigate_helpdesk_section(section):
 
 def kpi_group_caption(text):
     st.markdown(f'<div class="kpi-group-caption">{escape_text(text)}</div>', unsafe_allow_html=True)
+
+
+def render_overview_metrics(total, staff, referrals, follow_up):
+    items = [("Submissions", total, "In this report"), ("Active CPVs", staff, "With recorded submissions"),
+             ("Partner referrals", referrals, f"{format_rate(referrals, total)} of submissions"),
+             ("Follow-up required", follow_up, f"{format_rate(follow_up, total)} of submissions")]
+    cells = []
+    for label, value, context in items:
+        cells.append(f'<div class="overview-metric"><dt>{escape_text(label)}</dt>'
+                     f'<dd>{escape_text(format_number(value))}</dd><span>{escape_text(context)}</span></div>')
+    st.html('<dl class="overview-metric-strip" aria-label="Report headline figures">' + "".join(cells) + '</dl>')
 
 
 def show_kpi_card(column, label, value, context, share=None, accent="var(--accent-base)"):
@@ -6265,12 +6312,18 @@ header_html = (
     '<div class="app-header-subtitle">Protection helpdesk monitoring &middot; Turkana West &amp; Dadaab</div>'
     '</div></div>'
 )
-if hasattr(st, "html"):
-    st.html(header_html)
+if selected_tab == "Overview":
+    st.html('<header class="overview-report-header"><div>'
+            '<div class="overview-eyebrow">TDH KENYA · PROTECTION HELPDESKS</div>'
+            '<h1>Helpdesk overview</h1>'
+            '<p>Turkana West &amp; Dadaab</p></div>'
+            f'<div class="overview-update"><span>Last data update</span><strong>{escape_text(last_updated)}</strong></div></header>')
 else:
-    st.markdown(header_html, unsafe_allow_html=True)
-
-helpdesk_section_intro(selected_tab, total_records)
+    if hasattr(st, "html"):
+        st.html(header_html)
+    else:
+        st.markdown(header_html, unsafe_allow_html=True)
+    helpdesk_section_intro(selected_tab, total_records)
 render_report_context(
     selected_tab, total_records, from_date, to_date,
     selected_camp_locations, selected_helpdesk_locations, audit_count=len(dqa_records),
@@ -6285,13 +6338,7 @@ if filtered_records.empty and selected_tab not in {"DQA", "Overview"}:
 # deliberately omitted from analytical sections so users reach their data
 # immediately without repeatedly scrolling past the same summary cards.
 if selected_tab == "Overview":
-    st.caption(f"Last successful data update: {last_updated}")
-    with st.container(key="overview_headlines"):
-        headline = st.columns(4)
-        show_kpi_card(headline[0], "Submissions", format_number(total_records), "In the selected period and locations")
-        show_kpi_card(headline[1], "Active CPVs", format_number(staff_no), "Staff who submitted records")
-        show_kpi_card(headline[2], "Partner referrals", format_number(partner_referrals), format_rate(partner_referrals, total_records))
-        show_kpi_card(headline[3], "Follow-up required", format_number(follow_up), format_rate(follow_up, total_records))
+    render_overview_metrics(total_records, staff_no, partner_referrals, follow_up)
 if selected_tab != "Overview":
     st.button("← Back to Overview", key="helpdesk_back_to_overview", on_click=helpdesk_go_to_overview)
     show_section_findings(selected_tab, filtered_records, filtered_protection, filtered_information, filtered_referrals)
@@ -6301,15 +6348,16 @@ if selected_tab != "Overview":
 # -----------------------------------------------------------------------------
 if selected_tab == "Overview":
     render_overview_panels(filtered_records)
-    st.markdown("### Explore further")
-    links = st.columns(4)
-    for column, label, target in zip(links,
-            ["People & visits", "Location coverage", "Disability analysis", "Staff / CPV summary"],
-            ["People & Visits", "Locations", "Disability", "CPV Work"]):
-        column.button(label, key="overview_go_" + target, width="stretch",
-                      on_click=navigate_helpdesk_section, args=(target,))
-    show_section_findings(selected_tab, filtered_records, filtered_protection, filtered_information, filtered_referrals)
-    show_period_comparison(records, filters, min_date)
+    with st.expander("Detailed reports & analysis", expanded=False, on_change="rerun", key="overview_more_analysis") as more:
+        if more.open:
+            links = st.columns(4)
+            for column, label, target in zip(links,
+                    ["People & visits", "Location coverage", "Disability analysis", "Staff / CPV summary"],
+                    ["People & Visits", "Locations", "Disability", "CPV Work"]):
+                column.button(label, key="overview_go_" + target, width="stretch",
+                              on_click=navigate_helpdesk_section, args=(target,))
+            show_section_findings(selected_tab, filtered_records, filtered_protection, filtered_information, filtered_referrals)
+            show_period_comparison(records, filters, min_date)
 
 if selected_tab == "People & Visits":
     st.subheader("Age group by gender")
