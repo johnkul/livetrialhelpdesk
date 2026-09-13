@@ -4144,7 +4144,7 @@ def render_wrapped_table(table, label_column=None, max_height=560):
         if column == "Total":
             classes.append("total-col")
         class_attr = f' class="{" ".join(classes)}"' if classes else ""
-        header_cells.append(f"<th{class_attr}>{escape_text(column)}</th>")
+        header_cells.append(f'<th scope="col"{class_attr}>{escape_text(column)}</th>')
 
     body_rows = []
     for _, row in display_table.iterrows():
@@ -4157,7 +4157,7 @@ def render_wrapped_table(table, label_column=None, max_height=560):
 
         for column in columns:
             value = row[column]
-            display_value = display_table_value(value)
+            display_value = f"{value:.1f}%" if str(column).endswith("(%)") and pd.notna(value) else display_table_value(value)
             classes = []
 
             if column == label_column or column == columns[0]:
@@ -4170,19 +4170,19 @@ def render_wrapped_table(table, label_column=None, max_height=560):
                 classes.append("missing")
 
             class_attr = f' class="{" ".join(classes)}"' if classes else ""
-            cells.append(f"<td{class_attr}>{escape_text(display_value)}</td>")
+            tag = "th" if column == label_column else "td"
+            scope = ' scope="row"' if tag == "th" else ""
+            cells.append(f"<{tag}{scope}{class_attr}>{escape_text(display_value)}</{tag}>")
 
         body_rows.append(f"<tr{row_class}>{''.join(cells)}</tr>")
 
-    # Reserve the table's rendered height explicitly. Relying only on
-    # max-height can let Streamlit measure the Markdown block before the custom
-    # table finishes laying out, causing the following subsection to overlap it.
-    natural_height = 50 + (len(display_table) * 41)
-    wrapper_height = min(int(max_height), max(92, natural_height))
+    # st.html measures normal-flow content. Do not reserve single-line heights
+    # for wrapping rows: that clips content or creates blank space below tables.
     table_html = (
-        f'<div class="dashboard-table-wrap" '
-        f'style="height: {wrapper_height}px; max-height: {int(max_height)}px;">'
+        f'<div class="dashboard-table-wrap" tabindex="0" role="region" aria-label="Scrollable summary table" '
+        f'style="max-height: {int(max_height)}px;">'
         + '<table class="dashboard-table">'
+        + f'<caption class="table-accessible-caption">{escape_text(label_column or "Summary")} breakdown for the current report filters</caption>'
         + f"<thead><tr>{''.join(header_cells)}</tr></thead>"
         + f"<tbody>{''.join(body_rows)}</tbody>"
         + "</table></div>"
@@ -4199,7 +4199,7 @@ def public_drilldown_records(frame, category_column, values):
     if category_column not in frame.columns or not values:
         return pd.DataFrame(columns=[c for c in PUBLIC_RECORD_COLUMNS if c in frame.columns])
     candidates = frame[category_column].map(clean_text).fillna("[Missing]").astype(str)
-    selected = {str(value) for value in values}
+    selected = {"[Missing]" if pd.isna(clean_text(value)) else str(clean_text(value)) for value in values}
     matched = frame[candidates.isin(selected) | candidates.map(display_category_value).isin(selected)]
     approved = matched[[c for c in PUBLIC_RECORD_COLUMNS if c in matched.columns]].copy()
     if "record_id" in approved.columns:
@@ -4220,27 +4220,33 @@ def clear_keyboard_selection(widget_key):
     st.session_state[widget_key + "_picker"] = None
 
 
-def render_dashboard_table(table, label_column=None, max_height=560, selection_column=None):
+def render_dashboard_table(table, label_column=None, max_height=560, selection_column=None, compact_panel=False):
     """Show all summary rows for the report filters, with accessible drilldowns."""
     if table.empty:
         st.info("No records match the selected filters.")
         return None
     identity = selection_column or label_column
     key = interaction_key("table:" + str(label_column) + repr(list(table.columns)))
-    with st.popover("Table display"):
-        long_text = label_column in table and table[label_column].astype(str).str.len().max() > 90
-        density = st.radio("Reading layout", ["Compact", "Comfortable", "Wrapped"],
-                           index=2 if long_text else 0, key=key + "_layout")
+    # Long labels wrap automatically; short labels retain native row selection.
+    long_text = label_column in table and table[label_column].astype(str).str.len().max() > 55
     view = table.reset_index(drop=True)
+    if len(view) > 25:
+        pages = (len(view) + 24) // 25
+        page_context = hashlib.sha256(view.to_json(date_format="iso").encode()).hexdigest()[:12]
+        page = int(st.number_input("Table page", min_value=1, max_value=pages, value=1, step=1,
+                                   key=key + "_page_" + page_context))
+        start = (page - 1) * 25
+        st.caption(f"Rows {start + 1}–{min(start + 25, len(view))} of {len(view):,} · page {page} of {pages}")
+        view = view.iloc[start:start + 25].reset_index(drop=True)
     visible = view.drop(columns=[selection_column], errors="ignore") if selection_column else view
     row_signature = hashlib.sha256(view.to_json(date_format="iso").encode()).hexdigest()[:12]
     base_key = key + row_signature
     selected = None
-    if density == "Wrapped":
+    if long_text or compact_panel:
         render_wrapped_table(visible, label_column=label_column, max_height=max_height)
     else:
-        row_height = 38 if density == "Compact" else 64
-        config = {column: st.column_config.NumberColumn(width="small")
+        row_height = 44
+        config = {column: st.column_config.NumberColumn(width="small", format="%.1f%%" if str(column).endswith("(%)") else None)
                   if pd.api.types.is_numeric_dtype(visible[column])
                   else st.column_config.TextColumn(width="large" if column == label_column else "medium")
                   for column in visible}
@@ -4265,7 +4271,7 @@ def render_dashboard_table(table, label_column=None, max_height=560, selection_c
                 label += f" · {row['Latitude']}, {row['Longitude']}"
             labels[row[identity]] = label
         # Native selector is accessible by keyboard and works with wrapped HTML.
-        with st.popover("Open row details"):
+        with st.popover("View details"):
             chosen = st.selectbox("Choose a row", values, index=None,
                                   format_func=lambda v: labels[v],
                                   key=selection_widget_key(base_key) + "_picker",
@@ -4462,6 +4468,99 @@ def show_gender_table(frame, category_column, category_label, top_n=None):
     selected = render_dashboard_table(table, label_column=category_label)
     if selected is not None:
         show_selection_details(frame, category_column, [selected], interaction_key("detail:" + category_column))
+
+
+def chart_table_view(key):
+    return st.radio("Presentation", ["Chart", "Table"], horizontal=True,
+                    key=key + "_view", label_visibility="collapsed")
+
+
+def show_gender_panel(frame, category_column, category_label, key, status=False):
+    """Render only the requested representation of the same breakdown."""
+    if chart_table_view(key) == "Chart":
+        if status:
+            draw_status_donut_pair(frame, category_column, height=300)
+        else:
+            draw_gender_column_bar(frame, category_column, height=320)
+    else:
+        show_gender_table(frame, category_column, category_label)
+
+
+def show_ranked_gender_panel(frame, category_column, category_label, key):
+    if chart_table_view(key) == "Table":
+        st.caption("All categories for the current report filters; chart ranking limits do not apply.")
+        show_gender_table(frame, category_column, category_label)
+        return
+    with st.popover("Chart options"):
+        rank = st.radio("Rank", ["Highest values", "Lowest values"], key=key + "_rank")
+        top_n = st.selectbox("Number of categories", [5, 10, 15, 20, 25], index=2, key=key + "_top_n")
+    draw_gender_bar(frame, category_column, top_n=top_n, height=520, ascending=rank == "Lowest values")
+
+
+def show_age_gender_panel(frame, category_column, selected, category_label, key):
+    if chart_table_view(key) == "Chart":
+        draw_age_gender_breakdown_bar(frame, category_column, selected, category_label, height=320)
+    else:
+        show_age_gender_breakdown_table(frame, category_column, selected, category_label)
+
+
+def intervention_summary_table(frame):
+    columns = ["_category", "Intervention", "Submissions", "Share (%)"]
+    if frame.empty or "request_category" not in frame:
+        return pd.DataFrame(columns=columns)
+    counts = frame["request_category"].fillna("[Missing]").astype(str).value_counts()
+    table = counts.rename_axis("_category").reset_index(name="Submissions")
+    table["Intervention"] = table["_category"].replace({
+        "Reporting a protection concern": "Protection concern",
+        "Seeking general protection information": "General information",
+    })
+    table["Share (%)"] = table["Submissions"] / len(frame) * 100
+    total = pd.DataFrame([["Total", "Total", len(frame), 100.0]], columns=columns)
+    return pd.concat([table[columns], total], ignore_index=True)
+
+
+def submission_trend_table(frame):
+    if frame.empty or "reporting_date" not in frame:
+        return pd.DataFrame(columns=["Month", "Submissions"])
+    counts = pd.to_datetime(frame["reporting_date"], errors="coerce").dt.strftime("%Y-%m").value_counts().sort_index()
+    if counts.empty:
+        return pd.DataFrame(columns=["Month", "Submissions"])
+    months = pd.period_range(counts.index.min(), counts.index.max(), freq="M").astype(str)
+    return counts.reindex(months, fill_value=0).rename_axis("Month").reset_index(name="Submissions")
+
+
+def render_overview_panels(frame):
+    trend_column, intervention_column = st.columns([1.15, 1], gap="medium")
+    with trend_column, st.container(border=True, key="overview_trend_card"):
+        st.subheader("Submission trend")
+        if chart_table_view("overview_trend") == "Chart":
+            draw_submission_trend(frame)
+        else:
+            trend = submission_trend_table(frame)
+            selected = render_dashboard_table(trend, label_column="Month", compact_panel=True)
+            if selected is not None:
+                detail = frame.assign(report_month=pd.to_datetime(frame["reporting_date"], errors="coerce").dt.strftime("%Y-%m"))
+                show_selection_details(detail, "report_month", [selected], interaction_key("overview_month_detail"))
+    with intervention_column, st.container(border=True, key="overview_intervention_card"):
+        st.subheader("Type of Intervention Sort")
+        if chart_table_view("overview_intervention") == "Chart":
+            draw_request_type_bar(frame, height=280)
+        else:
+            selected = render_dashboard_table(intervention_summary_table(frame), label_column="Intervention", selection_column="_category", compact_panel=True)
+            st.caption("Share is based on all submissions in the current report filters. Open details for age and gender breakdowns.")
+            if selected is not None:
+                show_selection_details(frame, "request_category", [selected], interaction_key("overview_intervention_detail"))
+
+
+def show_section_findings(section, frame, protection_frame, information_frame, referral_frame):
+    with st.expander("Findings from the current tables", expanded=False,
+                     on_change="rerun", key="section_findings_open") as panel:
+        if panel.open:
+            findings = build_helpdesk_findings(section, frame, protection_frame, information_frame, referral_frame)
+            st.caption("A summary of the selected data. These patterns do not establish causes.")
+            if section == "DQA":
+                st.caption("These findings use the report filters; the source audit below includes all submissions.")
+            st.markdown(findings)
 
 
 def age_breakdown_options(frame, category_column):
@@ -4894,7 +4993,7 @@ def draw_request_type_bar(frame, height=190):
             title=None,
             axis=alt.Axis(labelLimit=360, labelFontSize=12, labelPadding=8),
         ),
-        x=alt.X("Records:Q", title="Records", scale=alt.Scale(domain=[0, x_upper], nice=False)),
+        x=alt.X("Records:Q", title="Submissions", axis=alt.Axis(tickMinStep=1), scale=alt.Scale(domain=[0, x_upper], nice=False)),
     )
 
     bars = base.mark_bar(cornerRadiusEnd=6, opacity=0.94, stroke="#FFFFFF", strokeWidth=0.7).encode(
@@ -4979,15 +5078,12 @@ def draw_submission_trend(frame):
         return
     detail = frame.copy()
     detail["report_month"] = pd.to_datetime(detail["reporting_date"], errors="coerce").dt.strftime("%Y-%m")
-    counts = detail["report_month"].value_counts().sort_index()
-    if counts.empty:
+    chart_data = submission_trend_table(frame)
+    if chart_data.empty:
         st.info("No usable submission dates.")
         return
-    months = pd.period_range(counts.index.min(), counts.index.max(), freq="M").astype(str)
-    counts = counts.reindex(months, fill_value=0)
-    chart_data = counts.rename_axis("Month").reset_index(name="Submissions")
     chart = alt.Chart(chart_data).mark_line(point=True, color="#2F7D69").encode(
-        x=alt.X("Month:N", title=None, sort=months.tolist()),
+        x=alt.X("Month:N", title=None, sort=chart_data["Month"].tolist(), axis=alt.Axis(labelAngle=0, labelOverlap=True)),
         y=alt.Y("Submissions:Q", axis=alt.Axis(tickMinStep=1)),
         tooltip=["Month:N", "Submissions:Q"],
     ).properties(height=280)
@@ -5171,6 +5267,8 @@ def section_header(title, note=None):
 
 HELPDESK_SECTION_META = {
     "Overview": ("🏠", "Overview", "Review overall volume, intervention types, demographics and location coverage."),
+    "People & Visits": ("👤", "People & Visits", "Explore age, gender, visits and disability prevalence for the selected submissions."),
+    "Locations": ("📍", "Location Coverage", "Compare submissions across camps and helpdesks."),
     "CPV Work": ("👥", "Staff / CPV Performance", "Compare staff workload, requests, referrals, follow-up and operating coverage."),
     "Disability": ("♿", "Disability Inclusion", "Review disability prevalence, impairment types and single versus multiple impairments."),
     "Concerns": ("🛡️", "Protection Concerns", "Explore reported protection concerns, rankings and age/gender patterns."),
@@ -5181,7 +5279,7 @@ HELPDESK_SECTION_META = {
     "Records": ("📄", "Records", "Search and inspect approved records in a read-only view."),
 }
 HELPDESK_SECTION_GROUPS = {
-    "Summary": ["Overview"],
+    "Summary": ["Overview", "People & Visits", "Locations"],
     "CPVs Submissions": ["CPV Work"],
     "Service Requests": ["Disability", "Concerns", "Information", "Referrals"],
     "Operations & Data": ["Map", "DQA", "Records"],
@@ -5262,6 +5360,10 @@ def render_report_context(section, count, from_date, to_date, camps, helpdesks, 
 def helpdesk_go_to_overview():
     st.session_state["helpdesk_section_category"] = "Summary"
     st.session_state["helpdesk_section"] = "Overview"
+
+
+def navigate_helpdesk_section(section):
+    st.session_state["helpdesk_section"] = section
 
 
 def kpi_group_caption(text):
@@ -6183,63 +6285,52 @@ if filtered_records.empty and selected_tab not in {"DQA", "Overview"}:
 # deliberately omitted from analytical sections so users reach their data
 # immediately without repeatedly scrolling past the same summary cards.
 if selected_tab == "Overview":
-    headline = st.columns(4)
-    show_kpi_card(headline[0], "Submissions", format_number(total_records), "In the selected period and locations")
-    show_kpi_card(headline[1], "Active CPVs", format_number(staff_no), "Staff who submitted records")
-    show_kpi_card(headline[2], "Partner referrals", format_number(partner_referrals), format_rate(partner_referrals, total_records))
-    show_kpi_card(headline[3], "Follow-up required", format_number(follow_up), format_rate(follow_up, total_records))
+    st.caption(f"Last successful data update: {last_updated}")
+    with st.container(key="overview_headlines"):
+        headline = st.columns(4)
+        show_kpi_card(headline[0], "Submissions", format_number(total_records), "In the selected period and locations")
+        show_kpi_card(headline[1], "Active CPVs", format_number(staff_no), "Staff who submitted records")
+        show_kpi_card(headline[2], "Partner referrals", format_number(partner_referrals), format_rate(partner_referrals, total_records))
+        show_kpi_card(headline[3], "Follow-up required", format_number(follow_up), format_rate(follow_up, total_records))
 if selected_tab != "Overview":
     st.button("← Back to Overview", key="helpdesk_back_to_overview", on_click=helpdesk_go_to_overview)
-with st.expander("Findings from the current tables", expanded=False,
-                 on_change="rerun", key="section_findings_open") as findings_panel:
-    if findings_panel.open:
-        section_findings = build_helpdesk_findings(
-            selected_tab, filtered_records, filtered_protection, filtered_information, filtered_referrals
-        )
-        st.caption("A summary of the selected data. These patterns do not establish causes.")
-        if selected_tab == "DQA":
-            st.caption("These findings use the report filters; the source audit below includes all submissions.")
-        st.markdown(section_findings)
+    show_section_findings(selected_tab, filtered_records, filtered_protection, filtered_information, filtered_referrals)
 
 # -----------------------------------------------------------------------------
 # Overview tab
 # -----------------------------------------------------------------------------
 if selected_tab == "Overview":
-    overview_view = st.radio("Overview detail", ["Summary", "Visits", "Demographics", "Locations", "Disability"],
-                             horizontal=True, key="overview_detail")
-    if overview_view == "Summary":
-        st.subheader("Submission trend")
-        draw_submission_trend(filtered_records)
-        st.subheader("Type of Intervention Sort")
-        draw_request_type_bar(filtered_records, height=190)
-        with st.expander("View intervention breakdown", on_change="rerun", key="overview_request_table") as panel:
-            if panel.open:
-                show_gender_table(filtered_records, "request_category", "Type of Intervention")
-        show_period_comparison(records, filters, min_date)
-    elif overview_view == "Visits":
-        st.subheader("First-time and repeat visits")
-        st.caption("Visit status is recorded per submission; this is not a count of unique people.")
-        draw_gender_column_bar(known_visit_records, "helpdesk_visit_history", height=300)
-        show_gender_table(known_visit_records, "helpdesk_visit_history", "Visit history")
-        repeat_records = known_visit_records[known_visit_records["helpdesk_visit_history"].eq("Repeat visitor")]
-        if not repeat_records.empty:
-            st.subheader("Repeat visit timing")
-            draw_gender_column_bar(repeat_records, "repeat_visit_timing", height=300)
-            show_gender_table(repeat_records, "repeat_visit_timing", "Repeat visit timing")
-    elif overview_view == "Demographics":
-        st.subheader("Age group by gender")
-        draw_gender_column_bar(filtered_records, "age_group", height=380)
-        show_gender_table(filtered_records, "age_group", "Age group")
-    elif overview_view == "Locations":
-        st.subheader("Submissions by location")
-        show_gender_table(filtered_records, "camp_location", "Camp")
-        draw_gender_column_bar(filtered_records, "helpdesk_location", height=400)
-        show_gender_table(filtered_records, "helpdesk_location", "Helpdesk")
-    else:
-        st.subheader("Disability inclusion")
-        draw_status_donut_pair(filtered_records, "disability_status", height=280)
-        show_gender_table(filtered_records, "disability_status", "Disability status")
-        st.caption("Choose Disability Inclusion in Dashboard section for full impairment analysis.")
+    render_overview_panels(filtered_records)
+    st.markdown("### Explore further")
+    links = st.columns(4)
+    for column, label, target in zip(links,
+            ["People & visits", "Location coverage", "Disability analysis", "Staff / CPV summary"],
+            ["People & Visits", "Locations", "Disability", "CPV Work"]):
+        column.button(label, key="overview_go_" + target, width="stretch",
+                      on_click=navigate_helpdesk_section, args=(target,))
+    show_section_findings(selected_tab, filtered_records, filtered_protection, filtered_information, filtered_referrals)
+    show_period_comparison(records, filters, min_date)
+
+if selected_tab == "People & Visits":
+    st.subheader("Age group by gender")
+    show_gender_panel(filtered_records, "age_group", "Age group", "people_age")
+    st.subheader("First-time and repeat visits")
+    st.caption("Visit status is recorded per submission; this is not a count of unique people.")
+    show_gender_panel(known_visit_records, "helpdesk_visit_history", "Visit history", "people_visits")
+    repeat_records = known_visit_records[known_visit_records["helpdesk_visit_history"].eq("Repeat visitor")]
+    if not repeat_records.empty:
+        st.subheader("Repeat visit timing")
+        show_gender_panel(repeat_records, "repeat_visit_timing", "Repeat visit timing", "people_repeat")
+    st.subheader("Disability prevalence")
+    st.caption("Includes submissions with and without disability. Detailed impairment analysis is available in Disability Inclusion.")
+    show_gender_panel(filtered_records, "disability_status", "Disability status", "people_disability", status=True)
+
+if selected_tab == "Locations":
+    st.subheader("Submissions by camp")
+    show_gender_panel(filtered_records, "camp_location", "Camp", "coverage_camp")
+    st.subheader("Submissions by helpdesk")
+    show_gender_panel(filtered_records, "helpdesk_location", "Helpdesk", "coverage_helpdesk")
+    st.button("Open service map", key="coverage_map", on_click=navigate_helpdesk_section, args=("Map",))
 
 # -----------------------------------------------------------------------------
 # Disability tab — ONLY disability data (no "No Disability" rows at all)
@@ -6250,7 +6341,7 @@ if selected_tab == "Disability":
 
     st.markdown(
         '<div class="section-note">This tab shows <strong>only records with disability</strong>. '
-        'All "No Disability" values are excluded. Overall prevalence is shown in the Overview tab. '
+        'All "No Disability" values are excluded. Overall prevalence is shown in People & Visits. '
         'Impairment types are standardized across adults and children.</div>',
         unsafe_allow_html=True,
     )
@@ -6279,13 +6370,7 @@ if selected_tab == "Disability":
 
     else:
         st.caption("Impairment types (all ages with disability)")
-        draw_gender_column_bar(disability_only, "disability_type", height=380)
-        show_gender_table(
-            disability_only,
-            "disability_type",
-            "Impairment type",
-            top_n=None,
-        )
+        show_gender_panel(disability_only, "disability_type", "Impairment type", "disability_impairments")
 
     st.markdown("#### Beneficiaries with Disability by Age Group")
     st.caption(
@@ -6306,12 +6391,8 @@ if selected_tab == "Disability":
 # Other tabs
 # -----------------------------------------------------------------------------
 if selected_tab == "Concerns":
-    st.subheader("Top Protection Concerns by gender")
-    concern_rank = st.radio("Rank", ["Highest values", "Lowest values"], horizontal=True, index=0, key="concern_rank")
-    concern_top_n = st.radio("Number of categories", [5, 10, 15, 20, 25], horizontal=True, index=2, key="concern_top_n")
-    draw_gender_bar(filtered_protection, "protection_concern", top_n=concern_top_n, height=640, ascending=concern_rank == "Lowest values")
-    st.caption("Full table (all categories, unaffected by chart slicing)")
-    show_gender_table(filtered_protection, "protection_concern", "Protection concern", top_n=None)
+    st.subheader("Protection concerns by gender")
+    show_ranked_gender_panel(filtered_protection, "protection_concern", "Protection concern", "concern_summary")
     st.markdown("#### Protection Concern by Age Group")
     st.caption("Select one or more protection concerns to view the age group and gender breakdown.")
     concern_age_options = age_breakdown_options(filtered_protection, "protection_concern")
@@ -6329,23 +6410,11 @@ if selected_tab == "Concerns":
         if not selected_concerns_for_age:
             st.info("Select at least one protection concern to view the age and gender breakdown.")
         else:
-            draw_age_gender_breakdown_bar(
-                filtered_protection,
-                "protection_concern",
-                selected_concerns_for_age,
-                "Protection concern",
-                height=320,
-            )
-            show_age_gender_breakdown_table(
-                filtered_protection,
-                "protection_concern",
-                selected_concerns_for_age,
-                "Protection concern",
-            )
+            show_age_gender_panel(filtered_protection, "protection_concern", selected_concerns_for_age, "Protection concern", "concern_age")
 
             st.markdown("#### Disability Distribution by Age Group")
             st.caption(
-                "Uses the same selected protection-concern rows as the table above, "
+                "Uses the same selected protection-concern rows as the breakdown above, "
                 "then retains only mentions linked to records with disability."
             )
             selected_protection_rows = filtered_protection[
@@ -6388,16 +6457,7 @@ if selected_tab == "Concerns":
     if child_accompaniment.empty:
         st.info("No determinable child accompaniment records match the selected filters.")
     else:
-        draw_gender_column_bar(
-            child_accompaniment,
-            "child_accompaniment_status",
-            height=300,
-        )
-        show_gender_table(
-            child_accompaniment,
-            "child_accompaniment_status",
-            "Accompaniment status",
-        )
+        show_gender_panel(child_accompaniment, "child_accompaniment_status", "Accompaniment status", "child_accompaniment")
 
         unaccompanied_children = child_accompaniment[
             child_accompaniment["child_accompaniment_status"].eq("Unaccompanied")
@@ -6414,21 +6474,15 @@ if selected_tab == "Concerns":
             )
 
 if selected_tab == "Information":
-    st.subheader("Top General Information Needs by Gender")
-    information_rank = st.radio("Rank", ["Highest values", "Lowest values"], horizontal=True, index=0, key="information_rank")
-    information_top_n = st.radio("Number of categories", [5, 10, 15, 20, 25], horizontal=True, index=2, key="information_top_n")
-    draw_gender_bar(filtered_information, "general_information_need", top_n=information_top_n, height=640, ascending=information_rank == "Lowest values")
-    st.caption("Full table (all categories, unaffected by chart slicing)")
-    show_gender_table(filtered_information, "general_information_need", "General information need", top_n=None)
+    st.subheader("General information needs by gender")
+    show_ranked_gender_panel(filtered_information, "general_information_need", "General information need", "information_summary")
 
 if selected_tab == "Referrals":
     st.subheader("Action and Follow-up by Gender")
     st.caption("Referral status")
-    draw_gender_column_bar(filtered_records, "referral_status", height=360)
-    show_gender_table(filtered_records, "referral_status", "Referral status")
+    show_gender_panel(filtered_records, "referral_status", "Referral status", "referral_status_panel")
     st.markdown("#### Follow-up required")
-    draw_gender_column_bar(filtered_records, "follow_up_required_clean", height=360)
-    show_gender_table(filtered_records, "follow_up_required_clean", "Follow-up required")
+    show_gender_panel(filtered_records, "follow_up_required_clean", "Follow-up required", "follow_up_panel")
     st.divider()
     st.subheader("Referral Partners by Gender")
     referred_case_count = int(
@@ -6449,11 +6503,7 @@ if selected_tab == "Referrals":
         st.info(
             f"{partner_assignment_count - partner_record_count:,} additional assignment(s) arise because some cases were referred to more than one partner."
         )
-    referral_rank = st.radio("Rank", ["Highest values", "Lowest values"], horizontal=True, index=0, key="referral_rank")
-    referral_top_n = st.radio("Number of categories", [10, 15, 25], horizontal=True, index=1, key="referral_top_n")
-    draw_gender_bar(filtered_referrals, "referral_partner", top_n=referral_top_n, height=560, ascending=referral_rank == "Lowest values")
-    st.caption("Full partner-assignment table (all categories, unaffected by chart slicing)")
-    show_gender_table(filtered_referrals, "referral_partner", "Referral partner", top_n=None)
+    show_ranked_gender_panel(filtered_referrals, "referral_partner", "Referral partner", "referral_summary")
     st.markdown('<div class="dashboard-subsection-break"></div>', unsafe_allow_html=True)
     st.markdown("#### Referral Partner by Age Group")
     st.caption("Select one or more referral partners to view the age group and gender breakdown.")
@@ -6472,23 +6522,11 @@ if selected_tab == "Referrals":
         if not selected_referral_partners_for_age:
             st.info("Select at least one referral partner to view the age and gender breakdown.")
         else:
-            draw_age_gender_breakdown_bar(
-                filtered_referrals,
-                "referral_partner",
-                selected_referral_partners_for_age,
-                "Referral partner",
-                height=320,
-            )
-            show_age_gender_breakdown_table(
-                filtered_referrals,
-                "referral_partner",
-                selected_referral_partners_for_age,
-                "Referral partner",
-            )
+            show_age_gender_panel(filtered_referrals, "referral_partner", selected_referral_partners_for_age, "Referral partner", "referral_age")
 
             st.markdown("#### Disability Distribution by Age Group")
             st.caption(
-                "Uses the same selected referral-partner assignments as the table "
+                "Uses the same selected referral-partner assignments as the breakdown "
                 "above, then retains only assignments linked to records with disability."
             )
             selected_referral_rows = filtered_referrals[

@@ -1606,10 +1606,48 @@ div[data-testid="stVegaLiteChart"], div[data-testid="stArrowVegaLiteChart"] {
 .dashboard-table-wrap { max-width: 100%; }
 .dashboard-table { width: 100%; table-layout: fixed; }
 .dashboard-table td, .dashboard-table th { overflow-wrap: anywhere; white-space: normal; }
+.dashboard-table-wrap { height: auto; box-shadow: none; }
+.dashboard-table thead th {
+    background: var(--table-head-bg); border-bottom: 1px solid var(--line);
+    font-weight: 650;
+}
+.dashboard-table tbody th {
+    padding: 9px 12px; text-align: left; vertical-align: middle;
+    border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft);
+    background: var(--surface); font-weight: 500;
+}
+.dashboard-table tbody tr:nth-child(even) th { background: var(--surface-2); }
+.dashboard-table td.label-cell, .dashboard-table th.label-cell { min-width: 0; font-weight: 500; }
+.dashboard-table td.total-col, .dashboard-table th.total-col,
+.dashboard-table tr.total-row td, .dashboard-table tr.total-row th {
+    background: var(--surface-2) !important; color: var(--ink); font-weight: 700;
+    border-left: none; border-top: 1px solid var(--line);
+}
+.table-accessible-caption {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap;
+}
+.st-key-overview_trend_card, .st-key-overview_intervention_card { min-width: 0; }
+.st-key-overview_intervention_card .dashboard-table thead th:first-child { width: 46%; }
+.st-key-overview_intervention_card .dashboard-table td,
+.st-key-overview_intervention_card .dashboard-table th { padding: 10px 8px; font-size: .82rem; }
+@media (max-width: 1000px) {
+    [data-testid="stHorizontalBlock"]:has(.st-key-overview_trend_card) { flex-direction: column; }
+    [data-testid="stHorizontalBlock"]:has(.st-key-overview_trend_card) > [data-testid="stColumn"] {
+        width: 100% !important; flex: 1 1 auto !important;
+    }
+}
 @media (max-width: 760px) {
     [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 12px !important; }
     [data-testid="stColumn"] { min-width: min(100%, 240px) !important; flex: 1 1 240px !important; }
     .report-selection-heading, .report-selection-values { flex-direction: column; }
     .app-header, .section-intro-card { padding: .7rem !important; }
     .stApp [role="radiogroup"] { flex-wrap: wrap; }
+    .st-key-overview_headlines [data-testid="stColumn"] {
+        min-width: 0 !important; width: calc(50% - 6px) !important;
+        flex: 1 1 calc(50% - 6px) !important;
+    }
+    .st-key-overview_headlines .kpi-card { min-height: 136px; padding: 12px; }
+    .st-key-overview_headlines .kpi-context { font-size: .8rem; }
+    .st-key-overview_intervention_card .dashboard-table thead th:first-child { width: 38%; }
 }
