@@ -18,6 +18,7 @@ import requests
 import streamlit as st
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from cpv_matching import CPVMatcher
 
 # -----------------------------------------------------------------------------
 # Page configuration
@@ -28,7 +29,7 @@ DEVELOPER_LOGO_PATH = BASE_DIR / "assets" / "developer-logo.png"
 STYLES_PATH = BASE_DIR / "assets" / "styles.css"
 DATA_FILE_PATH = Path(os.environ.get("HELPDESK_DATA_PATH") or (BASE_DIR / "data" / "HELPDESK_DashboardData_Tdh_Kenya_D2.xlsx"))
 PROCESSED_CACHE_PATH = BASE_DIR / "data" / "processed" / "helpdesk_processed_cache.pkl"
-PROCESSED_CACHE_VERSION = "2026-08-25-kobo-v5-submission-reporting-date"
+PROCESSED_CACHE_VERSION = "2026-09-13-kobo-v6-roster-name-matching"
 KOBO_REFRESH_WINDOW_SECONDS = 1800
 KOBO_CACHE_TTL_SECONDS = KOBO_REFRESH_WINDOW_SECONDS
 KOBO_SCHEMA_CACHE_TTL_SECONDS = 300
@@ -878,7 +879,7 @@ ANALYSIS_COLUMN_NAMES = frozenset(['action_taken',
  'staff_name',
  'visited_tdh_helpdesk_before'])
 
-APP_VERSION = "Version 1.1"
+APP_VERSION = "Version 1.2"
 APP_VERSION_DATE = "September 2026"
 
 _logo_for_icon = LOGO_PATH
@@ -1100,6 +1101,7 @@ DQA_RECORD_COLUMNS = (
     "kobo_status",
     "kobo_validation_status",
     "staff_name",
+    "staff_match_status",
     "camp_location",
     "helpdesk_location",
     "information_seeker_type",
@@ -1483,31 +1485,29 @@ CPV_NAME_STANDARD_MAP = {
 }
 
 
+try:
+    CPV_REGISTRY = json.loads((BASE_DIR / "cpv_name_registry.json").read_text(encoding="utf-8"))
+    CPV_MATCHER = CPVMatcher(CPV_NAME_STANDARD_MAP, CPV_REGISTRY)
+except (OSError, ValueError, TypeError):
+    st.error("CPV name configuration is missing or invalid. Check cpv_name_registry.json before loading the dashboard.")
+    st.stop()
+CPV_REGISTRY_SIGNATURE = hashlib.sha256(json.dumps(CPV_REGISTRY, sort_keys=True).encode()).hexdigest()
+
+
 def normalize_staff_name(value):
-    value = clean_text(value)
-    if pd.isna(value):
-        return "[Not recorded]"
+    cleaned = clean_text(value)
+    return CPV_MATCHER.resolve("" if pd.isna(cleaned) else str(cleaned))[0]
 
-    value = str(value).strip().strip('"').strip("'")
-    value = re.sub(r"\s+", " ", value)
 
-    normalized_empty_values = {"", "nan", "none", "missing", "not recorded", "[not recorded]"}
-    if value.lower() in normalized_empty_values:
-        return "[Not recorded]"
-
-    key = staff_name_key(value)
-    if key in CPV_NAME_STANDARD_MAP:
-        return CPV_NAME_STANDARD_MAP[key]
-
-    # Catch reversed two/three-name entries where the exact spelling was not
-    # listed in the alias map but the same tokens are present.
-    key_tokens = key.split()
-    for alias_key, canonical_name in CPV_NAME_STANDARD_MAP.items():
-        alias_tokens = alias_key.split()
-        if len(key_tokens) >= 2 and len(alias_tokens) >= 2 and sorted(key_tokens) == sorted(alias_tokens):
-            return canonical_name
-
-    return value.title()
+def harmonize_staff_records(frame):
+    """Retain raw names privately and resolve each distinct spelling once."""
+    work = frame.copy()
+    raw = work.get("staff_name_raw", work["staff_name"]).fillna("").astype(str)
+    results = {value: CPV_MATCHER.resolve(value) for value in raw.unique()}
+    work["staff_name_raw"] = raw
+    for index, column in enumerate(["staff_name", "staff_match_status", "staff_match_score", "staff_match_suggestions"]):
+        work[column] = raw.map(lambda value: results[value][index])
+    return work
 
 
 def standardize_disability_type(value):
@@ -3054,6 +3054,7 @@ def load_data(source_signature):
     # locally by running the app, then commit data/processed/helpdesk_processed_cache.pkl.
     processed_cache_key = {
         "version": PROCESSED_CACHE_VERSION,
+        "cpv_registry": CPV_REGISTRY_SIGNATURE,
         # Use file size, not modified time, so a cache generated locally and
         # committed to GitHub can still match after Streamlit Cloud checkout
         # changes file timestamps.
@@ -3169,7 +3170,11 @@ def load_data(source_signature):
     records["gps_latitude"] = pd.to_numeric(parsed_gps["gps_latitude"], errors="coerce")
     records["gps_longitude"] = pd.to_numeric(parsed_gps["gps_longitude"], errors="coerce")
 
-    records["staff_name"] = records["staff_name"].map(normalize_staff_name)
+    records = harmonize_staff_records(records)
+    # Aggregate all source submissions, including incomplete/excluded rows.
+    # Keep this audit only on the secure frame, never in public exports.
+    staff_audit_columns = ["staff_name_raw", "staff_name", "staff_match_status", "staff_match_score", "staff_match_suggestions"]
+    staff_name_audit = records.groupby(staff_audit_columns, dropna=False).size().reset_index(name="Submissions")
     records["household_type"] = records["household_type"].map(clean_text)
     records["age_group"] = records["information_seeker_age"].map(clean_text)
     records["derived_life_stage"] = records["age_group"].map(age_group_life_stage)
@@ -3488,6 +3493,7 @@ def load_data(source_signature):
     # - secure_records keeps PII for password-protected DQA follow-up tables.
     # - dashboard_records is a fail-closed allowlist used by normal views/downloads.
     secure_records = records.copy()
+    secure_records.attrs["cpv_name_audit"] = staff_name_audit.to_dict("records")
     approved_public_columns = [
         column for column in PUBLIC_RECORD_COLUMNS if column in records.columns
     ]
@@ -3678,11 +3684,14 @@ def interaction_key(label):
 
 
 def show_period_comparison(frame, filters, earliest_date):
-    previous_start, previous_end = previous_reporting_period(filters["start_date"], filters["end_date"])
-    previous_filters = {**filters, "start_date": previous_start, "end_date": previous_end}
-    current = apply_filters(frame, filters)
-    previous = apply_filters(frame, previous_filters)
-    with st.expander("Compare with the previous period", expanded=False):
+    with st.expander("Compare with the previous period", expanded=False,
+                     on_change="rerun", key="period_comparison_open") as panel:
+        if not panel.open:
+            return
+        previous_start, previous_end = previous_reporting_period(filters["start_date"], filters["end_date"])
+        previous_filters = {**filters, "start_date": previous_start, "end_date": previous_end}
+        current = apply_filters(frame, filters)
+        previous = apply_filters(frame, previous_filters)
         st.caption(
             f"Current: {filters['start_date']:%d %b %Y} – {filters['end_date']:%d %b %Y} · "
             f"Previous: {previous_start:%d %b %Y} – {previous_end:%d %b %Y}. Same location filters and number of calendar days."
@@ -3714,8 +3723,11 @@ def dqa_issue_records(frame, issue):
     elif issue == "Excluded submissions":
         mask = ~frame["dashboard_eligible"].fillna(False).astype(bool)
     elif issue == "CPV names to review":
-        names = frame["staff_name"].fillna("[Not recorded]").astype(str)
-        mask = ~names.isin(set(CPV_NAME_STANDARD_MAP.values()))
+        if "staff_match_status" in frame:
+            mask = frame["staff_match_status"].isin(["missing", "ambiguous", "needs review", "unmatched"])
+        else:
+            names = frame["staff_name"].fillna("[Not recorded]").astype(str)
+            mask = ~names.isin(set(CPV_NAME_STANDARD_MAP.values()))
     else:
         mask = pd.Series(True, index=frame.index)
     return frame.loc[mask, [c for c in DQA_RECORD_COLUMNS if c in frame.columns]].copy()
@@ -4203,112 +4215,245 @@ def selection_values(event, parameter, field):
     return list(dict.fromkeys(str(point[field]) for point in points if isinstance(point, Mapping) and field in point))
 
 
-def render_dashboard_table(table, label_column=None, max_height=560):
-    """Read-only, searchable grid. Return the selected category, not a row index."""
+def clear_keyboard_selection(widget_key):
+    """A new canvas selection takes precedence over a prior keyboard choice."""
+    st.session_state[widget_key + "_picker"] = None
+
+
+def render_dashboard_table(table, label_column=None, max_height=560, selection_column=None):
+    """Searchable grid or wrapped table, with keyboard access in both modes."""
     if table.empty:
         st.info("No records match the selected filters.")
         return None
+    identity = selection_column or label_column
     key = interaction_key("table:" + str(label_column) + repr(list(table.columns)))
-    with st.expander("Table options", expanded=False):
-        query = st.text_input("Search this table", key=key + "_search")
-        wrapped = st.checkbox("Wrapped reading view", key=key + "_wrapped",
-                              help="Fit long descriptions to the page. Switch off to select rows.")
+    query = st.text_input("Search this table", key=key + "_search", placeholder="Find a category or value…")
+    with st.popover("Table display"):
+        long_text = label_column in table and table[label_column].astype(str).str.len().max() > 90
+        density = st.radio("Reading layout", ["Compact", "Comfortable", "Wrapped"],
+                           index=2 if long_text else 0, key=key + "_layout")
     view = search_records(table, query).reset_index(drop=True)
     if view.empty:
-        st.info("No table rows match your search.")
+        st.info("No rows match your search. Clear the search to see the full table.")
         return None
-    if wrapped:
-        render_wrapped_table(view, label_column=label_column, max_height=max_height)
-        return None
-    config = {column: st.column_config.NumberColumn(width="small")
-              if pd.api.types.is_numeric_dtype(view[column])
-              else st.column_config.TextColumn(width="large" if column == label_column else "medium")
-              for column in view.columns}
-    # Include the searched row identity so an old row position cannot select a
-    # different category after searching, ranking or changing the snapshot.
+    visible = view.drop(columns=[selection_column], errors="ignore") if selection_column else view
     row_signature = hashlib.sha256(view.to_json(date_format="iso").encode()).hexdigest()[:12]
-    event = st.dataframe(
-        style_records_table(view), width="stretch", hide_index=True,
-        height=min(max_height, max(110, 38 + 64 * len(view))), row_height=64,
-        column_config=config, key=selection_widget_key(key + row_signature),
-        on_select="rerun" if label_column in view.columns else "ignore",
-        selection_mode="single-row",
-    )
-    if label_column in view.columns:
-        st.caption("Select a row to inspect it. Report totals stay unchanged.")
-        rows = event.selection.rows
-        if rows and 0 <= rows[0] < len(view):
-            value = view.iloc[rows[0]][label_column]
-            if str(value) != "Total":
-                st.button("Clear selection", key=key + "_clear",
-                          on_click=clear_local_selection, args=(key + row_signature,))
-            return None if str(value) == "Total" else value
-    return None
+    base_key = key + row_signature
+    selected = None
+    if density == "Wrapped":
+        render_wrapped_table(visible, label_column=label_column, max_height=max_height)
+    else:
+        row_height = 38 if density == "Compact" else 64
+        config = {column: st.column_config.NumberColumn(width="small")
+                  if pd.api.types.is_numeric_dtype(visible[column])
+                  else st.column_config.TextColumn(width="large" if column == label_column else "medium")
+                  for column in visible}
+        event = st.dataframe(
+            style_records_table(visible), width="stretch", hide_index=True,
+            height=min(max_height, max(110, 38 + row_height * len(view))), row_height=row_height,
+            column_config=config, key=selection_widget_key(base_key),
+            on_select=(lambda: clear_keyboard_selection(selection_widget_key(base_key))) if identity in view else "ignore",
+            selection_mode="single-row",
+        )
+        if identity in view and event.selection.rows:
+            position = event.selection.rows[0]
+            if 0 <= position < len(view) and str(view.iloc[position][label_column]) != "Total":
+                selected = view.iloc[position][identity]
+    if identity in view:
+        candidates = view[view[label_column].astype(str).ne("Total")]
+        values = candidates[identity].drop_duplicates().tolist()
+        labels = {}
+        for _, row in candidates.iterrows():
+            label = str(row[label_column])
+            if selection_column and {"Latitude", "Longitude"}.issubset(view.columns):
+                label += f" · {row['Latitude']}, {row['Longitude']}"
+            labels[row[identity]] = label
+        # Native selector is accessible by keyboard and works with wrapped HTML.
+        with st.popover("Open row details"):
+            chosen = st.selectbox("Choose a row", values, index=None,
+                                  format_func=lambda v: labels[v],
+                                  key=selection_widget_key(base_key) + "_picker",
+                                  placeholder="Search a row…")
+        if chosen is not None:
+            selected = chosen
+        if selected is not None:
+            st.button("Clear selection", key=key + "_clear",
+                      on_click=clear_local_selection, args=(base_key,))
+    return selected
+
+
+RECORD_COLUMN_PRESETS = {
+    "Essential": ["record_id", "reporting_date", "camp_location", "helpdesk_location",
+                  "staff_name", "request_category", "referral_status", "follow_up_required_clean"],
+    "Demographics": ["record_id", "reporting_date", "helpdesk_location", "information_seeker_gender",
+                     "age_group", "information_seeker_type", "disability_status", "disability_type"],
+    "Follow-up": ["record_id", "reporting_date", "helpdesk_location", "staff_name",
+                 "request_category", "referral_status", "follow_up_required_clean"],
+}
+RECORD_COLUMN_LABELS = {
+    "record_id": "Submission ID", "reporting_date": "Submission date",
+    "reporting_date_source": "Date source", "interview_date": "Activity date",
+    "camp_location": "Camp", "helpdesk_location": "Helpdesk", "staff_name": "CPV",
+    "information_seeker_gender": "Gender", "information_seeker_type": "Beneficiary type",
+    "age_group": "Age group", "request_category": "Request",
+    "referral_status": "Referral status", "follow_up_required_clean": "Follow-up required",
+}
+
+
+def record_column_label(column):
+    return RECORD_COLUMN_LABELS.get(column, column.replace("_", " ").capitalize())
+
+
+def paged_records(frame, query, sort_column, ascending, page, page_size):
+    """Search/sort the entire eligible frame before taking a deterministic page."""
+    approved = frame[[c for c in PUBLIC_RECORD_COLUMNS if c in frame]].copy()
+    searched = search_records(approved, query)
+    order = list(dict.fromkeys(c for c in [sort_column, "record_id"] if c in searched))
+    if order:
+        searched = searched.sort_values(order, ascending=ascending, kind="stable", na_position="last")
+    pages = max(1, (len(searched) + page_size - 1) // page_size)
+    page = min(max(1, int(page)), pages)
+    return searched.iloc[(page - 1) * page_size:page * page_size].reset_index(drop=True), len(searched), pages, page
+
+
+@st.fragment
+def render_record_browser(frame, key):
+    """Fragment keeps record search, pagination and display changes local."""
+    approved = frame[[c for c in PUBLIC_RECORD_COLUMNS if c in frame]].copy()
+    if approved.empty:
+        st.info("No submissions match this selection.")
+        return
+    query = st.text_input("Search records", key=key + "_search",
+                          placeholder="Search submission ID, CPV, helpdesk or request…")
+    preset = st.selectbox("Columns to show", [*RECORD_COLUMN_PRESETS, "Custom"], key=key + "_preset")
+    columns = [c for c in RECORD_COLUMN_PRESETS.get(preset, RECORD_COLUMN_PRESETS["Essential"]) if c in approved]
+    if preset == "Custom":
+        available = list(approved.columns)
+        sanitize_multiselect_state(key + "_columns", available)
+        columns = st.multiselect("Choose columns", available, default=None, key=key + "_columns",
+                                 format_func=record_column_label)
+        if not columns:
+            st.info("Choose at least one column to display.")
+            return
+    sort_col, direction_col, size_col = st.columns([2, 1.4, 1])
+    sort_options = [c for c in ["reporting_date", "staff_name", "helpdesk_location", "record_id"] if c in approved]
+    with sort_col:
+        sort_column = st.selectbox("Sort records by", sort_options, format_func=record_column_label, key=key + "_sort")
+    with direction_col:
+        direction = st.selectbox("Order", ["Newest / Z–A", "Oldest / A–Z"], key=key + "_order")
+    with size_col:
+        page_size = st.selectbox("Rows per page", [25, 50, 100], key=key + "_size")
+    context = (query, sort_column, direction, page_size, st.session_state.get("interaction_context"))
+    if st.session_state.get(key + "_page_context") != context:
+        st.session_state[key + "_page"] = 1
+        st.session_state[key + "_page_context"] = context
+    page_frame, total, pages, current = paged_records(approved, query, sort_column, direction == "Oldest / A–Z",
+                                           st.session_state.get(key + "_page", 1), page_size)
+    st.session_state[key + "_page"] = current
+    page = st.number_input("Page", min_value=1, max_value=pages, step=1, key=key + "_page")
+    if page != current:
+        page_frame, total, pages, page = paged_records(approved, query, sort_column, direction == "Oldest / A–Z", page, page_size)
+    first = (page - 1) * page_size + 1 if total else 0
+    last = (page - 1) * page_size + len(page_frame) if total else 0
+    st.caption(f"Showing {first:,}–{last:,} of {total:,} submissions · page {page:,} of {pages:,} · read-only")
+    config = {c: st.column_config.TextColumn(record_column_label(c)) for c in columns}
+    for c in columns:
+        if pd.api.types.is_datetime64_any_dtype(page_frame[c]):
+            config[c] = st.column_config.DateColumn(record_column_label(c), format="DD MMM YYYY")
+        elif pd.api.types.is_numeric_dtype(page_frame[c]):
+            config[c] = st.column_config.NumberColumn(record_column_label(c))
+    st.dataframe(page_frame[columns], width="stretch", hide_index=True, column_config=config,
+                 height=min(560, 38 + 38 * max(1, len(page_frame))), row_height=38)
 
 
 def show_selection_details(frame, category_column, values, key, selection_key=None):
     detail = public_drilldown_records(frame, category_column, values)
+    referrals = globals().get("filtered_referrals", pd.DataFrame())
+    render_selection_panel(detail, values, key, referrals, selection_key)
+
+
+@st.fragment
+def render_selection_panel(detail, values, key, referrals, selection_key=None):
     if detail.empty:
-        st.info("No approved records match this selection.")
+        st.info("No submissions match this selection.")
         return
     with st.container(border=True):
         st.markdown("**Details for " + ", ".join(str(v) for v in values) + "**")
-        st.caption(f"{len(detail):,} distinct submissions · current reporting and location filters · not unique beneficiaries")
-        st.caption("Only these details follow your selection. The rest of the report is unchanged.")
-        if selection_key is not None:
-            st.button("Clear selection", key=key + "_clear",
-                      on_click=clear_local_selection, args=(selection_key,))
-        age_tab, referral_tab, location_tab, trend_tab, record_tab = st.tabs(
-            ["Age & gender", "Referrals", "Locations", "Submission trend", "Records"]
-        )
-        with age_tab:
-            if {"age_group", "information_seeker_gender"}.issubset(detail.columns):
-                age_table = gender_pivot_table(detail, "age_group", "Age group")
-                st.dataframe(style_records_table(age_table.reset_index(drop=True)), width="stretch", hide_index=True)
-        with referral_tab:
-            source = globals().get("filtered_referrals", pd.DataFrame())
-            if {"record_id", "referral_partner"}.issubset(source.columns) and "record_id" in detail.columns:
-                linked = source[source["record_id"].isin(detail["record_id"])].drop_duplicates(["record_id", "referral_partner"])
-                summary = basic_count_table(linked, "referral_partner", "Referral partner")
-                st.dataframe(summary, width="stretch", hide_index=True)
-                st.caption("Referral mentions; one submission may include several partners.")
+        st.caption(f"{len(detail):,} submissions · report totals stay unchanged")
+        if selection_key is not None and st.button("Clear selection", key=key + "_clear"):
+            clear_local_selection(selection_key)
+            st.rerun()
+        mode = st.radio("Explore selection", ["Summary", "View breakdown", "View matching records"],
+                        horizontal=True, key=key + "_mode")
+        if mode == "Summary":
+            for field, label in [("staff_name", "Submitted by (CPV)"), ("helpdesk_location", "Helpdesk")]:
+                if field in detail:
+                    names = detail[field].dropna().astype(str).drop_duplicates().sort_values().tolist()
+                    shown = ", ".join(names[:5])
+                    if len(names) > 5:
+                        shown += f" and {len(names) - 5} more"
+                    st.text(f"{label}: {shown or 'Not recorded'}")
+            if "reporting_date" in detail:
+                dates = pd.to_datetime(detail["reporting_date"], errors="coerce").dropna()
+                if not dates.empty:
+                    st.caption(f"Submitted {dates.min():%d %b %Y} – {dates.max():%d %b %Y}")
+            st.caption("Choose a breakdown or open the matching records for more detail.")
+            return
+        if mode == "View matching records":
+            render_record_browser(detail, key + "_records")
+            return
+        breakdown = st.selectbox("Breakdown", ["Age & gender", "Referrals", "Locations", "Submission trend"],
+                                key=key + "_breakdown")
+        if breakdown == "Age & gender":
+            if {"age_group", "information_seeker_gender"}.issubset(detail):
+                st.dataframe(style_records_table(gender_pivot_table(detail, "age_group", "Age group")),
+                             width="stretch", hide_index=True)
+        elif breakdown == "Referrals":
+            if {"record_id", "referral_partner"}.issubset(referrals) and "record_id" in detail:
+                linked = referrals[referrals["record_id"].isin(detail["record_id"])].drop_duplicates(["record_id", "referral_partner"])
+                st.dataframe(basic_count_table(linked, "referral_partner", "Referral partner"), width="stretch", hide_index=True)
+                st.caption("One submission may include several referral partners.")
             else:
-                st.info("No linked referral information is available.")
-        with location_tab:
-            if "helpdesk_location" in detail.columns:
-                locations = basic_count_table(detail, "helpdesk_location", "Helpdesk location")
-                st.dataframe(locations, width="stretch", hide_index=True)
-        with trend_tab:
-            if "reporting_date" in detail.columns:
-                days = pd.to_datetime(detail["reporting_date"], errors="coerce").dropna().dt.normalize()
-                counts = days.value_counts().sort_index()
-                if not counts.empty:
-                    counts = counts.reindex(pd.date_range(counts.index.min(), counts.index.max()), fill_value=0)
-                    trend = counts.rename_axis("Date").reset_index(name="Submissions")
-                    chart = alt.Chart(trend).mark_line(point=True, color="#2F7D69").encode(
-                        x=alt.X("Date:T"), y=alt.Y("Submissions:Q"), tooltip=["Date:T", "Submissions:Q"],
-                    ).properties(height=230)
-                    st.altair_chart(polish_chart(chart), width="stretch")
-                else:
-                    st.info("No usable reporting dates for this selection.")
-        with record_tab:
-            query = st.text_input("Search selected records", key=key + "_records_search")
-            preview = search_records(detail, query).head(RECORD_PREVIEW_LIMIT).reset_index(drop=True)
-            st.caption(f"Read-only · showing {len(preview):,} records · raw export disabled")
-            st.dataframe(style_records_table(preview), width="stretch", hide_index=True, row_height=64)
+                st.info("No referral information is available.")
+        elif breakdown == "Locations":
+            st.dataframe(basic_count_table(detail, "helpdesk_location", "Helpdesk"), width="stretch", hide_index=True)
+        else:
+            days = pd.to_datetime(detail["reporting_date"], errors="coerce").dropna().dt.normalize()
+            counts = days.value_counts().sort_index()
+            if counts.empty:
+                st.info("No usable submission dates for this selection.")
+            else:
+                counts = counts.reindex(pd.date_range(counts.index.min(), counts.index.max()), fill_value=0)
+                trend = counts.rename_axis("Date").reset_index(name="Submissions")
+                chart = alt.Chart(trend).mark_line(point=True, color="#2F7D69").encode(
+                    x=alt.X("Date:T"), y=alt.Y("Submissions:Q"), tooltip=["Date:T", "Submissions:Q"]
+                ).properties(height=230)
+                st.altair_chart(polish_chart(chart), width="stretch")
 
 
 def render_selectable_chart(chart, frame, category_column, chart_field=None):
     field = chart_field or category_column
     chart_signature = hashlib.sha256(chart.to_json().encode()).hexdigest()[:12]
     key = interaction_key("chart:" + category_column) + chart_signature
+    render_chart_panel(chart, frame, category_column, field, key)
+
+
+@st.fragment
+def render_chart_panel(chart, frame, category_column, field, key):
     point = alt.selection_point(name="detail_pick", fields=[field], toggle=False, on="click", clear="dblclick")
     event = st.altair_chart(
         polish_chart(chart.add_params(point)), width="stretch", key=selection_widget_key(key),
-        on_select="rerun", selection_mode="detail_pick",
+        on_select=lambda: clear_keyboard_selection(selection_widget_key(key)), selection_mode="detail_pick",
     )
     st.caption("Click a bar, slice or point for details. Double-click to deselect.")
     selected = selection_values(event, "detail_pick", field)
+    with st.popover("Explore chart"):
+        st.caption("Search all categories in the current report, including those outside the displayed ranking.")
+        choices = sorted(frame[category_column].dropna().astype(str).unique().tolist())
+        keyboard_choice = st.selectbox("Find a category", choices, index=None,
+                                        key=selection_widget_key(key) + "_picker")
+    if keyboard_choice is not None:
+        selected = [keyboard_choice]
     if selected:
         show_selection_details(frame, category_column, selected, key, selection_key=key)
 
@@ -4832,6 +4977,27 @@ def draw_status_donut_pair(frame, status_column, height=300):
     render_selectable_chart(status_chart + status_labels, frame, status_column)
 
 
+def draw_submission_trend(frame):
+    if frame.empty:
+        st.info("No submissions in this period.")
+        return
+    detail = frame.copy()
+    detail["report_month"] = pd.to_datetime(detail["reporting_date"], errors="coerce").dt.strftime("%Y-%m")
+    counts = detail["report_month"].value_counts().sort_index()
+    if counts.empty:
+        st.info("No usable submission dates.")
+        return
+    months = pd.period_range(counts.index.min(), counts.index.max(), freq="M").astype(str)
+    counts = counts.reindex(months, fill_value=0)
+    chart_data = counts.rename_axis("Month").reset_index(name="Submissions")
+    chart = alt.Chart(chart_data).mark_line(point=True, color="#2F7D69").encode(
+        x=alt.X("Month:N", title=None, sort=months.tolist()),
+        y=alt.Y("Submissions:Q", axis=alt.Axis(tickMinStep=1)),
+        tooltip=["Month:N", "Submissions:Q"],
+    ).properties(height=280)
+    render_selectable_chart(chart, detail, "report_month", "Month")
+
+
 def draw_monthly_gender_column_bar(frame, height=340):
     if frame.empty or "information_seeker_gender" not in frame.columns:
         st.info("No records match the selected filters.")
@@ -5129,8 +5295,8 @@ def show_insight_card(column, label, value, detail, icon="", count=None):
     icon_html = f'<span class="insight-icon">{escape_text(icon)}</span>' if icon else ""
     suppressed = count is not None and 0 < count < SMALL_N_THRESHOLD
     if suppressed:
-        value_html = '<div class="insight-value insight-suppressed">Suppressed</div>'
-        detail_html = f'<div class="insight-detail insight-suppressed-note">&#9888; Fewer than {SMALL_N_THRESHOLD} records &mdash; hidden to protect identity</div>'
+        value_html = '<div class="insight-value insight-suppressed">Limited data</div>'
+        detail_html = f'<div class="insight-detail insight-suppressed-note">Fewer than {SMALL_N_THRESHOLD} submissions; too few for a useful ranking.</div>'
     else:
         value_html = f'<div class="insight-value">{escape_text(value)}</div>'
         detail_html = f'<div class="insight-detail">{escape_text(detail)}</div>'
@@ -5265,6 +5431,72 @@ def pii_access_granted(key="pii_access_password"):
     return False
 
 
+def render_cpv_name_review(secure_frame, key):
+    """Protected, explicit alias approvals; no automatic training or source writes."""
+    with st.expander("CPV name matching · review and approve", expanded=False, on_change="rerun", key=key) as panel:
+        if not panel.open:
+            return
+        if not pii_access_granted(f"{key}_password"):
+            return
+        st.caption("All source submissions, including incomplete entries; report filters do not limit this audit. Original names remain unchanged in Kobo.")
+        st.info("Approvals prepared here do not change reports yet. Download the registry, replace cpv_name_registry.json beside the app, and redeploy to apply them for everyone. Unsaved drafts are lost when this session ends.")
+        if st.button("Lock name review", key=f"{key}_lock"):
+            st.session_state.pop(f"{key}_password_granted", None)
+            st.session_state.pop(f"{key}_password", None)
+            st.rerun()
+        audit = pd.DataFrame(secure_frame.attrs.get("cpv_name_audit", []))
+        if audit.empty:
+            st.info("No name audit is available. Fetch a fresh snapshot after updating the application.")
+            return
+        review_statuses = ["ambiguous", "needs review", "unmatched", "missing"]
+        review_count = int(audit.loc[audit.staff_match_status.isin(review_statuses), "Submissions"].sum())
+        st.caption(f"{review_count:,} source submissions need name review. Similarity scores measure text resemblance, not the probability of a correct identity.")
+        scope = st.radio("Show names", ["Needs review", "All matching decisions"], horizontal=True, key=f"{key}_scope")
+        query = st.text_input("Search original or standardised CPV names", key=f"{key}_query")
+        display = audit[audit.staff_match_status.isin(review_statuses)] if scope == "Needs review" else audit
+        display = search_records(display, query).rename(columns={
+            "staff_name_raw": "Original entry", "staff_name": "Dashboard name",
+            "staff_match_status": "Matching reason", "staff_match_score": "Text similarity (0–1)",
+            "staff_match_suggestions": "Possible roster matches",
+        })
+        st.dataframe(display, width="stretch", hide_index=True, row_height=64)
+        # Keep drafts isolated by configuration version and browser session.
+        draft_key = f"cpv_alias_draft_{CPV_REGISTRY_SIGNATURE}"
+        draft = dict(st.session_state.get(draft_key, {}))
+        editable = audit[~audit.staff_match_status.isin(["confirmed", "approved alias", "missing"])]
+        raw_options = sorted(editable.staff_name_raw.unique().tolist())
+        if raw_options:
+            with st.form(f"{key}_approval"):
+                original = st.selectbox("Original entry to correct", raw_options, index=None, key=f"{key}_original")
+                target = st.selectbox("Confirmed main CPV name", CPV_MATCHER.roster, index=None, key=f"{key}_target")
+                confirmed = st.checkbox("I have verified that this entry belongs to the selected CPV.", key=f"{key}_confirm")
+                submitted = st.form_submit_button("Prepare approved alias")
+            if submitted:
+                if not original or not target or not confirmed:
+                    st.warning("Choose both names and confirm the person's identity before preparing an alias.")
+                else:
+                    candidate = {**draft, original: target}
+                    try:
+                        CPV_MATCHER.approved_config(candidate)
+                    except ValueError:
+                        st.error("This mapping conflicts with an existing confirmed alias. Review the registry before changing it.")
+                    else:
+                        draft = candidate
+                        st.session_state[draft_key] = draft
+                        st.success("Alias prepared. Download and deploy the registry below to apply it.")
+        if draft:
+            st.markdown("**Prepared approvals — not applied to reports yet**")
+            st.dataframe(pd.DataFrame([{"Original entry": k, "Approved main name": v} for k, v in draft.items()]), hide_index=True, width="stretch")
+            remove = st.selectbox("Prepared alias to remove", sorted(draft), index=None, key=f"{key}_remove")
+            if st.button("Remove prepared alias", key=f"{key}_remove_button", disabled=remove is None):
+                draft.pop(remove, None)
+                st.session_state[draft_key] = draft
+                st.rerun()
+        st.download_button("Download approved CPV registry", CPV_MATCHER.approved_config(draft),
+                           file_name="cpv_name_registry.json", mime="application/json", key=f"{key}_download")
+        st.caption("The export contains roster names and explicit approvals only—not predictions or beneficiary records. Keep the deployed registry in version control.")
+
+
 def education_concern_followup_table(frame, referrals_frame):
     """Build a password-protected DQA follow-up table for education concerns."""
     concern_cols = [
@@ -5348,6 +5580,7 @@ def interactive_helpdesk_map_points(frame):
     mapped = map_data(frame)
     if mapped.empty:
         return pd.DataFrame()
+    mapped = mapped.drop_duplicates(["record_id", "lat", "lon"])
 
     def joined_labels(series):
         excluded = {"", "none", "nan", "nat", "[missing]", "[not recorded]"}
@@ -5425,7 +5658,26 @@ def interactive_helpdesk_map_points(frame):
         lambda value: html.escape(str(value))
     )
     points["point_radius"] = 120 + points["records"].pow(0.5) * 35
+    points["point_id"] = [map_point_id(lat, lon) for lat, lon in zip(points["lat"], points["lon"])]
     return points
+
+
+def map_point_id(lat, lon):
+    """Use exact normalized coordinates, matching the map aggregation."""
+    coordinates = (float(lat) or 0.0, float(lon) or 0.0)
+    return hashlib.sha256(repr(coordinates).encode()).hexdigest()[:20]
+
+
+def map_point_records(frame, point_id):
+    mapped = map_data(frame)
+    if mapped.empty:
+        return frame.iloc[:0].copy()
+    ids = [map_point_id(lat, lon) for lat, lon in zip(mapped["lat"], mapped["lon"])]
+    # Match coordinates before deduplication. An inconsistent duplicate ID at
+    # another point must never replace the row the viewer actually selected.
+    matched = mapped.loc[pd.Series(ids, index=mapped.index).eq(point_id)]
+    matched = matched.rename(columns={"lat": "gps_latitude", "lon": "gps_longitude"})
+    return matched[[c for c in frame.columns if c in matched]].drop_duplicates("record_id")
 
 
 def cpv_work_summary(frame):
@@ -5597,7 +5849,7 @@ def build_helpdesk_findings(section, frame, protection_frame, information_frame,
         blocks.append(("Corrections", f"Gender/age corrections affect {int(frame['gender_age_correction_flag'].sum()):,} records, while seeker-type/age corrections affect {int(frame['type_age_correction_flag'].sum()):,} records."))
     else:
         blocks.append(("Records", f"The table contains {total:,} filtered, non-PII dashboard records. {gender_distribution()}"))
-        blocks.append(("Export", "The standard download excludes configured direct identifiers; protected education follow-up data remain password-gated."))
+        blocks.append(("Viewing records", "Search, sort and browse read-only submission records. Protected follow-up details require a password."))
 
     blocks = [(heading, text.strip()) for heading, text in blocks if text and text.strip()]
     return "\n\n".join(f"**{heading}.** {text}" for heading, text in blocks) if blocks else "The filtered tables do not support a sufficiently clear descriptive finding."
@@ -5625,9 +5877,10 @@ try:
             st.session_state.helpdesk_kobo_refresh_nonce,
             hashlib.sha256(str(setting("KOBO_TOKEN")).encode()).hexdigest(),
             PROCESSED_CACHE_VERSION,
+            CPV_REGISTRY_SIGNATURE,
         )
     else:
-        source_signature = ("local", *file_signature)
+        source_signature = ("local", *file_signature, PROCESSED_CACHE_VERSION, CPV_REGISTRY_SIGNATURE)
     load_started_at = time.perf_counter()
     frames = session_dashboard_snapshot(source_signature) if kobo_configured() else load_data(source_signature)
     records, secure_records, dqa_records, protection, information, referrals, kpis = frames
@@ -5934,109 +6187,63 @@ if filtered_records.empty and selected_tab not in {"DQA", "Overview"}:
 # deliberately omitted from analytical sections so users reach their data
 # immediately without repeatedly scrolling past the same summary cards.
 if selected_tab == "Overview":
-    show_period_comparison(records, filters, min_date)
-    kpi_group_caption("Volume, staffing & request mix — request types are mutually exclusive")
-    mix_cols = st.columns(4)
-    show_kpi_card(mix_cols[0], "Staff No.", format_number(staff_no), "Unique harmonized CPVs in current selection", accent="#2F7D69")
-    show_kpi_card(mix_cols[1], "Valid records", format_number(total_records), f"of {format_number(all_records)} in source", accent="#2F7D69")
-    show_kpi_card(mix_cols[2], "Protection concerns", format_number(protection_records), f"{format_rate(protection_records, total_records)} of requests", share=safe_share(protection_records, total_records), accent="#2563EB")
-    show_kpi_card(mix_cols[3], "Information requests", format_number(information_records), f"{format_rate(information_records, total_records)} of requests", share=safe_share(information_records, total_records), accent="#2563EB")
-
-    kpi_group_caption("Case outcomes — overlapping subsets of records")
-    outcome_cols = st.columns(3)
-    show_kpi_card(outcome_cols[0], "Partner referrals", format_number(partner_referrals), f"{format_rate(partner_referrals, total_records)} of all records", share=safe_share(partner_referrals, total_records), accent="#2F7D69")
-    show_kpi_card(outcome_cols[1], "Follow-up required", format_number(follow_up), f"{format_rate(follow_up, total_records)} of all records", share=safe_share(follow_up, total_records), accent="#D9A441")
-    show_kpi_card(outcome_cols[2], "Disability records", format_number(disability_records), f"{format_rate(disability_records, total_records)} of all records", share=safe_share(disability_records, total_records), accent="#7C3AED")
-
-    kpi_group_caption("Helpdesk entry point — prior visit history")
-    entry_cols = st.columns(2)
-    show_kpi_card(entry_cols[0], "First-time visitors", format_number(first_time_visitors), f"{format_rate(first_time_visitors, len(known_visit_records))} of records with known visit history", share=safe_share(first_time_visitors, len(known_visit_records)), accent="#1F6FB2")
-    show_kpi_card(entry_cols[1], "Repeat visitors", format_number(repeat_visitors), f"{format_rate(repeat_visitors, len(known_visit_records))} of records with known visit history", share=safe_share(repeat_visitors, len(known_visit_records)), accent="#D9A441")
-
-    disability_type_records = filtered_records[filtered_records["disability_status"].eq("Has Disability")]
-    follow_up_records = filtered_records[filtered_records["follow_up_required_clean"].eq("Yes")]
-    top_location, top_location_count = top_value(filtered_records, "helpdesk_location")
-    top_concern, top_concern_count = top_value(filtered_protection, "protection_concern")
-    top_disability, top_disability_count = top_value(disability_type_records, "disability_type")
-    top_followup_site, top_followup_site_count = top_value(follow_up_records, "helpdesk_location")
-    section_header("Quick Insights", "Leading categories within each dimension.")
-    insight_cols = st.columns(4)
-    show_insight_card(insight_cols[0], "Busiest helpdesk", top_location, insight_detail(top_location_count, total_records, denom_label="all records"), icon="🏢", count=top_location_count)
-    show_insight_card(insight_cols[1], "Top protection concern", top_concern, insight_detail(top_concern_count, len(filtered_protection), unit="mentions", denom_label="concerns"), icon="🛡️", count=top_concern_count)
-    show_insight_card(insight_cols[2], "Most common impairment", top_disability, insight_detail(top_disability_count, len(disability_type_records), denom_label="disability records"), icon="♿", count=top_disability_count)
-    show_insight_card(insight_cols[3], "Most follow-up activity", top_followup_site, insight_detail(top_followup_site_count, len(follow_up_records), unit="follow-ups", denom_label="follow-ups"), icon="🔄", count=top_followup_site_count)
+    headline = st.columns(4)
+    show_kpi_card(headline[0], "Submissions", format_number(total_records), "In the selected period and locations")
+    show_kpi_card(headline[1], "Active CPVs", format_number(staff_no), "Staff who submitted records")
+    show_kpi_card(headline[2], "Partner referrals", format_number(partner_referrals), format_rate(partner_referrals, total_records))
+    show_kpi_card(headline[3], "Follow-up required", format_number(follow_up), format_rate(follow_up, total_records))
 if selected_tab != "Overview":
     st.button("← Back to Overview", key="helpdesk_back_to_overview", on_click=helpdesk_go_to_overview)
-section_findings = build_helpdesk_findings(
-    selected_tab, filtered_records, filtered_protection, filtered_information, filtered_referrals
-)
-with st.expander("Findings from the current tables", expanded=(selected_tab == "Overview")):
-    st.caption("Automatically generated, filter-aware descriptive findings. They summarize observed patterns and do not establish causes.")
-    st.markdown(section_findings)
+with st.expander("Findings from the current tables", expanded=False,
+                 on_change="rerun", key="section_findings_open") as findings_panel:
+    if findings_panel.open:
+        section_findings = build_helpdesk_findings(
+            selected_tab, filtered_records, filtered_protection, filtered_information, filtered_referrals
+        )
+        st.caption("A summary of the selected data. These patterns do not establish causes.")
+        if selected_tab == "DQA":
+            st.caption("These findings use the report filters; the source audit below includes all submissions.")
+        st.markdown(section_findings)
 
 # -----------------------------------------------------------------------------
 # Overview tab
 # -----------------------------------------------------------------------------
 if selected_tab == "Overview":
-    st.subheader("Monthly Requests by Gender")
-    draw_monthly_gender_column_bar(filtered_records, height=390)
-
-    st.subheader("Requests by Type")
-    draw_request_type_bar(filtered_records, height=190)
-
-    st.subheader("Request Type Table")
-    show_gender_table(filtered_records, "request_category", "Request type")
-
-    st.divider()
-    st.subheader("First-time and Repeat Helpdesk Visits")
-    st.caption(
-        '"visited_tdh_helpdesk_before" establishes first-time versus repeat status. '
-        '"last_visit_within_current_month" is then applied only to repeat visitors.'
-    )
-    if known_visit_records.empty:
-        st.info("No usable prior-visit responses match the selected filters.")
-    else:
+    overview_view = st.radio("Overview detail", ["Summary", "Visits", "Demographics", "Locations", "Disability"],
+                             horizontal=True, key="overview_detail")
+    if overview_view == "Summary":
+        st.subheader("Submission trend")
+        draw_submission_trend(filtered_records)
+        st.subheader("Request mix")
+        draw_request_type_bar(filtered_records, height=190)
+        with st.expander("View request breakdown", on_change="rerun", key="overview_request_table") as panel:
+            if panel.open:
+                show_gender_table(filtered_records, "request_category", "Request type")
+        show_period_comparison(records, filters, min_date)
+    elif overview_view == "Visits":
+        st.subheader("First-time and repeat visits")
+        st.caption("Visit status is recorded per submission; this is not a count of unique people.")
         draw_gender_column_bar(known_visit_records, "helpdesk_visit_history", height=300)
         show_gender_table(known_visit_records, "helpdesk_visit_history", "Visit history")
-
-        repeat_visit_records = known_visit_records[
-            known_visit_records["helpdesk_visit_history"].eq("Repeat visitor")
-        ].copy()
-        st.markdown("#### Repeat Visit Timing")
-        if repeat_visit_records.empty:
-            st.info("No repeat visitors match the selected filters.")
-        else:
-            draw_gender_column_bar(
-                repeat_visit_records,
-                "repeat_visit_timing",
-                height=300,
-            )
-            show_gender_table(
-                repeat_visit_records,
-                "repeat_visit_timing",
-                "Repeat visit timing",
-            )
-
-    st.divider()
-    st.subheader("Age Group by Gender")
-    draw_gender_column_bar(filtered_records, "age_group", height=420)
-    show_gender_table(filtered_records, "age_group", "Age group")
-
-    st.divider()
-    st.subheader("Location by gender")
-    st.caption("Camp location")
-    draw_gender_column_bar(filtered_records, "camp_location", height=320)
-    show_gender_table(filtered_records, "camp_location", "Camp location")
-
-    st.markdown("#### Helpdesk location")
-    draw_gender_column_bar(filtered_records, "helpdesk_location", height=460)
-    show_gender_table(filtered_records, "helpdesk_location", "Helpdesk location")
-
-    st.divider()
-    st.subheader("Overall Disability Status")
-    st.markdown('<div class="section-note">Uses "Has Disability / No Disability". Full impairment analysis is available in the Disability tab.</div>', unsafe_allow_html=True)
-    draw_status_donut_pair(filtered_records, "disability_status", height=280)
-    show_gender_table(filtered_records, "disability_status", "Disability status")
+        repeat_records = known_visit_records[known_visit_records["helpdesk_visit_history"].eq("Repeat visitor")]
+        if not repeat_records.empty:
+            st.subheader("Repeat visit timing")
+            draw_gender_column_bar(repeat_records, "repeat_visit_timing", height=300)
+            show_gender_table(repeat_records, "repeat_visit_timing", "Repeat visit timing")
+    elif overview_view == "Demographics":
+        st.subheader("Age group by gender")
+        draw_gender_column_bar(filtered_records, "age_group", height=380)
+        show_gender_table(filtered_records, "age_group", "Age group")
+    elif overview_view == "Locations":
+        st.subheader("Submissions by location")
+        show_gender_table(filtered_records, "camp_location", "Camp")
+        draw_gender_column_bar(filtered_records, "helpdesk_location", height=400)
+        show_gender_table(filtered_records, "helpdesk_location", "Helpdesk")
+    else:
+        st.subheader("Disability inclusion")
+        draw_status_donut_pair(filtered_records, "disability_status", height=280)
+        show_gender_table(filtered_records, "disability_status", "Disability status")
+        st.caption("Choose Disability Inclusion in Dashboard section for full impairment analysis.")
 
 # -----------------------------------------------------------------------------
 # Disability tab — ONLY disability data (no "No Disability" rows at all)
@@ -6380,13 +6587,14 @@ if selected_tab == "Map":
                 },
             },
         )
+        map_key = interaction_key("map") + hashlib.sha256(map_points.to_json().encode()).hexdigest()[:12]
         map_event = st.pydeck_chart(
             map_deck,
             use_container_width=True,
             height=520,
             on_select="rerun",
             selection_mode="single-object",
-            key="interactive_helpdesk_locations_map",
+            key=selection_widget_key(map_key),
         )
 
         selected_points = []
@@ -6403,60 +6611,16 @@ if selected_tab == "Map":
                 )
                 selected_points = selected_objects.get("helpdesk-points", [])
 
-        if selected_points:
-            selected_point = selected_points[0]
-            st.markdown("#### Selected Helpdesk Point")
-            selected_metric_cols = st.columns(4)
-            show_kpi_card(
-                selected_metric_cols[0],
-                "Records",
-                format_number(selected_point.get("records", 0)),
-                "Submissions at this point",
-                accent="#2F7D69",
-            )
-            show_kpi_card(
-                selected_metric_cols[1],
-                "Submitting CPVs",
-                format_number(selected_point.get("cpv_submitter_count", 0)),
-                "Distinct CPVs who entered data",
-                accent="#1F6FB2",
-            )
-            show_kpi_card(
-                selected_metric_cols[2],
-                "Protection concerns",
-                format_number(selected_point.get("protection_concerns", 0)),
-                "Records at this point",
-                accent="#D9A441",
-            )
-            show_kpi_card(
-                selected_metric_cols[3],
-                "Partner referrals",
-                format_number(selected_point.get("partner_referrals", 0)),
-                "Records at this point",
-                accent="#7C3AED",
-            )
-            selected_details = pd.DataFrame(
-                [
-                    {
-                        "Helpdesk location": selected_point.get("helpdesk_location", "Not recorded"),
-                        "Camp location": selected_point.get("camp_location", "Not recorded"),
-                        "Submitted by (CPV)": selected_point.get("cpv_submitters", "Not recorded"),
-                        "Latitude": selected_point.get("lat"),
-                        "Longitude": selected_point.get("lon"),
-                        "Information requests": selected_point.get("information_requests", 0),
-                        "Disability records": selected_point.get("disability_records", 0),
-                        "First interview": selected_point.get("first_interview", "Not recorded"),
-                        "Latest interview": selected_point.get("latest_interview", "Not recorded"),
-                    }
-                ]
-            )
-            st.dataframe(
-                style_records_table(selected_details),
-                use_container_width=True,
-                hide_index=True,
-            )
+        selected_id = selected_points[0].get("point_id") if selected_points else None
+        current_point = map_points[map_points["point_id"].eq(selected_id)]
+        if not current_point.empty:
+            point = current_point.iloc[0]
+            exact = map_point_records(filtered_records, point["point_id"])
+            render_selection_panel(exact[[c for c in PUBLIC_RECORD_COLUMNS if c in exact]],
+                                   [point["point_label"]], "map_detail_" + point["point_id"],
+                                   filtered_referrals, map_key)
         else:
-            st.info("Click a map point to view its operational details here.")
+            st.caption("Select a point, or use Open row details in the table below.")
 
         map_summary = map_points.rename(
             columns={
@@ -6476,6 +6640,7 @@ if selected_tab == "Map":
             }
         )[
             [
+                "point_id",
                 "Camp location",
                 "Helpdesk location",
                 "Latitude",
@@ -6492,9 +6657,12 @@ if selected_tab == "Map":
             ]
         ]
         st.subheader("Mapped Helpdesk Points")
-        selected_map_location = render_dashboard_table(map_summary, label_column="Helpdesk location")
-        if selected_map_location is not None:
-            show_selection_details(filtered_records, "helpdesk_location", [selected_map_location], interaction_key("map_table_detail"))
+        selected_map_id = render_dashboard_table(map_summary, label_column="Helpdesk location", selection_column="point_id")
+        if selected_map_id is not None:
+            exact = map_point_records(filtered_records, selected_map_id)
+            point = map_points[map_points["point_id"].eq(selected_map_id)].iloc[0]
+            render_selection_panel(exact[[c for c in PUBLIC_RECORD_COLUMNS if c in exact]],
+                                   [point["point_label"]], interaction_key("map_table_detail"), filtered_referrals)
 
 if selected_tab == "CPV Work":
     st.subheader("CPV Work Summary")
@@ -6667,6 +6835,8 @@ if selected_tab == "CPV Work":
         if selected_cpv is not None:
             show_selection_details(filtered_records, "staff_name", [selected_cpv], interaction_key("cpv_table_detail"))
 
+    render_cpv_name_review(secure_records, "cpv_work_name_review")
+
 if selected_tab == "DQA":
     st.subheader("Data Quality Assurance (DQA)")
     st.markdown(
@@ -6688,7 +6858,7 @@ if selected_tab == "DQA":
             issue_view = dqa_issue_records(dqa_records, chosen_issue)
             st.markdown(f"**{chosen_issue} · {len(issue_view):,} source submissions**")
             if chosen_issue == "CPV names to review":
-                st.caption("Names absent from the current harmonization map, including missing names. This is a review list, not proof of a naming error.")
+                st.caption("Missing, ambiguous or insufficiently matched CPV names. These are not automatically classified as new staff. Review proposed matches in the protected CPV Work section.")
             issue_query = st.text_input("Search issue records", key=interaction_key("dqa_issue_search"))
             st.dataframe(
                 style_records_table(search_records(issue_view, issue_query).head(RECORD_PREVIEW_LIMIT).reset_index(drop=True)),
@@ -6834,20 +7004,8 @@ if selected_tab == "DQA":
 
 if selected_tab == "Records":
     st.subheader("Filtered Records")
-    st.caption("Read-only view. Columns are restricted to the approved public-data contract.")
-    ordered_columns = [col for col in CORE_RECORD_COLUMNS if col in filtered_records.columns] + [col for col in filtered_records.columns if col not in CORE_RECORD_COLUMNS]
-    default_columns = [col for col in CORE_RECORD_COLUMNS if col in ordered_columns]
-    if "record_columns" not in st.session_state:
-        st.session_state["record_columns"] = default_columns
-    st.session_state["record_columns"] = [col for col in st.session_state["record_columns"] if col in ordered_columns]
-    selected_columns = st.multiselect("Columns", ordered_columns, key="record_columns")
-    if not selected_columns:
-        selected_columns = default_columns
-    query = st.text_input("Search filtered records", placeholder="Search by record ID, location, category, status...", key="records_search")
-    searched_records = search_records(filtered_records, query)
-    preview_records = searched_records[selected_columns].head(RECORD_PREVIEW_LIMIT)
-    st.caption(f"Showing {format_number(len(preview_records))} preview records from {format_number(len(searched_records))} matching records.")
-    st.dataframe(style_records_table(preview_records), use_container_width=True, hide_index=True)
+    st.caption("Read-only submission records.")
+    render_record_browser(filtered_records, "records_browser")
 
     with st.expander("Protected DQA table: education concerns with PII", expanded=False):
         st.markdown(

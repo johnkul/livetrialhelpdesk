@@ -163,6 +163,7 @@
 
 @media (max-width: 700px) {
     .block-container {
+        padding-top: 4.5rem !important;
         padding-left: 0.85rem !important;
         padding-right: 0.85rem !important;
     }
@@ -1572,4 +1573,43 @@ section[data-testid="stSidebar"] .st-key-helpdesk_section [data-testid="stWidget
     .live-sync-card {
         background: linear-gradient(135deg, #1B302A, var(--control-panel-strong));
     }
+}
+
+/* Reporting interface: quiet surfaces, explicit navigation and readable data. */
+.stApp { background: var(--surface-3) !important; }
+section[data-testid="stSidebar"] { background: var(--control-panel) !important; }
+.app-header, .section-intro-card, .kpi-card, .insight-card,
+.cpv-table-title, .report-selection {
+    background: var(--surface) !important;
+    box-shadow: none !important;
+}
+.app-header { border-left-width: 3px; }
+.kpi-card { border-top-width: 2px; height: auto; min-height: 148px; }
+.kpi-card:hover { transform: none; }
+.kpi-label { text-transform: none; letter-spacing: normal; font-weight: 600; }
+.section-intro-desc, .section-note, .kpi-context { font-size: .9rem; line-height: 1.5; }
+section[data-testid="stSidebar"] [data-testid="stExpander"],
+section[data-testid="stSidebar"] [data-testid="stExpander"] details summary {
+    background: var(--surface) !important;
+    box-shadow: none !important;
+}
+section[data-testid="stSidebar"] .stButton button {
+    background: var(--surface) !important;
+}
+div[data-testid="stVegaLiteChart"], div[data-testid="stArrowVegaLiteChart"] {
+    background: #fff; box-shadow: none; padding: 8px;
+}
+.stApp .stButton button, .stApp [data-testid="stPopoverButton"] { min-height: 44px; }
+.stApp button:focus-visible, .stApp input:focus-visible, .stApp [tabindex="0"]:focus-visible {
+    outline: 3px solid var(--accent-blue); outline-offset: 2px;
+}
+.dashboard-table-wrap { max-width: 100%; }
+.dashboard-table { width: 100%; table-layout: fixed; }
+.dashboard-table td, .dashboard-table th { overflow-wrap: anywhere; white-space: normal; }
+@media (max-width: 760px) {
+    [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; gap: 12px !important; }
+    [data-testid="stColumn"] { min-width: min(100%, 240px) !important; flex: 1 1 240px !important; }
+    .report-selection-heading, .report-selection-values { flex-direction: column; }
+    .app-header, .section-intro-card { padding: .7rem !important; }
+    .stApp [role="radiogroup"] { flex-wrap: wrap; }
 }
