@@ -4221,21 +4221,17 @@ def clear_keyboard_selection(widget_key):
 
 
 def render_dashboard_table(table, label_column=None, max_height=560, selection_column=None):
-    """Searchable grid or wrapped table, with keyboard access in both modes."""
+    """Show all summary rows for the report filters, with accessible drilldowns."""
     if table.empty:
         st.info("No records match the selected filters.")
         return None
     identity = selection_column or label_column
     key = interaction_key("table:" + str(label_column) + repr(list(table.columns)))
-    query = st.text_input("Search this table", key=key + "_search", placeholder="Find a category or value…")
     with st.popover("Table display"):
         long_text = label_column in table and table[label_column].astype(str).str.len().max() > 90
         density = st.radio("Reading layout", ["Compact", "Comfortable", "Wrapped"],
                            index=2 if long_text else 0, key=key + "_layout")
-    view = search_records(table, query).reset_index(drop=True)
-    if view.empty:
-        st.info("No rows match your search. Clear the search to see the full table.")
-        return None
+    view = table.reset_index(drop=True)
     visible = view.drop(columns=[selection_column], errors="ignore") if selection_column else view
     row_signature = hashlib.sha256(view.to_json(date_format="iso").encode()).hexdigest()[:12]
     base_key = key + row_signature
@@ -4273,7 +4269,7 @@ def render_dashboard_table(table, label_column=None, max_height=560, selection_c
             chosen = st.selectbox("Choose a row", values, index=None,
                                   format_func=lambda v: labels[v],
                                   key=selection_widget_key(base_key) + "_picker",
-                                  placeholder="Search a row…")
+                                  placeholder="Select a row…")
         if chosen is not None:
             selected = chosen
         if selected is not None:
@@ -4908,7 +4904,7 @@ def draw_request_type_bar(frame, height=190):
             scale=alt.Scale(domain=type_order, range=type_colors[: len(type_order)]),
         ),
         tooltip=[
-            alt.Tooltip("Request type:N", title="Request type"),
+            alt.Tooltip("Request type:N", title="Type of Intervention"),
             alt.Tooltip("Records:Q", title="Records", format=","),
             alt.Tooltip("Share:Q", title="Share", format=".1%"),
         ],
@@ -5174,7 +5170,7 @@ def section_header(title, note=None):
 
 
 HELPDESK_SECTION_META = {
-    "Overview": ("🏠", "Overview", "Review overall volume, request mix, demographics and location coverage."),
+    "Overview": ("🏠", "Overview", "Review overall volume, intervention types, demographics and location coverage."),
     "CPV Work": ("👥", "Staff / CPV Performance", "Compare staff workload, requests, referrals, follow-up and operating coverage."),
     "Disability": ("♿", "Disability Inclusion", "Review disability prevalence, impairment types and single versus multiple impairments."),
     "Concerns": ("🛡️", "Protection Concerns", "Explore reported protection concerns, rankings and age/gender patterns."),
@@ -6214,11 +6210,11 @@ if selected_tab == "Overview":
     if overview_view == "Summary":
         st.subheader("Submission trend")
         draw_submission_trend(filtered_records)
-        st.subheader("Request mix")
+        st.subheader("Type of Intervention Sort")
         draw_request_type_bar(filtered_records, height=190)
-        with st.expander("View request breakdown", on_change="rerun", key="overview_request_table") as panel:
+        with st.expander("View intervention breakdown", on_change="rerun", key="overview_request_table") as panel:
             if panel.open:
-                show_gender_table(filtered_records, "request_category", "Request type")
+                show_gender_table(filtered_records, "request_category", "Type of Intervention")
         show_period_comparison(records, filters, min_date)
     elif overview_view == "Visits":
         st.subheader("First-time and repeat visits")
