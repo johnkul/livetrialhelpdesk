@@ -1671,7 +1671,7 @@ div[data-testid="stVegaLiteChart"], div[data-testid="stArrowVegaLiteChart"] {
 .overview-filter-line span { overflow-wrap: anywhere; }
 .overview-filter-line b { font-weight: 600; color: #253f35; margin-right: 5px; }
 .overview-metric-strip {
-    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0 0 12px;
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0 0 12px;
     background: #fff; border: 1px solid #dae3df; border-radius: 8px; padding: 20px 0;
 }
 .overview-metric { padding: 0 22px; border-left: 1px solid #e3e9e6; min-width: 0; }
@@ -1716,10 +1716,10 @@ div[data-testid="stVegaLiteChart"], div[data-testid="stArrowVegaLiteChart"] {
     .overview-update { text-align: left; font-size: .72rem; }
     .overview-update span, .overview-update strong { display: inline; margin-right: 6px; }
     .overview-filter-line { gap: 6px 16px; font-size: .75rem; }
-    .overview-metric-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 0; }
+    .overview-metric-strip { grid-template-columns: 1fr; padding: 0; }
     .overview-metric { padding: 15px; }
-    .overview-metric:nth-child(3) { border-left: 0; }
-    .overview-metric:nth-child(n+3) { border-top: 1px solid #e3e9e6; }
+    .overview-metric { border-left: 0; }
+    .overview-metric + .overview-metric { border-top: 1px solid #e3e9e6; }
     .overview-metric dd { font-size: 1.7rem; }
     .st-key-overview_trend_report, .st-key-overview_intervention_report { padding: 16px 12px; }
     .intervention-report-table thead th:first-child { width: 43%; }
