@@ -4561,6 +4561,22 @@ def intervention_summary_table(frame):
     return pd.concat([table[columns], total], ignore_index=True)
 
 
+def intervention_gender_table(frame):
+    """Use the same entry population as the intervention summary, including missing values."""
+    if frame.empty or "request_category" not in frame:
+        return pd.DataFrame(columns=["Intervention", "Total"])
+    entries = frame[["request_category"]].copy()
+    entries["Intervention"] = entries["request_category"].fillna("[Missing]").astype(str).replace({
+        "Reporting a protection concern": "Protection concern",
+        "Seeking general protection information": "General information",
+    })
+    entries["information_seeker_gender"] = (
+        frame["information_seeker_gender"].map(clean_text).fillna("[Not recorded]")
+        if "information_seeker_gender" in frame else "[Not recorded]"
+    )
+    return gender_pivot_table(entries, "Intervention", "Intervention")
+
+
 def submission_trend_table(frame):
     if frame.empty or "reporting_date" not in frame:
         return pd.DataFrame(columns=["Month", "Submissions"])
@@ -4597,6 +4613,10 @@ def render_overview_panels(frame):
         st.html('<div class="intervention-report-table"><table><caption class="table-accessible-caption">Intervention submissions and share for the current report filters</caption>'
                 '<thead><tr><th scope="col">Intervention</th><th scope="col">Entries</th><th scope="col">Share (%)</th></tr></thead>'
                 f'<tbody>{"".join(rows)}</tbody></table></div>')
+        st.subheader("Type of Intervention Sort — by gender")
+        st.caption("Gender of the person seeking information or support, not the submitting staff member. Row totals match the intervention table above.")
+        render_dashboard_table(intervention_gender_table(frame), label_column="Intervention",
+                               compact_panel=True, enable_details=False)
     with st.container(key="overview_trend_report"):
         st.subheader("Entries over time")
         st.caption("Entries received each month within the selected dates. Hover over a point to see the count.")
@@ -5399,9 +5419,10 @@ def render_report_header(section, last_updated):
         "Records": ("Submission records", "Read-only entries for the selected dates and locations."),
     }
     title, description = titles[section]
-    st.html('<header class="overview-report-header"><div>'
-            '<div class="overview-eyebrow">TDH KENYA · PROTECTION HELPDESKS</div>'
-            f'<h1>{escape_text(title)}</h1><p>{escape_text(description)}</p></div>'
+    st.html('<header class="overview-report-header"><div class="report-brand">'
+            f'{tdh_logo_html()}<div class="report-brand-copy">'
+            '<h1>TDH KENYA · PROTECTION HELPDESKS</h1>'
+            f'<h2 class="report-section-title">{escape_text(title)}</h2><p>{escape_text(description)}</p></div></div>'
             f'<div class="overview-update"><span>Last data update</span><strong>{escape_text(last_updated)}</strong></div></header>')
 
 
@@ -5468,10 +5489,11 @@ def kpi_group_caption(text):
     st.markdown(f'<div class="kpi-group-caption">{escape_text(text)}</div>', unsafe_allow_html=True)
 
 
-def render_overview_metrics(total, referrals, follow_up):
+def render_overview_metrics(total, referrals, follow_up, staff_submissions, staff_count):
     items = [("Entries received", total, "Submitted records, not unique people"),
              ("Entries referred to partners", referrals, f"{format_rate(referrals, total)} of entries received"),
-             ("Entries requiring follow-up", follow_up, f"{format_rate(follow_up, total)} of entries received")]
+             ("Entries requiring follow-up", follow_up, f"{format_rate(follow_up, total)} of entries received"),
+             ("Staff submissions", staff_submissions, f"Entries with a recorded staff name · {staff_count:,} contributing CPVs")]
     render_report_figures(items)
 
 
@@ -5480,7 +5502,7 @@ def render_report_figures(items):
     for label, value, context in items:
         cells.append(f'<div class="overview-metric"><dt>{escape_text(label)}</dt>'
                      f'<dd>{escape_text(format_number(value))}</dd><span>{escape_text(context)}</span></div>')
-    st.html('<dl class="overview-metric-strip" aria-label="Report headline figures">' + "".join(cells) + '</dl>')
+    st.html(f'<dl class="overview-metric-strip" data-count="{len(items)}" aria-label="Report headline figures">' + "".join(cells) + '</dl>')
 
 
 def show_kpi_card(column, label, value, context, share=None, accent="var(--accent-base)"):
@@ -5535,15 +5557,17 @@ def encode_image_data_uri(path_str, mtime):
     if not path.exists():
         return None
     suffix = path.suffix.lower().lstrip(".")
-    mime = "image/jpeg" if suffix in ("jpg", "jpeg") else f"image/{suffix or 'png'}"
+    mime = "image/svg+xml" if suffix == "svg" else "image/jpeg" if suffix in ("jpg", "jpeg") else f"image/{suffix or 'png'}"
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return f"data:{mime};base64,{encoded}"
 
 
 def tdh_logo_html():
-    if not LOGO_PATH.exists():
+    # Preserve a deployment's existing PNG; otherwise use the bundled official SVG.
+    logo_path = LOGO_PATH if LOGO_PATH.exists() else LOGO_PATH.with_suffix(".svg")
+    if not logo_path.exists():
         return ""
-    data_uri = encode_image_data_uri(str(LOGO_PATH), LOGO_PATH.stat().st_mtime_ns)
+    data_uri = encode_image_data_uri(str(logo_path), logo_path.stat().st_mtime_ns)
     return f'<img class="app-header-logo" src="{data_uri}" alt="Tdh logo" />' if data_uri else ""
 
 
@@ -6356,8 +6380,10 @@ repeat_visitors = known_visit_records["helpdesk_visit_history"].eq("Repeat visit
 if "staff_name" in filtered_records.columns:
     harmonized_staff = filtered_records["staff_name"].map(normalize_staff_name)
     staff_no = int(harmonized_staff[harmonized_staff.ne("[Not recorded]")].nunique())
+    staff_submission_count = int(harmonized_staff.ne("[Not recorded]").sum())
 else:
     staff_no = 0
+    staff_submission_count = 0
 if kobo_configured():
     last_fetch_timestamp = pd.to_datetime(
         source_metadata.get("fetched_at"), utc=True, errors="coerce"
@@ -6385,7 +6411,7 @@ if filtered_records.empty and selected_tab not in {"DQA", "Overview"}:
 # deliberately omitted from analytical sections so users reach their data
 # immediately without repeatedly scrolling past the same summary cards.
 if selected_tab == "Overview":
-    render_overview_metrics(total_records, partner_referrals, follow_up)
+    render_overview_metrics(total_records, partner_referrals, follow_up, staff_submission_count, staff_no)
 if selected_tab != "Overview":
     st.button("← Back to Overview", key="helpdesk_back_to_overview", on_click=helpdesk_go_to_overview)
 
