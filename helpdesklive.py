@@ -30,7 +30,7 @@ DEVELOPER_LOGO_PATH = BASE_DIR / "assets" / "developer-logo.png"
 STYLES_PATH = BASE_DIR / "assets" / "styles.css"
 DATA_FILE_PATH = Path(os.environ.get("HELPDESK_DATA_PATH") or (BASE_DIR / "data" / "HELPDESK_DashboardData_Tdh_Kenya_D2.xlsx"))
 PROCESSED_CACHE_PATH = BASE_DIR / "data" / "processed" / "helpdesk_processed_cache.pkl"
-PROCESSED_CACHE_VERSION = "2026-09-13-kobo-v6-roster-name-matching"
+PROCESSED_CACHE_VERSION = "2026-09-14-kobo-v7-age-reporting-groups"
 KOBO_REFRESH_WINDOW_SECONDS = 1800
 KOBO_CACHE_TTL_SECONDS = KOBO_REFRESH_WINDOW_SECONDS
 KOBO_SCHEMA_CACHE_TTL_SECONDS = 300
@@ -901,18 +901,24 @@ st.set_page_config(
 # -----------------------------------------------------------------------------
 # Constants
 # -----------------------------------------------------------------------------
-AGE_GROUP_ORDER = [
-    "0-5 Years",
-    "6-11 Years",
-    "12-17 Years",
-    "18-35 Years",
-    "36-49 Years",
-    "50-64 Years",
-    "65 Years and Above",
-    "[Missing]",
-]
-CHILD_AGE_GROUPS = {"0-5 Years", "6-11 Years", "12-17 Years"}
-ADULT_AGE_GROUPS = {"18-35 Years", "36-49 Years", "50-64 Years", "65 Years and Above"}
+# Requested reporting crosswalk, not a recalculation from exact ages.
+# Preserve information_seeker_age as supplied by the source.
+AGE_GROUP_DISPLAY_MAP = {
+    "0-5 years": "0-4 years",
+    "6-11 years": "5-11 years",
+    "12-17 years": "12-17 years",
+    "18-35 years": "18-59 years",
+    "36-49 years": "18-59 years",
+    "50-64 years": "60+ years",
+    "65 years and above": "60+ years",
+    "0-4 years": "0-4 years",
+    "5-11 years": "5-11 years",
+    "18-59 years": "18-59 years",
+    "60+ years": "60+ years",
+}
+AGE_GROUP_ORDER = ["0-4 years", "5-11 years", "12-17 years", "18-59 years", "60+ years", "[Missing]"]
+CHILD_AGE_GROUPS = {"0-4 years", "5-11 years", "12-17 years", "0-5 Years", "6-11 Years", "12-17 Years"}
+ADULT_AGE_GROUPS = {"18-59 years", "60+ years", "18-35 Years", "36-49 Years", "50-64 Years", "65 Years and Above"}
 
 GENDER_ORDER = ["Girl", "Boy", "Woman", "Man", "Transgender", "[Missing]"]
 VISIT_HISTORY_ORDER = ["First-time visitor", "Repeat visitor", "[Missing]"]
@@ -1899,6 +1905,10 @@ def migrate_processed_cache_data(processed_data):
         information["general_information_need"] = information["general_information_need"].map(
             standardize_information_need_label
         )
+    dashboard_records, secure_records, dqa_records, protection, information, referrals = (
+        map_reporting_age_groups(frame)
+        for frame in (dashboard_records, secure_records, dqa_records, protection, information, referrals)
+    )
     return dashboard_records, secure_records, dqa_records, protection, information, referrals, kpis
 
 
@@ -2142,6 +2152,26 @@ def safe_share(numerator, denominator):
 # -----------------------------------------------------------------------------
 # Data derivation helpers
 # -----------------------------------------------------------------------------
+def reporting_age_group(value):
+    """Map source age bands to the agreed report groups; retain unknown values."""
+    cleaned = clean_text(value)
+    if pd.isna(cleaned):
+        return cleaned
+    key = str(cleaned).casefold().replace("–", "-").replace("—", "-")
+    key = re.sub(r"\s*-\s*", "-", key)
+    key = re.sub(r"\s+", " ", key).strip()
+    return AGE_GROUP_DISPLAY_MAP.get(key, cleaned)
+
+
+def map_reporting_age_groups(frame):
+    """Copy the derived column only; never overwrite source ages or shared caches."""
+    if not isinstance(frame, pd.DataFrame) or "age_group" not in frame:
+        return frame
+    result = frame.copy()
+    result["age_group"] = result["age_group"].map(reporting_age_group)
+    return result
+
+
 def age_group_life_stage(age_group):
     age_group = clean_text(age_group)
     if pd.isna(age_group):
@@ -3177,7 +3207,7 @@ def load_data(source_signature):
     staff_audit_columns = ["staff_name_raw", "staff_name", "staff_match_status", "staff_match_score", "staff_match_suggestions"]
     staff_name_audit = records.groupby(staff_audit_columns, dropna=False).size().reset_index(name="Submissions")
     records["household_type"] = records["household_type"].map(clean_text)
-    records["age_group"] = records["information_seeker_age"].map(clean_text)
+    records["age_group"] = records["information_seeker_age"].map(reporting_age_group)
     records["derived_life_stage"] = records["age_group"].map(age_group_life_stage)
     records["information_seeker_type_raw"] = records["information_seeker_type"].map(clean_text)
     records["information_seeker_gender_raw"] = records["information_seeker_gender"].map(clean_text)
@@ -4553,8 +4583,8 @@ def intervention_summary_table(frame):
     counts = frame["request_category"].fillna("[Missing]").astype(str).value_counts()
     table = counts.rename_axis("_category").reset_index(name="Submissions")
     table["Intervention"] = table["_category"].replace({
-        "Reporting a protection concern": "Protection concern",
-        "Seeking general protection information": "General information",
+        "Reporting a protection concern": "Reporting Protection concern",
+        "Seeking general protection information": "Seeking general information or services",
     })
     table["Share (%)"] = table["Submissions"] / len(frame) * 100
     total = pd.DataFrame([["Total", "Total", len(frame), 100.0]], columns=columns)
@@ -4567,8 +4597,8 @@ def intervention_gender_table(frame):
         return pd.DataFrame(columns=["Intervention", "Total"])
     entries = frame[["request_category"]].copy()
     entries["Intervention"] = entries["request_category"].fillna("[Missing]").astype(str).replace({
-        "Reporting a protection concern": "Protection concern",
-        "Seeking general protection information": "General information",
+        "Reporting a protection concern": "Reporting Protection concern",
+        "Seeking general protection information": "Seeking general information or services",
     })
     entries["information_seeker_gender"] = (
         frame["information_seeker_gender"].map(clean_text).fillna("[Not recorded]")
@@ -4593,7 +4623,7 @@ def render_overview_panels(frame):
         st.info("No entries match the selected dates and locations. Adjust the existing filters to see results.")
         return
     with st.container(key="overview_intervention_report"):
-        st.subheader("Type of Intervention Sort")
+        st.subheader("Type of Intervention Sought")
         st.caption("What were the entries about? Each entry is counted once in this table.")
         table = intervention_summary_table(frame)
         if table.empty:
@@ -4613,7 +4643,7 @@ def render_overview_panels(frame):
         st.html('<div class="intervention-report-table"><table><caption class="table-accessible-caption">Intervention submissions and share for the current report filters</caption>'
                 '<thead><tr><th scope="col">Intervention</th><th scope="col">Entries</th><th scope="col">Share (%)</th></tr></thead>'
                 f'<tbody>{"".join(rows)}</tbody></table></div>')
-        st.subheader("Type of Intervention Sort — by gender")
+        st.subheader("Type of Intervention Sought — by gender")
         st.caption("Gender of the person seeking information or support, not the submitting staff member. Row totals match the intervention table above.")
         render_dashboard_table(intervention_gender_table(frame), label_column="Intervention",
                                compact_panel=True, enable_details=False)
@@ -5041,8 +5071,8 @@ def draw_request_type_bar(frame, height=190):
         return
 
     display_labels = {
-        "Reporting a protection concern": "Protection concern",
-        "Seeking general protection information": "General information",
+        "Reporting a protection concern": "Reporting Protection concern",
+        "Seeking general protection information": "Seeking general information or services",
     }
 
     summary["request_category"] = summary["request_category"].fillna("[Missing]").astype(str)
@@ -5489,11 +5519,11 @@ def kpi_group_caption(text):
     st.markdown(f'<div class="kpi-group-caption">{escape_text(text)}</div>', unsafe_allow_html=True)
 
 
-def render_overview_metrics(total, referrals, follow_up, staff_submissions, staff_count):
+def render_overview_metrics(total, referrals, follow_up, staff_count):
     items = [("Entries received", total, "Submitted records, not unique people"),
              ("Entries referred to partners", referrals, f"{format_rate(referrals, total)} of entries received"),
              ("Entries requiring follow-up", follow_up, f"{format_rate(follow_up, total)} of entries received"),
-             ("Staff submissions", staff_submissions, f"Entries with a recorded staff name · {staff_count:,} contributing CPVs")]
+             ("Number of staff", staff_count, "Distinct staff / CPVs contributing within the selected filters")]
     render_report_figures(items)
 
 
@@ -6380,10 +6410,8 @@ repeat_visitors = known_visit_records["helpdesk_visit_history"].eq("Repeat visit
 if "staff_name" in filtered_records.columns:
     harmonized_staff = filtered_records["staff_name"].map(normalize_staff_name)
     staff_no = int(harmonized_staff[harmonized_staff.ne("[Not recorded]")].nunique())
-    staff_submission_count = int(harmonized_staff.ne("[Not recorded]").sum())
 else:
     staff_no = 0
-    staff_submission_count = 0
 if kobo_configured():
     last_fetch_timestamp = pd.to_datetime(
         source_metadata.get("fetched_at"), utc=True, errors="coerce"
@@ -6411,7 +6439,7 @@ if filtered_records.empty and selected_tab not in {"DQA", "Overview"}:
 # deliberately omitted from analytical sections so users reach their data
 # immediately without repeatedly scrolling past the same summary cards.
 if selected_tab == "Overview":
-    render_overview_metrics(total_records, partner_referrals, follow_up, staff_submission_count, staff_no)
+    render_overview_metrics(total_records, partner_referrals, follow_up, staff_no)
 if selected_tab != "Overview":
     st.button("← Back to Overview", key="helpdesk_back_to_overview", on_click=helpdesk_go_to_overview)
 
@@ -6515,8 +6543,8 @@ if selected_tab == "Concerns":
             render_dashboard_table(unique_concerns, label_column="Concern classification",
                                    compact_panel=True, enable_details=False)
             st.caption(
-                f'Total: {int(unique_concerns.iloc[-1]["Total"]):,} entries — matches Protection concern '
-                'in Type of Intervention Sort for the same dates and locations.'
+                f'Total: {int(unique_concerns.iloc[-1]["Total"]):,} entries — matches Reporting Protection concern '
+                'in Type of Intervention Sought for the same dates and locations.'
             )
 
     with report_panel("concerns_summary", "Protection concerns by gender"):
