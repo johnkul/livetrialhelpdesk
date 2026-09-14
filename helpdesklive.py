@@ -4507,6 +4507,45 @@ def show_age_gender_panel(frame, category_column, selected, category_label, key)
     draw_age_gender_breakdown_bar(frame, category_column, selected, category_label, height=280)
 
 
+def exclusive_protection_concern_table(records, protection):
+    """Count each Overview protection entry once, not each expanded concern mention.
+
+    Keep the same row population as the Overview (including duplicate-ID rows,
+    which DQA audits separately). IDs link the existing standardized concern
+    labels; repeated copies of the same label do not create multiple concerns.
+    """
+    label_column = "Concern classification"
+    if records.empty or "request_category" not in records:
+        return pd.DataFrame(columns=[label_column, "Total"])
+    entries = records.loc[
+        records["request_category"].eq("Reporting a protection concern")
+    ].copy()
+    if entries.empty:
+        return pd.DataFrame(columns=[label_column, "Total"])
+
+    classifications = {}
+    if {"record_id", "protection_concern"}.issubset(protection.columns):
+        labels = protection[["record_id", "protection_concern"]].copy()
+        labels["record_id"] = labels["record_id"].map(clean_text)
+        labels["protection_concern"] = labels["protection_concern"].map(clean_text)
+        labels = labels.dropna(subset=["record_id", "protection_concern"])
+        labels = labels[~labels["protection_concern"].isin(["[Missing]", "[Not recorded]", "None", "nan", "NaT"])]
+        for record_id, group in labels.groupby("record_id", sort=False):
+            concerns = group["protection_concern"].drop_duplicates().tolist()
+            classifications[record_id] = concerns[0] if len(concerns) == 1 else "Multiple concerns reported"
+
+    if "record_id" in entries:
+        entries[label_column] = entries["record_id"].map(clean_text).map(classifications).fillna("Concern not specified")
+    else:
+        entries[label_column] = "Concern not specified"
+    # Missing gender must remain in the total rather than being lost in a pivot.
+    if "information_seeker_gender" not in entries:
+        entries["information_seeker_gender"] = "[Not recorded]"
+    else:
+        entries["information_seeker_gender"] = entries["information_seeker_gender"].map(clean_text).fillna("[Not recorded]")
+    return gender_pivot_table(entries, label_column, label_column)
+
+
 def intervention_summary_table(frame):
     columns = ["_category", "Intervention", "Submissions", "Share (%)"]
     if frame.empty or "request_category" not in frame:
@@ -6437,7 +6476,25 @@ if selected_tab == "Disability":
 # Other tabs
 # -----------------------------------------------------------------------------
 if selected_tab == "Concerns":
+    with report_panel("concerns_unique", "Protection concerns by gender — each entry counted once"):
+        st.caption(
+            "One concern selected: counted under that concern. Several concerns selected: counted once under "
+            "Multiple concerns reported. No concern specified: counted under Concern not specified. "
+            "These are submission counts, not unique people."
+        )
+        unique_concerns = exclusive_protection_concern_table(filtered_records, filtered_protection)
+        if unique_concerns.empty:
+            st.info("No protection-concern entries match the selected filters.")
+        else:
+            render_dashboard_table(unique_concerns, label_column="Concern classification",
+                                   compact_panel=True, enable_details=False)
+            st.caption(
+                f'Total: {int(unique_concerns.iloc[-1]["Total"]):,} entries — matches Protection concern '
+                'in Type of Intervention Sort for the same dates and locations.'
+            )
+
     with report_panel("concerns_summary", "Protection concerns by gender"):
+        st.caption("All reported concern selections. An entry with several concerns contributes to each selected concern; this total can be higher than the entry count above.")
         show_ranked_gender_panel(filtered_protection, "protection_concern", "Protection concern", "concern_summary")
 
     with report_panel("concerns_age", "Protection concerns by age group"):
