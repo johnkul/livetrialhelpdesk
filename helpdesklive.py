@@ -8,6 +8,7 @@ import pickle
 import re
 import time
 from collections.abc import Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
@@ -4181,7 +4182,7 @@ def render_wrapped_table(table, label_column=None, max_height=560):
     table_html = (
         f'<div class="dashboard-table-wrap" tabindex="0" role="region" aria-label="Scrollable summary table" '
         f'style="max-height: {int(max_height)}px;">'
-        + '<table class="dashboard-table">'
+        + f'<table class="dashboard-table" data-columns="{len(columns)}">'
         + f'<caption class="table-accessible-caption">{escape_text(label_column or "Summary")} breakdown for the current report filters</caption>'
         + f"<thead><tr>{''.join(header_cells)}</tr></thead>"
         + f"<tbody>{''.join(body_rows)}</tbody>"
@@ -4220,7 +4221,7 @@ def clear_keyboard_selection(widget_key):
     st.session_state[widget_key + "_picker"] = None
 
 
-def render_dashboard_table(table, label_column=None, max_height=560, selection_column=None, compact_panel=False):
+def render_dashboard_table(table, label_column=None, max_height=560, selection_column=None, compact_panel=False, enable_details=True):
     """Show all summary rows for the report filters, with accessible drilldowns."""
     if table.empty:
         st.info("No records match the selected filters.")
@@ -4254,14 +4255,14 @@ def render_dashboard_table(table, label_column=None, max_height=560, selection_c
             style_records_table(visible), width="stretch", hide_index=True,
             height=min(max_height, max(110, 38 + row_height * len(view))), row_height=row_height,
             column_config=config, key=selection_widget_key(base_key),
-            on_select=(lambda: clear_keyboard_selection(selection_widget_key(base_key))) if identity in view else "ignore",
+            on_select=(lambda: clear_keyboard_selection(selection_widget_key(base_key))) if enable_details and identity in view else "ignore",
             selection_mode="single-row",
         )
-        if identity in view and event.selection.rows:
+        if enable_details and identity in view and event.selection.rows:
             position = event.selection.rows[0]
             if 0 <= position < len(view) and str(view.iloc[position][label_column]) != "Total":
                 selected = view.iloc[position][identity]
-    if identity in view:
+    if enable_details and identity in view:
         candidates = view[view[label_column].astype(str).ne("Total")]
         values = candidates[identity].drop_duplicates().tolist()
         labels = {}
@@ -4327,24 +4328,25 @@ def render_record_browser(frame, key):
         return
     query = st.text_input("Search records", key=key + "_search",
                           placeholder="Search submission ID, CPV, helpdesk or request…")
-    preset = st.selectbox("Columns to show", [*RECORD_COLUMN_PRESETS, "Custom"], key=key + "_preset")
-    columns = [c for c in RECORD_COLUMN_PRESETS.get(preset, RECORD_COLUMN_PRESETS["Essential"]) if c in approved]
-    if preset == "Custom":
-        available = list(approved.columns)
-        sanitize_multiselect_state(key + "_columns", available)
-        columns = st.multiselect("Choose columns", available, default=None, key=key + "_columns",
-                                 format_func=record_column_label)
-        if not columns:
-            st.info("Choose at least one column to display.")
-            return
-    sort_col, direction_col, size_col = st.columns([2, 1.4, 1])
-    sort_options = [c for c in ["reporting_date", "staff_name", "helpdesk_location", "record_id"] if c in approved]
-    with sort_col:
-        sort_column = st.selectbox("Sort records by", sort_options, format_func=record_column_label, key=key + "_sort")
-    with direction_col:
-        direction = st.selectbox("Order", ["Newest / Z–A", "Oldest / A–Z"], key=key + "_order")
-    with size_col:
-        page_size = st.selectbox("Rows per page", [25, 50, 100], key=key + "_size")
+    with st.expander("Table display options", expanded=False):
+        preset = st.selectbox("Columns to show", [*RECORD_COLUMN_PRESETS, "Custom"], key=key + "_preset")
+        columns = [c for c in RECORD_COLUMN_PRESETS.get(preset, RECORD_COLUMN_PRESETS["Essential"]) if c in approved]
+        if preset == "Custom":
+            available = list(approved.columns)
+            sanitize_multiselect_state(key + "_columns", available)
+            columns = st.multiselect("Choose columns", available, default=None, key=key + "_columns",
+                                     format_func=record_column_label)
+            if not columns:
+                st.info("Choose at least one column to display.")
+                return
+        sort_col, direction_col, size_col = st.columns([2, 1.4, 1])
+        sort_options = [c for c in ["reporting_date", "staff_name", "helpdesk_location", "record_id"] if c in approved]
+        with sort_col:
+            sort_column = st.selectbox("Sort records by", sort_options, format_func=record_column_label, key=key + "_sort")
+        with direction_col:
+            direction = st.selectbox("Order", ["Newest / Z–A", "Oldest / A–Z"], key=key + "_order")
+        with size_col:
+            page_size = st.selectbox("Rows per page", [25, 50, 100], key=key + "_size")
     context = (query, sort_column, direction, page_size, st.session_state.get("interaction_context"))
     if st.session_state.get(key + "_page_context") != context:
         st.session_state[key + "_page"] = 1
@@ -4461,12 +4463,12 @@ def render_chart_panel(chart, frame, category_column, field, key, compact_contro
         show_selection_details(frame, category_column, selected, key, selection_key=key)
 
 
-def show_gender_table(frame, category_column, category_label, top_n=None):
+def show_gender_table(frame, category_column, category_label, top_n=None, compact_panel=True):
     table = gender_pivot_table(frame, category_column, category_label, top_n=top_n)
     if table.empty:
         st.info("No records match the selected filters.")
         return
-    selected = render_dashboard_table(table, label_column=category_label)
+    selected = render_dashboard_table(table, label_column=category_label, compact_panel=compact_panel)
     if selected is not None:
         show_selection_details(frame, category_column, [selected], interaction_key("detail:" + category_column))
 
@@ -4477,32 +4479,32 @@ def chart_table_view(key):
 
 
 def show_gender_panel(frame, category_column, category_label, key, status=False):
-    """Render only the requested representation of the same breakdown."""
-    if chart_table_view(key) == "Chart":
-        if status:
-            draw_status_donut_pair(frame, category_column, height=300)
-        else:
-            draw_gender_column_bar(frame, category_column, height=320)
-    else:
-        show_gender_table(frame, category_column, category_label)
+    """Exact figures first, followed by one comparison chart; no view switch."""
+    if frame.empty:
+        st.info("No entries match this selection.")
+        return
+    show_gender_table(frame, category_column, category_label)
+    st.caption("Compare the figures below. Hover for values, or select a bar for details.")
+    draw_gender_column_bar(frame, category_column, height=280)
 
 
 def show_ranked_gender_panel(frame, category_column, category_label, key):
-    if chart_table_view(key) == "Table":
-        st.caption("All categories for the current report filters; chart ranking limits do not apply.")
-        show_gender_table(frame, category_column, category_label)
+    if frame.empty:
+        st.info("No entries match this selection.")
         return
-    with st.popover("Chart options"):
+    st.caption("An entry may include several categories, so these totals may exceed the number of entries received.")
+    show_gender_table(frame, category_column, category_label)
+    with st.expander("Adjust chart ranking", expanded=False):
         rank = st.radio("Rank", ["Highest values", "Lowest values"], key=key + "_rank")
         top_n = st.selectbox("Number of categories", [5, 10, 15, 20, 25], index=2, key=key + "_top_n")
-    draw_gender_bar(frame, category_column, top_n=top_n, height=520, ascending=rank == "Lowest values")
+    st.caption(f"Chart: up to {top_n} categories · {rank.lower()}. The table includes all categories. Hover for values or select a bar for details.")
+    draw_gender_bar(frame, category_column, top_n=top_n, height=320, ascending=rank == "Lowest values")
 
 
 def show_age_gender_panel(frame, category_column, selected, category_label, key):
-    if chart_table_view(key) == "Chart":
-        draw_age_gender_breakdown_bar(frame, category_column, selected, category_label, height=320)
-    else:
-        show_age_gender_breakdown_table(frame, category_column, selected, category_label)
+    show_age_gender_breakdown_table(frame, category_column, selected, category_label)
+    st.caption("Age and gender for the selected categories. Hover for values or select a bar for details.")
+    draw_age_gender_breakdown_bar(frame, category_column, selected, category_label, height=280)
 
 
 def intervention_summary_table(frame):
@@ -4718,7 +4720,7 @@ def draw_age_gender_breakdown_bar(
     )
 
     selected_frame = frame[frame[category_column].map(clean_text).fillna("[Missing]").astype(str).isin(selected_categories)]
-    render_selectable_chart(chart, selected_frame, "age_group", "Age group")
+    render_selectable_chart(chart, selected_frame, "age_group", "Age group", compact_controls=True)
 
 
 def show_age_gender_breakdown_table(frame, category_column, selected_categories, category_label):
@@ -4733,7 +4735,7 @@ def show_age_gender_breakdown_table(frame, category_column, selected_categories,
         st.info("No age breakdown is available for the selected option.")
         return
 
-    selected_age = render_dashboard_table(table, label_column="Age group")
+    selected_age = render_dashboard_table(table, label_column="Age group", compact_panel=True)
     if selected_age is not None:
         selected_frame = frame[frame[category_column].map(clean_text).fillna("[Missing]").astype(str).isin(selected_categories)]
         show_selection_details(selected_frame, "age_group", [selected_age], interaction_key("age_details"))
@@ -4796,7 +4798,7 @@ def draw_gender_bar(frame, category_column, top_n=None, height=430, ascending=Fa
             text=alt.Text("_total:Q", format=","),
         )
     )
-    render_selectable_chart(chart + totals_layer, frame, category_column)
+    render_selectable_chart(chart + totals_layer, frame, category_column, compact_controls=True)
 
 
 def draw_gender_column_bar(frame, category_column, top_n=None, height=360):
@@ -4855,7 +4857,7 @@ def draw_gender_column_bar(frame, category_column, top_n=None, height=360):
             )
             .properties(height=height)
         )
-        render_selectable_chart(age_chart, frame, category_column)
+        render_selectable_chart(age_chart, frame, category_column, compact_controls=True)
         return
     else:
         category_order = chart_data.sort_values("Total", ascending=False)[category_column].astype(str).tolist()
@@ -4883,7 +4885,7 @@ def draw_gender_column_bar(frame, category_column, top_n=None, height=360):
             text=alt.Text("Total:Q", format=","),
         )
     )
-    render_selectable_chart(chart + total_labels, frame, category_column)
+    render_selectable_chart(chart + total_labels, frame, category_column, compact_controls=True)
 
 
 def draw_total_donut(frame, category_column, category_label, height=320, min_label_share=0.04):
@@ -5332,6 +5334,38 @@ def helpdesk_section_navigation():
     return selected
 
 
+@contextmanager
+def report_panel(key, title=None, description=None):
+    """Normal-flow report card; contents and tables determine their own height."""
+    with st.container(key="report_panel_" + key):
+        if title:
+            st.subheader(title)
+        if description:
+            st.caption(description)
+        yield
+
+
+def render_report_header(section, last_updated):
+    titles = {
+        "Overview": ("Helpdesk at a glance", "Turkana West & Dadaab"),
+        "People & Visits": ("People & visits", "Age, gender and visit history in the selected entries."),
+        "Locations": ("Location coverage", "Entries received at each camp and helpdesk."),
+        "Disability": ("Disability inclusion", "Reported impairments and age groups in entries with disability."),
+        "Concerns": ("Protection concerns", "Reported concerns and the groups affected."),
+        "Information": ("Information requests", "The information people asked the helpdesk for."),
+        "Referrals": ("Referrals & follow-up", "Actions taken, referral partners and entries needing follow-up."),
+        "Map": ("Service map", "Where entries were recorded and which CPVs submitted them."),
+        "CPV Work": ("Staff / CPV submissions", "Recorded workload, not a measure of service quality."),
+        "DQA": ("Data quality", "Check completeness and records that need review."),
+        "Records": ("Submission records", "Read-only entries for the selected dates and locations."),
+    }
+    title, description = titles[section]
+    st.html('<header class="overview-report-header"><div>'
+            '<div class="overview-eyebrow">TDH KENYA · PROTECTION HELPDESKS</div>'
+            f'<h1>{escape_text(title)}</h1><p>{escape_text(description)}</p></div>'
+            f'<div class="overview-update"><span>Last data update</span><strong>{escape_text(last_updated)}</strong></div></header>')
+
+
 def helpdesk_section_intro(section, filtered_count):
     icon, label, description = HELPDESK_SECTION_META[section]
     category = next(category for category, views in HELPDESK_SECTION_GROUPS.items() if section in views)
@@ -5351,13 +5385,13 @@ def render_report_context(section, count, from_date, to_date, camps, helpdesks, 
     title = "Current report selection"
     count_label = f"{count:,} matching submissions"
     note = "These dates and locations apply across report sections."
-    if section == "Overview":
+    if section != "DQA":
         st.markdown(
             '<div class="report-selection" role="region" aria-label="Report selection">'
             '<div class="overview-filter-line">'
             f'<span>Showing entries received from <b>{escape_text(period)}</b>'
             f' · {escape_text(camp_label)} · {escape_text(helpdesk_label)}.</span></div>'
-            f'<span class="table-accessible-caption">{count:,} matching submissions</span></div>',
+            f'<span class="{"table-accessible-caption" if section == "Overview" else "report-entry-count"}">{count:,} matching submissions</span></div>',
             unsafe_allow_html=True,
         )
         return
@@ -5399,6 +5433,10 @@ def render_overview_metrics(total, referrals, follow_up):
     items = [("Entries received", total, "Submitted records, not unique people"),
              ("Entries referred to partners", referrals, f"{format_rate(referrals, total)} of entries received"),
              ("Entries requiring follow-up", follow_up, f"{format_rate(follow_up, total)} of entries received")]
+    render_report_figures(items)
+
+
+def render_report_figures(items):
     cells = []
     for label, value, context in items:
         cells.append(f'<div class="overview-metric"><dt>{escape_text(label)}</dt>'
@@ -6293,26 +6331,7 @@ if kobo_configured():
 else:
     last_updated = file_signature[3] if file_signature[3] else "Unknown"
 
-header_html = (
-    '<div class="app-header">'
-    f'{tdh_logo_html()}'
-    '<div class="app-header-text">'
-    '<div class="app-header-title">Tdh Kenya Helpdesk Data Dashboard</div>'
-    '<div class="app-header-subtitle">Protection helpdesk monitoring &middot; Turkana West &amp; Dadaab</div>'
-    '</div></div>'
-)
-if selected_tab == "Overview":
-    st.html('<header class="overview-report-header"><div>'
-            '<div class="overview-eyebrow">TDH KENYA · PROTECTION HELPDESKS</div>'
-            '<h1>Helpdesk at a glance</h1>'
-            '<p>Turkana West &amp; Dadaab</p></div>'
-            f'<div class="overview-update"><span>Last data update</span><strong>{escape_text(last_updated)}</strong></div></header>')
-else:
-    if hasattr(st, "html"):
-        st.html(header_html)
-    else:
-        st.markdown(header_html, unsafe_allow_html=True)
-    helpdesk_section_intro(selected_tab, total_records)
+render_report_header(selected_tab, last_updated)
 render_report_context(
     selected_tab, total_records, from_date, to_date,
     selected_camp_locations, selected_helpdesk_locations, audit_count=len(dqa_records),
@@ -6330,7 +6349,6 @@ if selected_tab == "Overview":
     render_overview_metrics(total_records, partner_referrals, follow_up)
 if selected_tab != "Overview":
     st.button("← Back to Overview", key="helpdesk_back_to_overview", on_click=helpdesk_go_to_overview)
-    show_section_findings(selected_tab, filtered_records, filtered_protection, filtered_information, filtered_referrals)
 
 # -----------------------------------------------------------------------------
 # Overview tab
@@ -6339,584 +6357,594 @@ if selected_tab == "Overview":
     render_overview_panels(filtered_records)
 
 if selected_tab == "People & Visits":
-    st.subheader("Age group by gender")
-    show_gender_panel(filtered_records, "age_group", "Age group", "people_age")
-    st.subheader("First-time and repeat visits")
-    st.caption("Visit status is recorded per submission; this is not a count of unique people.")
-    show_gender_panel(known_visit_records, "helpdesk_visit_history", "Visit history", "people_visits")
-    repeat_records = known_visit_records[known_visit_records["helpdesk_visit_history"].eq("Repeat visitor")]
-    if not repeat_records.empty:
-        st.subheader("Repeat visit timing")
-        show_gender_panel(repeat_records, "repeat_visit_timing", "Repeat visit timing", "people_repeat")
-    st.subheader("Disability prevalence")
-    st.caption("Includes submissions with and without disability. Detailed impairment analysis is available in Disability Inclusion.")
-    show_gender_panel(filtered_records, "disability_status", "Disability status", "people_disability", status=True)
+    with report_panel("people_age", "Age group by gender"):
+        show_gender_panel(filtered_records, "age_group", "Age group", "people_age")
+
+    with report_panel("people_visits", "First-time and repeat visits"):
+        st.caption("Visit status is recorded per submission; this is not a count of unique people.")
+        show_gender_panel(known_visit_records, "helpdesk_visit_history", "Visit history", "people_visits")
+        repeat_records = known_visit_records[known_visit_records["helpdesk_visit_history"].eq("Repeat visitor")]
+        if not repeat_records.empty:
+            st.subheader("Repeat visit timing")
+            show_gender_panel(repeat_records, "repeat_visit_timing", "Repeat visit timing", "people_repeat")
+
+    with report_panel("people_disability", "Disability prevalence"):
+        st.caption("Includes submissions with and without disability. Detailed impairment analysis is available in Disability Inclusion.")
+        show_gender_panel(filtered_records, "disability_status", "Disability status", "people_disability", status=True)
 
 if selected_tab == "Locations":
-    st.subheader("Submissions by camp")
-    show_gender_panel(filtered_records, "camp_location", "Camp", "coverage_camp")
-    st.subheader("Submissions by helpdesk")
-    show_gender_panel(filtered_records, "helpdesk_location", "Helpdesk", "coverage_helpdesk")
-    st.button("Open service map", key="coverage_map", on_click=navigate_helpdesk_section, args=("Map",))
+    with report_panel("coverage_camp", "Entries by camp"):
+        show_gender_panel(filtered_records, "camp_location", "Camp", "coverage_camp")
+
+    with report_panel("coverage_helpdesk", "Entries by helpdesk"):
+        show_gender_panel(filtered_records, "helpdesk_location", "Helpdesk", "coverage_helpdesk")
+        st.button("Open service map", key="coverage_map", on_click=navigate_helpdesk_section, args=("Map",))
 
 # -----------------------------------------------------------------------------
 # Disability tab — ONLY disability data (no "No Disability" rows at all)
 # -----------------------------------------------------------------------------
 if selected_tab == "Disability":
 
-    st.subheader("Disability Analysis")
+    with report_panel("disability_types", "Disability Analysis"):
 
-    st.markdown(
-        '<div class="section-note">This tab shows <strong>only records with disability</strong>. '
-        'All "No Disability" values are excluded. Overall prevalence is shown in People & Visits. '
-        'Impairment types are standardized across adults and children.</div>',
-        unsafe_allow_html=True,
-    )
+        st.markdown(
+            '<div class="section-note">This tab shows <strong>only records with disability</strong>. '
+            'All "No Disability" values are excluded. Overall prevalence is shown in People & Visits. '
+            'Impairment types are standardized across adults and children.</div>',
+            unsafe_allow_html=True,
+        )
 
-    st.divider()
-
-    # Preserve the full disability-beneficiary population for age reporting.
-    # Impairment-specific analyses below use a stricter typed subset.
-    disability_beneficiaries = filtered_records[
-        filtered_records["disability_status"].astype(str).eq("Has Disability")
-    ].copy()
-    disability_only = disability_beneficiaries.copy()
-
-    # Extra safety: remove any accidental non-disability type labels from the
-    # combined impairment analysis. This protects the tab even if derivation
-    # logic upstream returns a non-disability label for a record.
-    non_disability_labels = ["No Disability", "None", "", "[Missing]"]
-    if "disability_type" in disability_only.columns:
-        disability_only = disability_only[
-            ~disability_only["disability_type"].astype(str).isin(non_disability_labels)
+        # Preserve the full disability-beneficiary population for age reporting.
+        # Impairment-specific analyses below use a stricter typed subset.
+        disability_beneficiaries = filtered_records[
+            filtered_records["disability_status"].astype(str).eq("Has Disability")
         ].copy()
+        disability_only = disability_beneficiaries.copy()
 
-    if disability_only.empty:
-        st.info("No standardized impairment types match the current filters.")
-        # Footer is still shown by the global show_footer() call later.
+        # Extra safety: remove any accidental non-disability type labels from the
+        # combined impairment analysis. This protects the tab even if derivation
+        # logic upstream returns a non-disability label for a record.
+        non_disability_labels = ["No Disability", "None", "", "[Missing]"]
+        if "disability_type" in disability_only.columns:
+            disability_only = disability_only[
+                ~disability_only["disability_type"].astype(str).isin(non_disability_labels)
+            ].copy()
 
-    else:
-        st.caption("Impairment types (all ages with disability)")
-        show_gender_panel(disability_only, "disability_type", "Impairment type", "disability_impairments")
+        if disability_only.empty:
+            st.info("No standardized impairment types match the current filters.")
+            # Footer is still shown by the global show_footer() call later.
 
-    st.markdown("#### Beneficiaries with Disability by Age Group")
-    st.caption(
-        "Counts all beneficiaries recorded with disability under the current filters, "
-        "including records where the specific impairment type was not captured."
-    )
-    if disability_beneficiaries.empty:
-        st.info("No disability beneficiaries match the current filters.")
-    else:
-        show_gender_table(
-            disability_beneficiaries,
-            "age_group",
-            "Age group",
-            top_n=None,
-        )
-
-# -----------------------------------------------------------------------------
-# Other tabs
-# -----------------------------------------------------------------------------
-if selected_tab == "Concerns":
-    st.subheader("Protection concerns by gender")
-    show_ranked_gender_panel(filtered_protection, "protection_concern", "Protection concern", "concern_summary")
-    st.markdown("#### Protection Concern by Age Group")
-    st.caption("Select one or more protection concerns to view the age group and gender breakdown.")
-    concern_age_options = age_breakdown_options(filtered_protection, "protection_concern")
-
-    if not concern_age_options:
-        st.info("No protection concern records match the selected filters.")
-    else:
-        selected_concerns_for_age = st.multiselect(
-            "Protection concerns",
-            concern_age_options,
-            default=concern_age_options[: min(3, len(concern_age_options))],
-            key="selected_concerns_for_age",
-        )
-
-        if not selected_concerns_for_age:
-            st.info("Select at least one protection concern to view the age and gender breakdown.")
         else:
-            show_age_gender_panel(filtered_protection, "protection_concern", selected_concerns_for_age, "Protection concern", "concern_age")
+            st.caption("Impairment types (all ages with disability)")
+            show_gender_panel(disability_only, "disability_type", "Impairment type", "disability_impairments")
 
-            st.markdown("#### Disability Distribution by Age Group")
-            st.caption(
-                "Uses the same selected protection-concern rows as the breakdown above, "
-                "then retains only mentions linked to records with disability."
-            )
-            selected_protection_rows = filtered_protection[
-                filtered_protection["protection_concern"]
-                .astype(str)
-                .isin(selected_concerns_for_age)
-            ].copy()
-            protection_disability_by_age = selected_protection_rows[
-                selected_protection_rows["disability_status"]
-                .astype(str)
-                .eq("Has Disability")
-            ].copy()
-
-            if protection_disability_by_age.empty:
-                st.info(
-                    "None of the selected protection-concern mentions are linked "
-                    "to records with disability."
-                )
-            else:
-                show_gender_table(
-                    protection_disability_by_age,
-                    "age_group",
-                    "Age group",
-                    top_n=None,
-                )
-
-    st.divider()
-    st.markdown("#### Child Accompaniment Status")
-    st.caption(
-        'Prioritizes "child_unaccompanied_minor". Where that field is blank, '
-        "the respondent relationship fields are used only when they clearly "
-        "identify an unaccompanied child or a caregiver."
-    )
-    child_accompaniment = filtered_records[
-        filtered_records["derived_life_stage"].astype(str).eq("Child")
-        & filtered_records["child_accompaniment_status"].isin(
-            ["Unaccompanied", "Not unaccompanied"]
+    with report_panel("disability_age", "Entries with disability by age group"):
+        st.caption(
+            "Counts all entries recorded with disability under the current filters, "
+            "including records where the specific impairment type was not captured."
         )
-    ].copy()
-    if child_accompaniment.empty:
-        st.info("No determinable child accompaniment records match the selected filters.")
-    else:
-        show_gender_panel(child_accompaniment, "child_accompaniment_status", "Accompaniment status", "child_accompaniment")
-
-        unaccompanied_children = child_accompaniment[
-            child_accompaniment["child_accompaniment_status"].eq("Unaccompanied")
-        ]
-        st.markdown("##### Unaccompanied Children by Age Group")
-        if unaccompanied_children.empty:
-            st.info("No unaccompanied children match the selected filters.")
+        if disability_beneficiaries.empty:
+            st.info("No disability beneficiaries match the current filters.")
         else:
             show_gender_table(
-                unaccompanied_children,
+                disability_beneficiaries,
                 "age_group",
                 "Age group",
                 top_n=None,
             )
 
-if selected_tab == "Information":
-    st.subheader("General information needs by gender")
-    show_ranked_gender_panel(filtered_information, "general_information_need", "General information need", "information_summary")
+# -----------------------------------------------------------------------------
+# Other tabs
+# -----------------------------------------------------------------------------
+if selected_tab == "Concerns":
+    with report_panel("concerns_summary", "Protection concerns by gender"):
+        show_ranked_gender_panel(filtered_protection, "protection_concern", "Protection concern", "concern_summary")
 
-if selected_tab == "Referrals":
-    st.subheader("Action and Follow-up by Gender")
-    st.caption("Referral status")
-    show_gender_panel(filtered_records, "referral_status", "Referral status", "referral_status_panel")
-    st.markdown("#### Follow-up required")
-    show_gender_panel(filtered_records, "follow_up_required_clean", "Follow-up required", "follow_up_panel")
-    st.divider()
-    st.subheader("Referral Partners by Gender")
-    referred_case_count = int(
-        filtered_records["referral_status"].astype(str).eq("Referred to partner agency").sum()
-    )
-    partner_record_count = int(filtered_referrals["record_id"].nunique()) if "record_id" in filtered_referrals.columns else 0
-    partner_assignment_count = len(filtered_referrals)
-    st.caption(
-        f"Reconciliation: {referred_case_count:,} referred cases; "
-        f"{partner_record_count:,} cases with a recorded partner; "
-        f"{partner_assignment_count:,} partner assignments."
-    )
-    if partner_record_count < referred_case_count:
-        st.warning(
-            f"{referred_case_count - partner_record_count:,} referred case(s) do not have a partner recorded."
-        )
-    if partner_assignment_count > partner_record_count:
-        st.info(
-            f"{partner_assignment_count - partner_record_count:,} additional assignment(s) arise because some cases were referred to more than one partner."
-        )
-    show_ranked_gender_panel(filtered_referrals, "referral_partner", "Referral partner", "referral_summary")
-    st.markdown('<div class="dashboard-subsection-break"></div>', unsafe_allow_html=True)
-    st.markdown("#### Referral Partner by Age Group")
-    st.caption("Select one or more referral partners to view the age group and gender breakdown.")
-    referral_age_options = age_breakdown_options(filtered_referrals, "referral_partner")
+    with report_panel("concerns_age", "Protection concerns by age group"):
+        st.caption("Select one or more protection concerns to view the age group and gender breakdown.")
+        concern_age_options = age_breakdown_options(filtered_protection, "protection_concern")
 
-    if not referral_age_options:
-        st.info("No referral partner records match the selected filters.")
-    else:
-        selected_referral_partners_for_age = st.multiselect(
-            "Referral partners",
-            referral_age_options,
-            default=referral_age_options[: min(3, len(referral_age_options))],
-            key="selected_referral_partners_for_age",
-        )
-
-        if not selected_referral_partners_for_age:
-            st.info("Select at least one referral partner to view the age and gender breakdown.")
+        if not concern_age_options:
+            st.info("No protection concern records match the selected filters.")
         else:
-            show_age_gender_panel(filtered_referrals, "referral_partner", selected_referral_partners_for_age, "Referral partner", "referral_age")
-
-            st.markdown("#### Disability Distribution by Age Group")
-            st.caption(
-                "Uses the same selected referral-partner assignments as the breakdown "
-                "above, then retains only assignments linked to records with disability."
+            selected_concerns_for_age = st.multiselect(
+                "Protection concerns",
+                concern_age_options,
+                default=concern_age_options[: min(3, len(concern_age_options))],
+                key="selected_concerns_for_age",
             )
-            selected_referral_rows = filtered_referrals[
-                filtered_referrals["referral_partner"]
-                .astype(str)
-                .isin(selected_referral_partners_for_age)
-            ].copy()
-            referral_disability_by_age = selected_referral_rows[
-                selected_referral_rows["disability_status"]
-                .astype(str)
-                .eq("Has Disability")
-            ].copy()
 
-            if referral_disability_by_age.empty:
-                st.info(
-                    "None of the selected referral-partner assignments are linked "
-                    "to records with disability."
+            if not selected_concerns_for_age:
+                st.info("Select at least one protection concern to view the age and gender breakdown.")
+            else:
+                show_age_gender_panel(filtered_protection, "protection_concern", selected_concerns_for_age, "Protection concern", "concern_age")
+
+                st.markdown("#### Disability Distribution by Age Group")
+                st.caption(
+                    "Uses the same selected protection-concern rows as the breakdown above, "
+                    "then retains only mentions linked to records with disability."
                 )
+                selected_protection_rows = filtered_protection[
+                    filtered_protection["protection_concern"]
+                    .astype(str)
+                    .isin(selected_concerns_for_age)
+                ].copy()
+                protection_disability_by_age = selected_protection_rows[
+                    selected_protection_rows["disability_status"]
+                    .astype(str)
+                    .eq("Has Disability")
+                ].copy()
+
+                if protection_disability_by_age.empty:
+                    st.info(
+                        "None of the selected protection-concern mentions are linked "
+                        "to records with disability."
+                    )
+                else:
+                    show_gender_table(
+                        protection_disability_by_age,
+                        "age_group",
+                        "Age group",
+                        top_n=None,
+                    )
+
+    with report_panel("child_accompaniment", "Child accompaniment"):
+        st.caption(
+            "Shows entries with a known child accompaniment status. When the direct answer is missing, "
+            "a clear recorded relationship is used; unknown statuses are not included."
+        )
+        child_accompaniment = filtered_records[
+            filtered_records["derived_life_stage"].astype(str).eq("Child")
+            & filtered_records["child_accompaniment_status"].isin(
+                ["Unaccompanied", "Not unaccompanied"]
+            )
+        ].copy()
+        if child_accompaniment.empty:
+            st.info("No determinable child accompaniment records match the selected filters.")
+        else:
+            show_gender_panel(child_accompaniment, "child_accompaniment_status", "Accompaniment status", "child_accompaniment")
+
+            unaccompanied_children = child_accompaniment[
+                child_accompaniment["child_accompaniment_status"].eq("Unaccompanied")
+            ]
+            st.markdown("##### Unaccompanied Children by Age Group")
+            if unaccompanied_children.empty:
+                st.info("No unaccompanied children match the selected filters.")
             else:
                 show_gender_table(
-                    referral_disability_by_age,
+                    unaccompanied_children,
                     "age_group",
                     "Age group",
                     top_n=None,
                 )
 
-if selected_tab == "Map":
-    st.subheader("Helpdesk Locations Map")
-    map_points = interactive_helpdesk_map_points(filtered_records)
-    if map_points.empty:
-        st.info("No valid GPS coordinates are available for the selected filters.")
-    else:
+if selected_tab == "Information":
+    with report_panel("information", "General information needs by gender"):
+        show_ranked_gender_panel(filtered_information, "general_information_need", "General information need", "information_summary")
+
+if selected_tab == "Referrals":
+    with report_panel("referral_status", "Referral status"):
+        show_gender_panel(filtered_records, "referral_status", "Referral status", "referral_status_panel")
+
+    with report_panel("follow_up", "Follow-up required"):
+        show_gender_panel(filtered_records, "follow_up_required_clean", "Follow-up required", "follow_up_panel")
+
+    with report_panel("referral_partners", "Referral partners by gender"):
+        referred_case_count = int(
+            filtered_records["referral_status"].astype(str).eq("Referred to partner agency").sum()
+        )
+        partner_record_count = int(filtered_referrals["record_id"].nunique()) if "record_id" in filtered_referrals.columns else 0
+        partner_assignment_count = len(filtered_referrals)
         st.caption(
-            "Hover over a point for a quick summary, or click it to open the full operational details below the map."
+            f"Reconciliation: {referred_case_count:,} referred cases; "
+            f"{partner_record_count:,} cases with a recorded partner; "
+            f"{partner_assignment_count:,} partner assignments."
         )
-        latitude_span = float(map_points["lat"].max() - map_points["lat"].min())
-        longitude_span = float(map_points["lon"].max() - map_points["lon"].min())
-        coordinate_span = max(latitude_span, longitude_span)
-        if coordinate_span > 8:
-            map_zoom = 4.5
-        elif coordinate_span > 4:
-            map_zoom = 5.5
-        elif coordinate_span > 2:
-            map_zoom = 6.5
-        elif coordinate_span > 0.8:
-            map_zoom = 7.5
-        elif coordinate_span > 0.2:
-            map_zoom = 9
+        if partner_record_count < referred_case_count:
+            st.warning(
+                f"{referred_case_count - partner_record_count:,} referred case(s) do not have a partner recorded."
+            )
+        if partner_assignment_count > partner_record_count:
+            st.info(
+                f"{partner_assignment_count - partner_record_count:,} additional assignment(s) arise because some cases were referred to more than one partner."
+            )
+        show_ranked_gender_panel(filtered_referrals, "referral_partner", "Referral partner", "referral_summary")
+
+    with report_panel("referral_age", "Referral partners by age group"):
+        st.caption("Select one or more referral partners to view the age group and gender breakdown.")
+        referral_age_options = age_breakdown_options(filtered_referrals, "referral_partner")
+
+        if not referral_age_options:
+            st.info("No referral partner records match the selected filters.")
         else:
-            map_zoom = 11
+            selected_referral_partners_for_age = st.multiselect(
+                "Referral partners",
+                referral_age_options,
+                default=referral_age_options[: min(3, len(referral_age_options))],
+                key="selected_referral_partners_for_age",
+            )
 
-        point_layer = pdk.Layer(
-            "ScatterplotLayer",
-            id="helpdesk-points",
-            data=map_points,
-            get_position="[lon, lat]",
-            get_radius="point_radius",
-            radius_min_pixels=7,
-            radius_max_pixels=24,
-            get_fill_color=[47, 125, 105, 215],
-            get_line_color=[255, 255, 255, 245],
-            line_width_min_pixels=2,
-            pickable=True,
-            auto_highlight=True,
-            highlight_color=[217, 164, 65, 245],
-        )
-        map_deck = pdk.Deck(
-            map_style=None,
-            initial_view_state=pdk.ViewState(
-                latitude=float(map_points["lat"].mean()),
-                longitude=float(map_points["lon"].mean()),
-                zoom=map_zoom,
-                pitch=0,
-                bearing=0,
-            ),
-            layers=[point_layer],
-            tooltip={
-                "html": (
-                    "<b>{tooltip_point_label}</b><br/>"
-                    "Camp: {tooltip_camp_location}<br/>"
-                    "Records: {records}<br/>"
-                    "Submitted by: {tooltip_cpv_submitters}<br/>"
-                    "Protection concerns: {protection_concerns}<br/>"
-                    "Information requests: {information_requests}<br/>"
-                    "Partner referrals: {partner_referrals}"
-                ),
-                "style": {
-                    "backgroundColor": "#12312F",
-                    "color": "#FFFFFF",
-                    "fontSize": "13px",
-                    "padding": "10px 12px",
-                },
-            },
-        )
-        map_key = interaction_key("map") + hashlib.sha256(map_points.to_json().encode()).hexdigest()[:12]
-        map_event = st.pydeck_chart(
-            map_deck,
-            use_container_width=True,
-            height=520,
-            on_select="rerun",
-            selection_mode="single-object",
-            key=selection_widget_key(map_key),
-        )
+            if not selected_referral_partners_for_age:
+                st.info("Select at least one referral partner to view the age and gender breakdown.")
+            else:
+                show_age_gender_panel(filtered_referrals, "referral_partner", selected_referral_partners_for_age, "Referral partner", "referral_age")
 
-        selected_points = []
-        try:
-            selection_state = map_event.selection
-            selected_points = selection_state.objects.get("helpdesk-points", [])
-        except (AttributeError, KeyError, TypeError):
-            if isinstance(map_event, Mapping):
-                selection_state = map_event.get("selection", {})
-                selected_objects = (
-                    selection_state.get("objects", {})
-                    if isinstance(selection_state, Mapping)
-                    else {}
+                st.markdown("#### Disability Distribution by Age Group")
+                st.caption(
+                    "Uses the same selected referral-partner assignments as the breakdown "
+                    "above, then retains only assignments linked to records with disability."
                 )
-                selected_points = selected_objects.get("helpdesk-points", [])
+                selected_referral_rows = filtered_referrals[
+                    filtered_referrals["referral_partner"]
+                    .astype(str)
+                    .isin(selected_referral_partners_for_age)
+                ].copy()
+                referral_disability_by_age = selected_referral_rows[
+                    selected_referral_rows["disability_status"]
+                    .astype(str)
+                    .eq("Has Disability")
+                ].copy()
 
-        selected_id = selected_points[0].get("point_id") if selected_points else None
-        current_point = map_points[map_points["point_id"].eq(selected_id)]
-        if not current_point.empty:
-            point = current_point.iloc[0]
-            exact = map_point_records(filtered_records, point["point_id"])
-            render_selection_panel(exact[[c for c in PUBLIC_RECORD_COLUMNS if c in exact]],
-                                   [point["point_label"]], "map_detail_" + point["point_id"],
-                                   filtered_referrals, map_key)
+                if referral_disability_by_age.empty:
+                    st.info(
+                        "None of the selected referral-partner assignments are linked "
+                        "to records with disability."
+                    )
+                else:
+                    show_gender_table(
+                        referral_disability_by_age,
+                        "age_group",
+                        "Age group",
+                        top_n=None,
+                    )
+
+if selected_tab == "Map":
+    with report_panel("map", "Helpdesk Locations Map"):
+        map_points = interactive_helpdesk_map_points(filtered_records)
+        if map_points.empty:
+            st.info("No valid GPS coordinates are available for the selected filters.")
         else:
-            st.caption("Select a point, or use Open row details in the table below.")
+            st.caption(
+                "Hover over a point for a quick summary, or click it to open the full operational details below the map."
+            )
+            latitude_span = float(map_points["lat"].max() - map_points["lat"].min())
+            longitude_span = float(map_points["lon"].max() - map_points["lon"].min())
+            coordinate_span = max(latitude_span, longitude_span)
+            if coordinate_span > 8:
+                map_zoom = 4.5
+            elif coordinate_span > 4:
+                map_zoom = 5.5
+            elif coordinate_span > 2:
+                map_zoom = 6.5
+            elif coordinate_span > 0.8:
+                map_zoom = 7.5
+            elif coordinate_span > 0.2:
+                map_zoom = 9
+            else:
+                map_zoom = 11
 
-        map_summary = map_points.rename(
-            columns={
-                "camp_location": "Camp location",
-                "helpdesk_location": "Helpdesk location",
-                "lat": "Latitude",
-                "lon": "Longitude",
-                "records": "Records",
-                "cpv_submitters": "Submitted by (CPV)",
-                "cpv_submitter_count": "Submitting CPVs",
-                "protection_concerns": "Protection concerns",
-                "information_requests": "Information requests",
-                "partner_referrals": "Partner referrals",
-                "disability_records": "Disability records",
-                "first_interview": "First interview",
-                "latest_interview": "Latest interview",
-            }
-        )[
-            [
-                "point_id",
-                "Camp location",
-                "Helpdesk location",
-                "Latitude",
-                "Longitude",
-                "Records",
-                "Submitted by (CPV)",
-                "Submitting CPVs",
-                "Protection concerns",
-                "Information requests",
-                "Partner referrals",
-                "Disability records",
-                "First interview",
-                "Latest interview",
+            point_layer = pdk.Layer(
+                "ScatterplotLayer",
+                id="helpdesk-points",
+                data=map_points,
+                get_position="[lon, lat]",
+                get_radius="point_radius",
+                radius_min_pixels=7,
+                radius_max_pixels=24,
+                get_fill_color=[47, 125, 105, 215],
+                get_line_color=[255, 255, 255, 245],
+                line_width_min_pixels=2,
+                pickable=True,
+                auto_highlight=True,
+                highlight_color=[217, 164, 65, 245],
+            )
+            map_deck = pdk.Deck(
+                map_style=None,
+                initial_view_state=pdk.ViewState(
+                    latitude=float(map_points["lat"].mean()),
+                    longitude=float(map_points["lon"].mean()),
+                    zoom=map_zoom,
+                    pitch=0,
+                    bearing=0,
+                ),
+                layers=[point_layer],
+                tooltip={
+                    "html": (
+                        "<b>{tooltip_point_label}</b><br/>"
+                        "Camp: {tooltip_camp_location}<br/>"
+                        "Records: {records}<br/>"
+                        "Submitted by: {tooltip_cpv_submitters}<br/>"
+                        "Protection concerns: {protection_concerns}<br/>"
+                        "Information requests: {information_requests}<br/>"
+                        "Partner referrals: {partner_referrals}"
+                    ),
+                    "style": {
+                        "backgroundColor": "#12312F",
+                        "color": "#FFFFFF",
+                        "fontSize": "13px",
+                        "padding": "10px 12px",
+                    },
+                },
+            )
+            map_key = interaction_key("map") + hashlib.sha256(map_points.to_json().encode()).hexdigest()[:12]
+            map_event = st.pydeck_chart(
+                map_deck,
+                use_container_width=True,
+                height=520,
+                on_select="rerun",
+                selection_mode="single-object",
+                key=selection_widget_key(map_key),
+            )
+
+            selected_points = []
+            try:
+                selection_state = map_event.selection
+                selected_points = selection_state.objects.get("helpdesk-points", [])
+            except (AttributeError, KeyError, TypeError):
+                if isinstance(map_event, Mapping):
+                    selection_state = map_event.get("selection", {})
+                    selected_objects = (
+                        selection_state.get("objects", {})
+                        if isinstance(selection_state, Mapping)
+                        else {}
+                    )
+                    selected_points = selected_objects.get("helpdesk-points", [])
+
+            selected_id = selected_points[0].get("point_id") if selected_points else None
+            current_point = map_points[map_points["point_id"].eq(selected_id)]
+            if not current_point.empty:
+                point = current_point.iloc[0]
+                exact = map_point_records(filtered_records, point["point_id"])
+                render_selection_panel(exact[[c for c in PUBLIC_RECORD_COLUMNS if c in exact]],
+                                       [point["point_label"]], "map_detail_" + point["point_id"],
+                                       filtered_referrals, map_key)
+            else:
+                st.caption("Select a point, or choose View details below the table.")
+
+            map_summary = map_points.rename(
+                columns={
+                    "camp_location": "Camp location",
+                    "helpdesk_location": "Helpdesk location",
+                    "lat": "Latitude",
+                    "lon": "Longitude",
+                    "records": "Records",
+                    "cpv_submitters": "Submitted by (CPV)",
+                    "cpv_submitter_count": "Submitting CPVs",
+                    "protection_concerns": "Protection concerns",
+                    "information_requests": "Information requests",
+                    "partner_referrals": "Partner referrals",
+                    "disability_records": "Disability records",
+                    "first_interview": "First interview",
+                    "latest_interview": "Latest interview",
+                }
+            )[
+                [
+                    "point_id",
+                    "Camp location",
+                    "Helpdesk location",
+                    "Latitude",
+                    "Longitude",
+                    "Records",
+                    "Submitted by (CPV)",
+                    "Submitting CPVs",
+                    "Protection concerns",
+                    "Information requests",
+                    "Partner referrals",
+                    "Disability records",
+                    "First interview",
+                    "Latest interview",
+                ]
             ]
-        ]
-        st.subheader("Mapped Helpdesk Points")
-        selected_map_id = render_dashboard_table(map_summary, label_column="Helpdesk location", selection_column="point_id")
-        if selected_map_id is not None:
-            exact = map_point_records(filtered_records, selected_map_id)
-            point = map_points[map_points["point_id"].eq(selected_map_id)].iloc[0]
-            render_selection_panel(exact[[c for c in PUBLIC_RECORD_COLUMNS if c in exact]],
-                                   [point["point_label"]], interaction_key("map_table_detail"), filtered_referrals)
+            st.subheader("Mapped Helpdesk Points")
+            map_essentials = map_summary[["point_id", "Helpdesk location", "Camp location", "Records", "Submitted by (CPV)"]].copy()
+            # Coordinates disambiguate different points with the same helpdesk name.
+            map_essentials["Helpdesk location"] = map_summary.apply(
+                lambda row: f'{row["Helpdesk location"]} ({row["Latitude"]:.5f}, {row["Longitude"]:.5f})', axis=1)
+            selected_map_id = render_dashboard_table(map_essentials, label_column="Helpdesk location", selection_column="point_id", compact_panel=True)
+            if selected_map_id is not None:
+                exact = map_point_records(filtered_records, selected_map_id)
+                point = map_points[map_points["point_id"].eq(selected_map_id)].iloc[0]
+                render_selection_panel(exact[[c for c in PUBLIC_RECORD_COLUMNS if c in exact]],
+                                       [point["point_label"]], interaction_key("map_table_detail"), filtered_referrals)
+            with st.expander("Full location breakdown", expanded=False):
+                render_dashboard_table(map_summary, label_column="Helpdesk location", selection_column="point_id",
+                                       enable_details=False)
 
 if selected_tab == "CPV Work":
-    st.subheader("CPV Work Summary")
-    st.markdown(
-        '<div class="section-note">Use the chart slicers to choose the metric, ranking direction, and number of CPVs displayed. The table below remains the full CPV summary for the selected dashboard filters.</div>',
-        unsafe_allow_html=True,
-    )
-
     cpv_records = filtered_records[filtered_records["staff_name"].astype(str).ne("[Not recorded]")].copy()
     cpv_summary = cpv_work_summary(filtered_records)
 
     if cpv_summary.empty:
         st.info("No CPV work summary data match the selected filters.")
     else:
-        chart_metric_options = [
-            "Records",
-            "Protection concerns",
-            "Information requests",
-            "Partner referrals",
-            "Follow-up required",
-            "Disability records",
-            "Mapped records",
-            "Helpdesk locations",
-        ]
-        chart_metric_options = [
-            metric for metric in chart_metric_options if metric in cpv_summary.columns
-        ]
+        with report_panel("cpv_summary", "CPV Work Summary",
+                          "All CPVs in the selected entries. Chart settings do not change these totals."):
+            essentials = cpv_summary[["CPV", "Records", "Partner referrals", "Follow-up required"]].rename(columns={"Records": "Entries"})
+            selected_cpv = render_dashboard_table(essentials, label_column="CPV", compact_panel=True)
+            if selected_cpv is not None:
+                show_selection_details(filtered_records, "staff_name", [selected_cpv], interaction_key("cpv_table_detail"))
+            with st.expander("Full staff breakdown", expanded=False):
+                render_dashboard_table(cpv_summary, label_column="CPV", max_height=620, enable_details=False)
 
-        slicer_col1, slicer_col2, slicer_col3 = st.columns([2.2, 1.6, 1.8])
+        with report_panel("cpv_chart", "CPV comparison"):
+            chart_metric_options = [
+                "Records",
+                "Protection concerns",
+                "Information requests",
+                "Partner referrals",
+                "Follow-up required",
+                "Disability records",
+                "Mapped records",
+                "Helpdesk locations",
+            ]
+            chart_metric_options = [
+                metric for metric in chart_metric_options if metric in cpv_summary.columns
+            ]
 
-        with slicer_col1:
-            cpv_chart_metric = st.selectbox(
-                "Chart metric",
-                chart_metric_options,
-                index=0,
-                key="cpv_chart_metric",
-                help="Choose which CPV workload/outcome metric to visualize.",
-            )
+            with st.expander("Adjust staff chart", expanded=False):
+                slicer_col1, slicer_col2, slicer_col3 = st.columns([2.2, 1.6, 1.8])
 
-        with slicer_col2:
-            cpv_rank = st.radio(
-                "Rank",
-                ["Highest values", "Lowest values"],
-                horizontal=True,
-                index=0,
-                key="cpv_chart_rank",
-                help="Choose whether to show the highest or lowest values first.",
-            )
-
-        with slicer_col3:
-            max_cpv_display = len(cpv_summary)
-            default_cpv_display = min(15, max_cpv_display)
-            cpv_top_n_key = "cpv_chart_top_n"
-
-            if max_cpv_display == 1:
-                # Streamlit sliders require the maximum to be greater than the
-                # minimum. A single filtered CPV therefore needs no control.
-                cpv_top_n = 1
-                st.caption("Number of CPVs: 1 (all available)")
-            else:
-                # A previous selection can become invalid when dashboard
-                # filters reduce the number of available CPVs. Clamp the saved
-                # widget value before Streamlit validates the slider bounds.
-                slider_options = {
-                    "min_value": 1,
-                    "max_value": max_cpv_display,
-                    "step": 1,
-                    "key": cpv_top_n_key,
-                    "help": "Limit the number of CPVs shown in the chart for easier visualization.",
-                }
-                if cpv_top_n_key in st.session_state:
-                    saved_cpv_top_n = st.session_state[cpv_top_n_key]
-                    try:
-                        saved_cpv_top_n = int(saved_cpv_top_n)
-                    except (TypeError, ValueError):
-                        saved_cpv_top_n = default_cpv_display
-                    st.session_state[cpv_top_n_key] = min(
-                        max(saved_cpv_top_n, 1),
-                        max_cpv_display,
+                with slicer_col1:
+                    cpv_chart_metric = st.selectbox(
+                        "Chart metric",
+                        chart_metric_options,
+                        index=0,
+                        key="cpv_chart_metric",
+                        help="Choose which CPV workload/outcome metric to visualize.",
                     )
-                else:
-                    slider_options["value"] = default_cpv_display
 
-                cpv_top_n = st.slider(
-                    "Number of CPVs",
-                    **slider_options,
+                with slicer_col2:
+                    cpv_rank = st.radio(
+                        "Rank",
+                        ["Highest values", "Lowest values"],
+                        horizontal=True,
+                        index=0,
+                        key="cpv_chart_rank",
+                        help="Choose whether to show the highest or lowest values first.",
+                    )
+
+                with slicer_col3:
+                    max_cpv_display = len(cpv_summary)
+                    default_cpv_display = min(15, max_cpv_display)
+                    cpv_top_n_key = "cpv_chart_top_n"
+
+                    if max_cpv_display == 1:
+                        # Streamlit sliders require the maximum to be greater than the
+                        # minimum. A single filtered CPV therefore needs no control.
+                        cpv_top_n = 1
+                        st.caption("Number of CPVs: 1 (all available)")
+                    else:
+                        # A previous selection can become invalid when dashboard
+                        # filters reduce the number of available CPVs. Clamp the saved
+                        # widget value before Streamlit validates the slider bounds.
+                        slider_options = {
+                            "min_value": 1,
+                            "max_value": max_cpv_display,
+                            "step": 1,
+                            "key": cpv_top_n_key,
+                            "help": "Limit the number of CPVs shown in the chart for easier visualization.",
+                        }
+                        if cpv_top_n_key in st.session_state:
+                            saved_cpv_top_n = st.session_state[cpv_top_n_key]
+                            try:
+                                saved_cpv_top_n = int(saved_cpv_top_n)
+                            except (TypeError, ValueError):
+                                saved_cpv_top_n = default_cpv_display
+                            st.session_state[cpv_top_n_key] = min(
+                                max(saved_cpv_top_n, 1),
+                                max_cpv_display,
+                            )
+                        else:
+                            slider_options["value"] = default_cpv_display
+
+                        cpv_top_n = st.slider(
+                            "Number of CPVs",
+                            **slider_options,
+                        )
+
+            cpv_ascending = cpv_rank == "Lowest values"
+            cpv_chart_data = cpv_summary.copy()
+            cpv_chart_data[cpv_chart_metric] = pd.to_numeric(
+                cpv_chart_data[cpv_chart_metric],
+                errors="coerce",
+            ).fillna(0)
+
+            if cpv_ascending:
+                cpv_chart_data = cpv_chart_data.nsmallest(cpv_top_n, cpv_chart_metric)
+            else:
+                cpv_chart_data = cpv_chart_data.nlargest(cpv_top_n, cpv_chart_metric)
+
+            cpv_chart_data = cpv_chart_data.sort_values(
+                cpv_chart_metric,
+                ascending=cpv_ascending,
+            )
+            cpv_order = cpv_chart_data["CPV"].astype(str).tolist()
+            cpv_chart_height = max(280, min(760, 34 * len(cpv_order) + 80))
+            cpv_chart_color = CPV_METRIC_COLORS.get(cpv_chart_metric, "#2F7D69")
+            cpv_x_upper = chart_headroom(cpv_chart_data[cpv_chart_metric])
+
+            cpv_chart = (
+                alt.Chart(cpv_chart_data)
+                .mark_bar(
+                    cornerRadiusEnd=6,
+                    color=cpv_chart_color,
+                    opacity=0.94,
+                    stroke="#FFFFFF",
+                    strokeWidth=0.7,
                 )
-
-        cpv_ascending = cpv_rank == "Lowest values"
-        cpv_chart_data = cpv_summary.copy()
-        cpv_chart_data[cpv_chart_metric] = pd.to_numeric(
-            cpv_chart_data[cpv_chart_metric],
-            errors="coerce",
-        ).fillna(0)
-
-        if cpv_ascending:
-            cpv_chart_data = cpv_chart_data.nsmallest(cpv_top_n, cpv_chart_metric)
-        else:
-            cpv_chart_data = cpv_chart_data.nlargest(cpv_top_n, cpv_chart_metric)
-
-        cpv_chart_data = cpv_chart_data.sort_values(
-            cpv_chart_metric,
-            ascending=cpv_ascending,
-        )
-        cpv_order = cpv_chart_data["CPV"].astype(str).tolist()
-        cpv_chart_height = max(280, min(760, 34 * len(cpv_order) + 80))
-        cpv_chart_color = CPV_METRIC_COLORS.get(cpv_chart_metric, "#2F7D69")
-        cpv_x_upper = chart_headroom(cpv_chart_data[cpv_chart_metric])
-
-        cpv_chart = (
-            alt.Chart(cpv_chart_data)
-            .mark_bar(
-                cornerRadiusEnd=6,
-                color=cpv_chart_color,
-                opacity=0.94,
-                stroke="#FFFFFF",
-                strokeWidth=0.7,
+                .encode(
+                    y=alt.Y(
+                        "CPV:N",
+                        sort=cpv_order,
+                        title=None,
+                        axis=alt.Axis(labelLimit=360, labelFontSize=11, labelPadding=6),
+                    ),
+                    x=alt.X(
+                        f"{cpv_chart_metric}:Q",
+                        title=cpv_chart_metric,
+                        scale=alt.Scale(domain=[0, cpv_x_upper], nice=False),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("CPV:N", title="CPV"),
+                        alt.Tooltip(f"{cpv_chart_metric}:Q", title=cpv_chart_metric, format=","),
+                        alt.Tooltip("Records:Q", title="Total records", format=","),
+                        alt.Tooltip("Protection concerns:Q", title="Protection concerns", format=","),
+                        alt.Tooltip("Information requests:Q", title="Information requests", format=","),
+                        alt.Tooltip("Partner referrals:Q", title="Partner referrals", format=","),
+                        alt.Tooltip("Follow-up required:Q", title="Follow-up required", format=","),
+                        alt.Tooltip("Disability records:Q", title="Disability records", format=","),
+                    ],
+                )
+                .properties(height=cpv_chart_height)
             )
-            .encode(
-                y=alt.Y(
-                    "CPV:N",
-                    sort=cpv_order,
-                    title=None,
-                    axis=alt.Axis(labelLimit=360, labelFontSize=11, labelPadding=6),
-                ),
-                x=alt.X(
-                    f"{cpv_chart_metric}:Q",
-                    title=cpv_chart_metric,
-                    scale=alt.Scale(domain=[0, cpv_x_upper], nice=False),
-                ),
-                tooltip=[
-                    alt.Tooltip("CPV:N", title="CPV"),
-                    alt.Tooltip(f"{cpv_chart_metric}:Q", title=cpv_chart_metric, format=","),
-                    alt.Tooltip("Records:Q", title="Total records", format=","),
-                    alt.Tooltip("Protection concerns:Q", title="Protection concerns", format=","),
-                    alt.Tooltip("Information requests:Q", title="Information requests", format=","),
-                    alt.Tooltip("Partner referrals:Q", title="Partner referrals", format=","),
-                    alt.Tooltip("Follow-up required:Q", title="Follow-up required", format=","),
-                    alt.Tooltip("Disability records:Q", title="Disability records", format=","),
-                ],
-            )
-            .properties(height=cpv_chart_height)
-        )
 
-        cpv_labels = (
-            alt.Chart(cpv_chart_data)
-            .mark_text(
-                align="left",
-                baseline="middle",
-                dx=5,
-                fontSize=11,
-                fontWeight=700,
-                color="#12312F",
+            cpv_labels = (
+                alt.Chart(cpv_chart_data)
+                .mark_text(
+                    align="left",
+                    baseline="middle",
+                    dx=5,
+                    fontSize=11,
+                    fontWeight=700,
+                    color="#12312F",
+                )
+                .encode(
+                    y=alt.Y("CPV:N", sort=cpv_order, title=None),
+                    x=alt.X(f"{cpv_chart_metric}:Q", scale=alt.Scale(domain=[0, cpv_x_upper], nice=False)),
+                    text=alt.Text(f"{cpv_chart_metric}:Q", format=","),
+                )
             )
-            .encode(
-                y=alt.Y("CPV:N", sort=cpv_order, title=None),
-                x=alt.X(f"{cpv_chart_metric}:Q", scale=alt.Scale(domain=[0, cpv_x_upper], nice=False)),
-                text=alt.Text(f"{cpv_chart_metric}:Q", format=","),
-            )
-        )
 
-        render_selectable_chart(cpv_chart + cpv_labels, filtered_records, "staff_name", "CPV")
-        st.caption("Submission volume describes recorded workload, not service quality.")
-
-        st.markdown(
-            '<div class="cpv-table-title">Full CPV Work Summary — all CPVs, unaffected by chart slicers</div>',
-            unsafe_allow_html=True,
-        )
-        selected_cpv = render_dashboard_table(cpv_summary, label_column="CPV", max_height=620)
-        if selected_cpv is not None:
-            show_selection_details(filtered_records, "staff_name", [selected_cpv], interaction_key("cpv_table_detail"))
+            render_selectable_chart(cpv_chart + cpv_labels, filtered_records, "staff_name", "CPV", compact_controls=True)
+            st.caption(f"Showing {len(cpv_chart_data):,} of {len(cpv_summary):,} CPVs · {cpv_chart_metric} · {cpv_rank.lower()}. Hover for values or select a bar for details.")
 
     render_cpv_name_review(secure_records, "cpv_work_name_review")
 
 if selected_tab == "DQA":
-    st.subheader("Data Quality Assurance (DQA)")
-    st.markdown(
-        '<div class="section-note">The intake audit covers every source submission, including records excluded from dashboard statistics. Beneficiary PII is not included in this audit frame; PII-sensitive follow-up tables remain password-protected.</div>',
-        unsafe_allow_html=True,
-    )
-
     dqa_total = len(dqa_records)
+    dqa_eligible = int(dqa_records["dashboard_eligible"].fillna(False).astype(bool).sum()) if "dashboard_eligible" in dqa_records.columns else 0
+    dqa_excluded = max(dqa_total - dqa_eligible, 0)
+    duplicate_records = int(dqa_records["dqa_duplicate_record_id"].fillna(False).astype(bool).sum()) if "dqa_duplicate_record_id" in dqa_records.columns else 0
+    gps_missing = int(dqa_records["dqa_missing_gps"].fillna(False).astype(bool).sum()) if "dqa_missing_gps" in dqa_records.columns else 0
+    consent_declined = int(dqa_records["consent_declined"].fillna(False).astype(bool).sum()) if "consent_declined" in dqa_records.columns else 0
+
+    render_report_figures([
+        ("Source submissions", dqa_total, "All records received, including incomplete entries"),
+        ("Included in dashboard", dqa_eligible, f"{format_rate(dqa_eligible, dqa_total)} of source submissions"),
+        ("Excluded from dashboard", dqa_excluded, f"{format_rate(dqa_excluded, dqa_total)} of source submissions"),
+    ])
+
     issues = ["All submissions", "Missing required fields", "Missing GPS", "Duplicate IDs", "Excluded submissions", "CPV names to review"]
-    with st.container(border=True):
-        st.markdown("**Data quality quick check**")
+    with report_panel("dqa_issues", "Records needing review"):
         st.caption("All source submissions, including incomplete and excluded records; dashboard date/location filters do not limit this audit.")
         issue_table = pd.DataFrame([
             {"Issue": issue, "Submissions": len(dqa_issue_records(dqa_records, issue))}
             for issue in issues[1:]
         ])
-        chosen_issue = render_dashboard_table(issue_table, label_column="Issue", max_height=400)
+        issue_table.loc[len(issue_table)] = {"Issue": "Consent declined", "Submissions": consent_declined}
+        chosen_issue = render_dashboard_table(issue_table, label_column="Issue", max_height=400, compact_panel=True)
         if chosen_issue is not None:
-            issue_view = dqa_issue_records(dqa_records, chosen_issue)
+            issue_view = dqa_records[dqa_records["consent_declined"].fillna(False).astype(bool)] if chosen_issue == "Consent declined" else dqa_issue_records(dqa_records, chosen_issue)
             st.markdown(f"**{chosen_issue} · {len(issue_view):,} source submissions**")
             if chosen_issue == "CPV names to review":
                 st.caption("Missing, ambiguous or insufficiently matched CPV names. These are not automatically classified as new staff. Review proposed matches in the protected CPV Work section.")
@@ -6925,148 +6953,135 @@ if selected_tab == "DQA":
                 style_records_table(search_records(issue_view, issue_query).head(RECORD_PREVIEW_LIMIT).reset_index(drop=True)),
                 width="stretch", hide_index=True, row_height=64,
             )
-    dqa_eligible = int(dqa_records["dashboard_eligible"].fillna(False).astype(bool).sum()) if "dashboard_eligible" in dqa_records.columns else 0
-    dqa_excluded = max(dqa_total - dqa_eligible, 0)
-    duplicate_records = int(dqa_records["dqa_duplicate_record_id"].fillna(False).astype(bool).sum()) if "dqa_duplicate_record_id" in dqa_records.columns else 0
-    gps_missing = int(dqa_records["dqa_missing_gps"].fillna(False).astype(bool).sum()) if "dqa_missing_gps" in dqa_records.columns else 0
-    consent_declined = int(dqa_records["consent_declined"].fillna(False).astype(bool).sum()) if "consent_declined" in dqa_records.columns else 0
 
-    dqa_cols = st.columns(5)
-    show_kpi_card(dqa_cols[0], "Source submissions", format_number(dqa_total), "All records received from the source", accent="#1F6FB2")
-    show_kpi_card(dqa_cols[1], "Dashboard eligible", format_number(dqa_eligible), f"{format_rate(dqa_eligible, dqa_total)} of submissions", share=safe_share(dqa_eligible, dqa_total), accent="#2F7D69")
-    show_kpi_card(dqa_cols[2], "Excluded", format_number(dqa_excluded), f"{format_rate(dqa_excluded, dqa_total)} of submissions", share=safe_share(dqa_excluded, dqa_total), accent="#DB2777")
-    show_kpi_card(dqa_cols[3], "Consent declined", format_number(consent_declined), "Excluded from all analysis", accent="#7C3AED")
-    show_kpi_card(dqa_cols[4], "Duplicate stable IDs", format_number(duplicate_records), "All affected source rows", accent="#D9A441")
-
-    st.markdown("### Submission eligibility audit")
-    if dqa_records.empty:
-        st.info("No source submissions are available for DQA.")
-    else:
-        eligibility_summary = (
-            dqa_records.groupby(
-                ["dashboard_eligible", "dashboard_exclusion_reason"],
-                dropna=False,
-            )
-            .size()
-            .reset_index(name="Submissions")
-            .rename(
-                columns={
-                    "dashboard_eligible": "Dashboard eligible",
-                    "dashboard_exclusion_reason": "Eligibility result",
-                }
-            )
-            .sort_values("Submissions", ascending=False)
-        )
-        eligibility_summary["Dashboard eligible"] = eligibility_summary["Dashboard eligible"].map(
-            {True: "Yes", False: "No"}
-        ).fillna("No")
-        render_dashboard_table(
-            eligibility_summary,
-            label_column="Eligibility result",
-            max_height=380,
-        )
-
-    st.divider()
-    st.markdown("### Missingness across all source submissions")
-    dqa_fields = [
-        "reporting_date",
-        "kobo_submission_time",
-        "kobo_today",
-        "interview_date",
-        "staff_name",
-        "camp_location",
-        "helpdesk_location",
-        "information_seeker_type",
-        "information_seeker_gender",
-        "age_group",
-        "request_category",
-        "gps_latitude",
-        "gps_longitude",
-    ]
-    missing_rows = []
-    for col in dqa_fields:
-        if col in dqa_records.columns:
-            missing_count = int(dqa_records[col].map(quality_value_missing).sum())
-            missing_rows.append(
-                {
-                    "Field": col,
-                    "Missing / not recorded": missing_count,
-                    "Completeness %": round(((dqa_total - missing_count) / dqa_total) * 100, 1) if dqa_total else 0,
-                }
-            )
-    missing_table = pd.DataFrame(missing_rows).sort_values("Missing / not recorded", ascending=False)
-    st.dataframe(style_records_table(missing_table), use_container_width=True, hide_index=True)
-
-    st.markdown("### Source submission DQA records")
-    st.caption("Read-only operational audit. Direct beneficiary identifiers and free-text PII are excluded by contract.")
-    available_statuses = sorted(dqa_records["dqa_status"].dropna().astype(str).unique().tolist()) if "dqa_status" in dqa_records.columns else []
-    selected_dqa_statuses = st.multiselect(
-        "DQA status",
-        available_statuses,
-        placeholder="All DQA statuses",
-        key="dqa_status_filter",
-    )
-    dqa_view = dqa_records.copy()
-    if selected_dqa_statuses:
-        dqa_view = dqa_view[dqa_view["dqa_status"].astype(str).isin(selected_dqa_statuses)]
-    dqa_query = st.text_input(
-        "Search DQA records",
-        placeholder="Search record ID, CPV, location, missing field or status...",
-        key="dqa_records_search",
-    )
-    dqa_view = search_records(dqa_view, dqa_query)
-    st.caption(f"Showing {format_number(min(len(dqa_view), RECORD_PREVIEW_LIMIT))} of {format_number(len(dqa_view))} matching source submissions.")
-    st.dataframe(
-        style_records_table(dqa_view.head(RECORD_PREVIEW_LIMIT)),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.divider()
-    st.markdown("### Helpdesk visit-history consistency")
-    st.caption(
-        'Checks the dependency between "visited_tdh_helpdesk_before" and '
-        '"last_visit_within_current_month". The timing question should only be '
-        "answered for repeat visitors. This check uses dashboard-eligible records under the current filters."
-    )
-    visit_consistency_table = basic_count_table(
-        filtered_records,
-        "visit_history_consistency",
-        "Consistency result",
-    )
-    render_dashboard_table(
-        visit_consistency_table,
-        label_column="Consistency result",
-        max_height=360,
-    )
-
-    st.divider()
-    st.markdown("### Protected education-concern follow-up table")
-    st.markdown(
-        '<div class="section-note">Includes records where concern_educational_support and/or concern_school_dropout_risk_or_dropped_out was selected. This table contains PII and requires a password.</div>',
-        unsafe_allow_html=True,
-    )
-    st.caption("Unlock the table to calculate and display matching PII records.")
-    if pii_access_granted("dqa_pii_password"):
-        filtered_secure_records = apply_filters(secure_records, filters)
-        protected_education_table = education_concern_followup_table(filtered_secure_records, filtered_referrals)
-        st.caption(f"Matching education-concern records: {format_number(len(protected_education_table))}")
-        if protected_education_table.empty:
-            st.info("No matching education-concern records for the current filters.")
+    with report_panel("dqa_eligibility", "Included and excluded entries"):
+        if dqa_records.empty:
+            st.info("No source submissions are available for DQA.")
         else:
-            st.dataframe(style_records_table(protected_education_table), use_container_width=True, hide_index=True)
-            st.download_button(
-                "Download protected education-concern table",
-                data=protected_education_table.to_csv(index=False).encode("utf-8"),
-                file_name="protected_education_concern_followup_table.csv",
-                mime="text/csv",
-                use_container_width=True,
+            eligibility_summary = (
+                dqa_records.groupby(
+                    ["dashboard_eligible", "dashboard_exclusion_reason"],
+                    dropna=False,
+                )
+                .size()
+                .reset_index(name="Submissions")
+                .rename(
+                    columns={
+                        "dashboard_eligible": "Dashboard eligible",
+                        "dashboard_exclusion_reason": "Eligibility result",
+                    }
+                )
+                .sort_values("Submissions", ascending=False)
             )
+            eligibility_summary["Dashboard eligible"] = eligibility_summary["Dashboard eligible"].map(
+                {True: "Yes", False: "No"}
+            ).fillna("No")
+            render_dashboard_table(
+                eligibility_summary,
+                label_column="Eligibility result",
+                max_height=380, compact_panel=True, enable_details=False,
+            )
+
+    with report_panel("dqa_missing", "Missing information"):
+        dqa_fields = [
+            "reporting_date",
+            "kobo_submission_time",
+            "kobo_today",
+            "interview_date",
+            "staff_name",
+            "camp_location",
+            "helpdesk_location",
+            "information_seeker_type",
+            "information_seeker_gender",
+            "age_group",
+            "request_category",
+            "gps_latitude",
+            "gps_longitude",
+        ]
+        missing_rows = []
+        for col in dqa_fields:
+            if col in dqa_records.columns:
+                missing_count = int(dqa_records[col].map(quality_value_missing).sum())
+                missing_rows.append(
+                    {
+                        "Field": col,
+                        "Missing / not recorded": missing_count,
+                        "Completeness %": round(((dqa_total - missing_count) / dqa_total) * 100, 1) if dqa_total else 0,
+                    }
+                )
+        missing_table = pd.DataFrame(missing_rows).sort_values("Missing / not recorded", ascending=False)
+        missing_table["Field"] = missing_table["Field"].map(record_column_label)
+        missing_table = missing_table.rename(columns={"Completeness %": "Complete (%)"})
+        render_dashboard_table(missing_table, label_column="Field", compact_panel=True, enable_details=False)
+
+    with report_panel("dqa_records", "Source submission records"):
+        st.caption("Read-only operational audit. Direct beneficiary identifiers and free-text PII are excluded by contract.")
+        available_statuses = sorted(dqa_records["dqa_status"].dropna().astype(str).unique().tolist()) if "dqa_status" in dqa_records.columns else []
+        selected_dqa_statuses = st.multiselect(
+            "DQA status",
+            available_statuses,
+            placeholder="All DQA statuses",
+            key="dqa_status_filter",
+        )
+        dqa_view = dqa_records.copy()
+        if selected_dqa_statuses:
+            dqa_view = dqa_view[dqa_view["dqa_status"].astype(str).isin(selected_dqa_statuses)]
+        dqa_query = st.text_input(
+            "Search DQA records",
+            placeholder="Search record ID, CPV, location, missing field or status...",
+            key="dqa_records_search",
+        )
+        dqa_view = search_records(dqa_view, dqa_query)
+        st.caption(f"Showing {format_number(min(len(dqa_view), RECORD_PREVIEW_LIMIT))} of {format_number(len(dqa_view))} matching source submissions.")
+        st.dataframe(
+            style_records_table(dqa_view.head(RECORD_PREVIEW_LIMIT)),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with report_panel("dqa_visits", "Visit-history checks"):
+        st.caption(
+            'Checks the dependency between "visited_tdh_helpdesk_before" and '
+            '"last_visit_within_current_month". The timing question should only be '
+            "answered for repeat visitors. This check uses dashboard-eligible records under the current filters."
+        )
+        visit_consistency_table = basic_count_table(
+            filtered_records,
+            "visit_history_consistency",
+            "Consistency result",
+        )
+        render_dashboard_table(
+            visit_consistency_table,
+            label_column="Consistency result",
+            max_height=360, compact_panel=True, enable_details=False,
+        )
+
+    with report_panel("dqa_protected", "Protected education follow-up"):
+        st.markdown(
+            '<div class="section-note">Includes records where concern_educational_support and/or concern_school_dropout_risk_or_dropped_out was selected. This table contains PII and requires a password.</div>',
+            unsafe_allow_html=True,
+        )
+        st.caption("Unlock the table to calculate and display matching PII records.")
+        if pii_access_granted("dqa_pii_password"):
+            filtered_secure_records = apply_filters(secure_records, filters)
+            protected_education_table = education_concern_followup_table(filtered_secure_records, filtered_referrals)
+            st.caption(f"Matching education-concern records: {format_number(len(protected_education_table))}")
+            if protected_education_table.empty:
+                st.info("No matching education-concern records for the current filters.")
+            else:
+                st.dataframe(style_records_table(protected_education_table), use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download protected education-concern table",
+                    data=protected_education_table.to_csv(index=False).encode("utf-8"),
+                    file_name="protected_education_concern_followup_table.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
 
 if selected_tab == "Records":
-    st.subheader("Filtered Records")
-    st.caption("Read-only submission records.")
-    render_record_browser(filtered_records, "records_browser")
+    with report_panel("records", "Filtered Records"):
+        st.caption("Read-only submission records.")
+        render_record_browser(filtered_records, "records_browser")
 
     with st.expander("Protected DQA table: education concerns with PII", expanded=False):
         st.markdown(
@@ -7102,6 +7117,9 @@ if selected_tab == "Records":
 
     with st.expander("Source KPI summary"): 
         st.dataframe(style_records_table(kpis), use_container_width=True, hide_index=True)
+
+if selected_tab != "Overview":
+    show_section_findings(selected_tab, filtered_records, filtered_protection, filtered_information, filtered_referrals)
 
 show_footer()
 
