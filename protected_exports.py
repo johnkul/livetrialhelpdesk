@@ -37,6 +37,17 @@ def register_gender(value):
     return text or "Not recorded"
 
 
+def register_disability(value):
+    """Short display labels only; leave source disability classifications intact."""
+    text = _text(value)
+    key = text.casefold()
+    if key in {"yes", "yes disability", "has disability"}:
+        return "Yes"
+    if key in {"no", "no disability"}:
+        return "No"
+    return text or "Not recorded"
+
+
 def register_profile(value):
     text = _text(value)
     key = text.casefold().replace("_", " ")
@@ -84,7 +95,7 @@ def beneficiary_register(frame, age_mapper):
     other = column("information_seeker_nationality_other").map(_text)
     use_other = nationality.str.casefold().isin(["", "other", "others", "other nationality", "other not listed", "not listed"])
     result["Nationality"] = nationality.mask(use_other & other.ne(""), other).replace("", "Not recorded")
-    result["Disability"] = column("disability_status").map(_text).replace("", "Not recorded")
+    result["Disability"] = column("disability_status").map(register_disability)
     result["Type of Disability"] = column("disability_type").map(_text).replace("", "Not recorded")
     result["Profile status"] = column("household_type").map(register_profile)
     return result[REGISTER_COLUMNS].sort_values(REGISTER_COLUMNS[0], ascending=False, na_position="last", kind="stable").reset_index(drop=True)
