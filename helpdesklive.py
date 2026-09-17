@@ -5850,7 +5850,7 @@ def render_protected_beneficiary_register(secure_frame, filters, key):
             return
         scoped = apply_filters(secure_frame, filters)
         table = beneficiary_register(scoped, reporting_age_group)
-        st.caption("All filtered beneficiary entries, including adults and repeat visits. Interview date is used when available, otherwise the dashboard entry date. Specific location combines the labelled helpdesk Section/Block and Neighborhood/Compound/House. Phone number uses the information seeker's number, or the alternative number when empty. Missing fields are marked Not recorded; other recorded genders are retained, not relabelled Intersex.")
+        st.caption("All filtered beneficiary entries, including adults and repeat visits. Interview date is used when available, otherwise the dashboard entry date. Specific location shows the recorded location entries without field-name prefixes. Phone number uses the information seeker's number, or the alternative number when empty. Missing fields are marked Not recorded; other recorded genders are retained, not relabelled Intersex.")
         st.caption(f"Matching entries: {len(table):,}")
         if table.empty:
             st.info("No beneficiary entries match the selected filters.")

@@ -70,14 +70,11 @@ def beneficiary_register(frame, age_mapper):
     primary_phone = primary_phone.mask(primary_phone.str.casefold().isin(missing_phone_labels), "")
     alternative_phone = alternative_phone.mask(alternative_phone.str.casefold().isin(missing_phone_labels), "")
     result["Phone number"] = primary_phone.mask(primary_phone.eq(""), alternative_phone).replace("", "Not recorded")
-    # Keep both source contexts explicit: helpdesk Section/Block is not residence.
+    # Show recorded entries directly, without source-field prefixes.
     section = column("helpdesk_section_block").map(_text)
     residence = column("residence_neighborhood_compound_house").map(_text)
     result["Specific location"] = [
-        "; ".join(part for part in (
-            f"Section/Block: {block}" if block else "",
-            f"Neighborhood/Compound/House: {home}" if home else "",
-        ) if part) or "Not recorded"
+        "; ".join(part for part in (block, home) if part) or "Not recorded"
         for block, home in zip(section, residence)
     ]
     result["Gender"] = column("information_seeker_gender").map(register_gender)
