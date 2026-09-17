@@ -11,7 +11,7 @@ import pandas as pd
 
 
 REGISTER_COLUMNS = [
-    "Date of Interview/entry", "Child / Beneficiary Name", "Individual number",
+    "Date of Interview/entry", "Child / Beneficiary Name", "Individual number", "Phone number",
     "Specific location", "Gender", "Age group", "Nationality", "Disability",
     "Type of Disability", "Profile status",
 ]
@@ -64,8 +64,22 @@ def beneficiary_register(frame, age_mapper):
     result[REGISTER_COLUMNS[0]] = dates("interview_date").combine_first(dates("reporting_date"))
     result[REGISTER_COLUMNS[1]] = column("information_seeker_name").map(_text).replace("", "Not recorded")
     result[REGISTER_COLUMNS[2]] = column("information_seeker_individual_number").map(_text).replace("", "Not recorded")
-    # Do not present a helpdesk/GPS location as the person's residence.
-    result[REGISTER_COLUMNS[3]] = column("residence_neighborhood_compound_house").map(_text).replace("", "Not recorded")
+    primary_phone = column("information_seeker_phone").map(_text)
+    alternative_phone = column("alternative_phone").map(_text)
+    missing_phone_labels = {"not recorded", "not provided", "n/a", "na"}
+    primary_phone = primary_phone.mask(primary_phone.str.casefold().isin(missing_phone_labels), "")
+    alternative_phone = alternative_phone.mask(alternative_phone.str.casefold().isin(missing_phone_labels), "")
+    result["Phone number"] = primary_phone.mask(primary_phone.eq(""), alternative_phone).replace("", "Not recorded")
+    # Keep both source contexts explicit: helpdesk Section/Block is not residence.
+    section = column("helpdesk_section_block").map(_text)
+    residence = column("residence_neighborhood_compound_house").map(_text)
+    result["Specific location"] = [
+        "; ".join(part for part in (
+            f"Section/Block: {block}" if block else "",
+            f"Neighborhood/Compound/House: {home}" if home else "",
+        ) if part) or "Not recorded"
+        for block, home in zip(section, residence)
+    ]
     result["Gender"] = column("information_seeker_gender").map(register_gender)
     age = column("age_group").combine_first(column("information_seeker_age"))
     result["Age group"] = age.map(age_mapper).map(_text).str.replace(r" years$", " Yrs", regex=True).replace("", "Not recorded")
