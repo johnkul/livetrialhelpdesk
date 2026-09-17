@@ -1806,6 +1806,36 @@ div[data-testid="stVegaLiteChart"], div[data-testid="stArrowVegaLiteChart"] {
     .block-container:has(.overview-report-header) .dashboard-table th,
     .block-container:has(.overview-report-header) .dashboard-table td { padding: 10px 5px; font-size: .8rem; }
 }
+/* Visible location choices: scoped so other dashboard controls are unchanged. */
+section[data-testid="stSidebar"] :is(.st-key-camp_location_filter, .st-key-helpdesk_location_filter) button[data-variant="pills"] {
+    min-height: 44px !important;
+    max-width: 100% !important;
+    height: auto !important;
+    padding: 8px 12px !important;
+    white-space: normal !important;
+    overflow-wrap: anywhere;
+    border: 1px solid #98b5ae !important;
+    border-radius: 10px !important;
+    background: #ffffff !important;
+    color: #214d43 !important;
+    box-shadow: none !important;
+}
+section[data-testid="stSidebar"] :is(.st-key-camp_location_filter, .st-key-helpdesk_location_filter) button[data-variant="pills"] p {
+    white-space: normal !important;
+    overflow-wrap: anywhere;
+    color: inherit !important;
+    font-weight: 650 !important;
+}
+section[data-testid="stSidebar"] :is(.st-key-camp_location_filter, .st-key-helpdesk_location_filter) button[data-variant="pills"][aria-pressed="true"] {
+    background: #236653 !important;
+    border-color: #236653 !important;
+    color: #ffffff !important;
+    box-shadow: inset 0 0 0 2px #ffffff !important;
+}
+section[data-testid="stSidebar"] :is(.st-key-camp_location_filter, .st-key-helpdesk_location_filter) button[data-variant="pills"]:focus-visible {
+    outline: 3px solid #1f6fb2 !important;
+    outline-offset: 2px !important;
+}
 /* Keep large-table controls compact on phones; Page still reaches every page. */
 @media (max-width: 760px) {
     [class*="st-key-table_pager_"] [data-testid="stHorizontalBlock"] {

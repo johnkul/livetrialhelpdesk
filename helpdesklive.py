@@ -3628,6 +3628,28 @@ def sanitize_multiselect_state(key, options):
         st.session_state[key] = cleaned
 
 
+def location_pill_selector(label, options, key):
+    """Visible multi-select choices; finding an option never filters report data."""
+    options = list(options)
+    sanitize_multiselect_state(key, options)
+    selected = st.session_state.get(key, [])
+    query = ""
+    with st.container(key=key + "_choices_panel"):
+        if len(options) > 12:
+            query = st.text_input(f"Find a {label.lower()}", key=key + "_find",
+                                  placeholder="Type part of a location name…",
+                                  help="Only searches the choices below. Selected locations stay visible.").strip().casefold()
+        visible = [value for value in options if not query or query in value.casefold() or value in selected]
+        chosen = st.pills(label, options=visible, selection_mode="multi", key=key,
+                          wrap=True, width="stretch",
+                          help="Tap one or more locations. Tap a selected location again to remove it. No selection includes all available locations.") or []
+        if query and not any(query in value.casefold() for value in options):
+            st.caption("No matching choices. Existing selections are unchanged.")
+        noun = "camps" if label == "Camp" else "helpdesks"
+        st.caption(f"{len(chosen):,} of {len(options):,} {noun} selected" if chosen else f"All {noun} included")
+    return chosen
+
+
 def reset_filters(default_from_date, max_date):
     st.session_state["reporting_period_preset"] = "All dates"
     clear_exploration()
@@ -3637,6 +3659,8 @@ def reset_filters(default_from_date, max_date):
     for key in FILTER_KEYS:
         st.session_state[key] = []
     st.session_state["records_search"] = ""
+    for key in ("camp_location_filter_find", "helpdesk_location_filter_find"):
+        st.session_state[key] = ""
 
 
 def apply_filters(frame, filters):
@@ -6428,21 +6452,13 @@ with st.sidebar:
     # Location choices span the snapshot, not just this date range. This keeps
     # an empty reporting period from silently removing an active location.
     camp_options = sorted(records["camp_location"].dropna().astype(str).unique().tolist())
-    sanitize_multiselect_state("camp_location_filter", camp_options)
-    selected_camp_locations = st.multiselect(
-        "Camp", camp_options, key="camp_location_filter", placeholder="All camps",
-        help="Optional. Select camps to narrow the available helpdesks.",
-    )
+    selected_camp_locations = location_pill_selector("Camp", camp_options, "camp_location_filter")
     location_source = records[
         records["camp_location"].astype(str).isin(selected_camp_locations)
     ] if selected_camp_locations else records
     helpdesk_options = sorted(location_source["helpdesk_location"].dropna().astype(str).unique().tolist())
     prior_helpdesks = list(st.session_state.get("helpdesk_location_filter", []))
-    sanitize_multiselect_state("helpdesk_location_filter", helpdesk_options)
-    selected_helpdesk_locations = st.multiselect(
-        "Helpdesk", helpdesk_options, key="helpdesk_location_filter", placeholder="All helpdesks",
-        help="Type to search directly. A camp selection is optional.",
-    )
+    selected_helpdesk_locations = location_pill_selector("Helpdesk", helpdesk_options, "helpdesk_location_filter")
     removed_helpdesks = [v for v in prior_helpdesks if v not in helpdesk_options]
     if removed_helpdesks:
         st.caption("Cleared unavailable helpdesks: " + ", ".join(removed_helpdesks))
