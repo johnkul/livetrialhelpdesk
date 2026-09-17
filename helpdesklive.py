@@ -20,7 +20,7 @@ import streamlit as st
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from cpv_matching import CPVMatcher
-from protected_exports import beneficiary_register, encrypted_excel_bytes
+from protected_exports import beneficiary_register, encrypted_excel_bytes, file_password_error
 
 # -----------------------------------------------------------------------------
 # Page configuration
@@ -5789,8 +5789,9 @@ def prepare_protected_export(table, key, gate_key):
     if not access_password or not st.session_state.get(gate_key + "_granted"):
         st.session_state[key + "_error"] = "Unlock the protected table before preparing a download."
         return
-    if len(password) < 12 or not password.strip():
-        st.session_state[key + "_error"] = "Use a file password with at least 12 characters."
+    password_error = file_password_error(password)
+    if password_error:
+        st.session_state[key + "_error"] = password_error
         return
     if password != confirmation:
         st.session_state[key + "_error"] = "The file passwords do not match."
@@ -5826,7 +5827,7 @@ def render_encrypted_download(table, key, gate_key, file_name):
     if payload and (payload["fingerprint"] != protected_export_fingerprint(table) or payload["expires_at"] <= time.time()):
         st.session_state.pop(key + "_payload", None)
         payload = None
-    st.caption("Download as password-encrypted Excel. Use a separate file password of at least 12 characters and share it separately from the file. Prepared downloads expire after 10 minutes when this view refreshes.")
+    st.caption("Download as password-encrypted Excel. File password: at least 6 characters, including uppercase, lowercase, a number and a symbol. A longer password is recommended for beneficiary data. Use a separate password and share it separately from the file. Prepared downloads expire after 10 minutes when this view refreshes.")
     with st.form(key + "_form", clear_on_submit=True):
         st.text_input("File password", type="password", key=key + "_file_password")
         st.text_input("Confirm file password", type="password", key=key + "_confirmation")

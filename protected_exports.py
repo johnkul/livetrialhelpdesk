@@ -101,14 +101,26 @@ def beneficiary_register(frame, age_mapper):
     return result[REGISTER_COLUMNS].sort_values(REGISTER_COLUMNS[0], ascending=False, na_position="last", kind="stable").reset_index(drop=True)
 
 
+def file_password_error(password):
+    """One policy shared by the UI and exporter, not the table-access password."""
+    if not isinstance(password, str) or len(password) < 6:
+        return "Use a file password with at least 6 characters."
+    if not (any(c.isupper() for c in password) and any(c.islower() for c in password)
+            and any(c.isdigit() for c in password)
+            and any(not c.isalnum() and not c.isspace() for c in password)):
+        return "Include an uppercase letter, a lowercase letter, a number and a symbol in the file password."
+    return None
+
+
 def encrypted_excel_bytes(table, password):
     """Return only verified Office Agile encrypted XLSX bytes, or raise.
 
     Sheet/workbook protection is not encryption. The OOXML file itself is
     encrypted; a password is required before its data can be opened.
     """
-    if not isinstance(password, str) or len(password) < 12 or not password.strip():
-        raise ValueError("Use a file password with at least 12 characters.")
+    password_error = file_password_error(password)
+    if password_error:
+        raise ValueError(password_error)
     if len(table) > 1_048_575 or len(table.columns) > 16_384:
         raise ValueError("Selection exceeds Excel limits. Narrow the report filters.")
     from openpyxl import Workbook
