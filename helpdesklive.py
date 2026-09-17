@@ -20,6 +20,7 @@ import streamlit as st
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from cpv_matching import CPVMatcher
+from protected_exports import beneficiary_register, encrypted_excel_bytes
 
 # -----------------------------------------------------------------------------
 # Page configuration
@@ -5769,6 +5770,99 @@ def pii_access_granted(key="pii_access_password"):
     return False
 
 
+def protected_export_fingerprint(table):
+    return hashlib.sha256(table.to_json(date_format="iso", orient="split").encode("utf-8")).hexdigest()
+
+
+def lock_protected_export(gate_key, export_key):
+    for state_key in list(st.session_state):
+        if state_key in {gate_key, gate_key + "_granted"} or state_key.startswith(export_key + "_"):
+            st.session_state.pop(state_key, None)
+
+
+def prepare_protected_export(table, key, gate_key):
+    """Form callback: discard password fields and keep only encrypted bytes."""
+    password = st.session_state.pop(key + "_file_password", "")
+    confirmation = st.session_state.pop(key + "_confirmation", "")
+    st.session_state.pop(key + "_payload", None)
+    access_password = configured_pii_password()
+    if not access_password or not st.session_state.get(gate_key + "_granted"):
+        st.session_state[key + "_error"] = "Unlock the protected table before preparing a download."
+        return
+    if len(password) < 12 or not password.strip():
+        st.session_state[key + "_error"] = "Use a file password with at least 12 characters."
+        return
+    if password != confirmation:
+        st.session_state[key + "_error"] = "The file passwords do not match."
+        return
+    if password == access_password:
+        st.session_state[key + "_error"] = "Choose a different file password from the dashboard access password."
+        return
+    try:
+        encrypted = encrypted_excel_bytes(table, password)
+    except ImportError:
+        st.session_state[key + "_error"] = "Encryption is unavailable. Install the updated requirements; no unencrypted file will be offered."
+        return
+    except Exception:
+        # Do not expose workbook values, credentials or exception details.
+        st.session_state[key + "_error"] = "The encrypted file could not be prepared or verified. No unencrypted download will be offered."
+        return
+    st.session_state[key + "_payload"] = {
+        "data": encrypted, "fingerprint": protected_export_fingerprint(table),
+        "expires_at": time.time() + 600,
+    }
+
+
+def render_encrypted_download(table, key, gate_key, file_name):
+    """Fail closed and invalidate prepared downloads after selection changes."""
+    if not configured_pii_password() or not st.session_state.get(gate_key + "_granted"):
+        st.session_state.pop(key + "_payload", None)
+        return
+    st.button("Lock table", key=key + "_lock", on_click=lock_protected_export, args=(gate_key, key))
+    if table.empty:
+        st.session_state.pop(key + "_payload", None)
+        return
+    payload = st.session_state.get(key + "_payload")
+    if payload and (payload["fingerprint"] != protected_export_fingerprint(table) or payload["expires_at"] <= time.time()):
+        st.session_state.pop(key + "_payload", None)
+        payload = None
+    st.caption("Download as password-encrypted Excel. Use a separate file password of at least 12 characters and share it separately from the file. Prepared downloads expire after 10 minutes when this view refreshes.")
+    with st.form(key + "_form", clear_on_submit=True):
+        st.text_input("File password", type="password", key=key + "_file_password")
+        st.text_input("Confirm file password", type="password", key=key + "_confirmation")
+        st.form_submit_button("Prepare encrypted Excel", on_click=prepare_protected_export, args=(table, key, gate_key))
+    error = st.session_state.pop(key + "_error", None)
+    if error:
+        st.error(error)
+    if payload:
+        st.download_button("Download encrypted Excel", data=payload["data"], file_name=file_name,
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           key=key + "_download", on_click="ignore")
+
+
+def render_protected_beneficiary_register(secure_frame, filters, key):
+    with st.expander("Protected beneficiary register", expanded=False, on_change="rerun", key=key) as panel:
+        if not panel.open:
+            return
+        gate_key = key + "_password"
+        if not pii_access_granted(gate_key):
+            st.session_state.pop(key + "_export_payload", None)
+            return
+        scoped = apply_filters(secure_frame, filters)
+        table = beneficiary_register(scoped, reporting_age_group)
+        st.caption("All filtered beneficiary entries, including adults and repeat visits. Interview date is used when available, otherwise the dashboard entry date. Specific location is recorded residential detail. Missing fields are marked Not recorded; other recorded genders are retained, not relabelled Intersex.")
+        st.caption(f"Matching entries: {len(table):,}")
+        if table.empty:
+            st.info("No beneficiary entries match the selected filters.")
+        else:
+            page, size, tall = table_page_controls(len(table), key + "_table", protected_export_fingerprint(table), noun="entries")
+            preview = table.iloc[(page - 1) * size:page * size]
+            st.dataframe(preview, hide_index=True, width="stretch",
+                         height=min(900 if tall else 560, 38 + 38 * max(1, len(preview))),
+                         column_config={"Date of Interview/entry": st.column_config.DateColumn(format="DD MMM YYYY")})
+        render_encrypted_download(table, key + "_export", gate_key, "protected_beneficiary_register.xlsx")
+
+
 def render_cpv_name_review(secure_frame, key):
     """Protected, explicit alias approvals; no automatic training or source writes."""
     with st.expander("CPV name matching · review and approve", expanded=False, on_change="rerun", key=key) as panel:
@@ -7254,13 +7348,10 @@ if selected_tab == "DQA":
                 st.info("No matching education-concern records for the current filters.")
             else:
                 st.dataframe(style_records_table(protected_education_table), use_container_width=True, hide_index=True)
-                st.download_button(
-                    "Download protected education-concern table",
-                    data=protected_education_table.to_csv(index=False).encode("utf-8"),
-                    file_name="protected_education_concern_followup_table.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
+                render_encrypted_download(protected_education_table, "dqa_education_export", "dqa_pii_password",
+                                          "protected_education_concern_followup_table.xlsx")
+
+    render_protected_beneficiary_register(secure_records, filters, "dqa_beneficiary")
 
 if selected_tab == "Records":
     with report_panel("records", "Filtered Records"):
@@ -7291,13 +7382,10 @@ if selected_tab == "Records":
                     use_container_width=True,
                     hide_index=True,
                 )
-                st.download_button(
-                    "Download protected education-concern table",
-                    data=protected_searched.to_csv(index=False).encode("utf-8"),
-                    file_name="protected_education_concern_followup_table.csv",
-                    mime="text/csv",
-                    use_container_width=True,
-                )
+                render_encrypted_download(protected_searched, "records_education_export", "records_pii_password",
+                                          "protected_education_concern_followup_table.xlsx")
+
+    render_protected_beneficiary_register(secure_records, filters, "records_beneficiary")
 
     with st.expander("Source KPI summary"): 
         st.dataframe(style_records_table(kpis), use_container_width=True, hide_index=True)
