@@ -4251,6 +4251,73 @@ def clear_keyboard_selection(widget_key):
     st.session_state[widget_key + "_picker"] = None
 
 
+def set_table_page(key, page):
+    st.session_state[key + "_page"] = page
+
+
+def table_page_controls(total, key, context, noun="rows"):
+    """Bound large views and keep page state valid after data/filter changes."""
+    if total <= 25:
+        st.session_state[key + "_page"] = 1
+        st.session_state[key + "_page_context"] = None
+        return 1, 25, False
+    with st.container(key="table_pager_" + key):
+        size_col, height_col = st.columns([1, 1])
+        with size_col:
+            page_size = st.selectbox("Rows per page", [25, 50, 100, 250, 500, 1000], key=key + "_size")
+        with height_col:
+            tall = st.selectbox("Table height", ["Standard", "Tall"], key=key + "_height") == "Tall"
+        pages = max(1, (total + page_size - 1) // page_size)
+        page_context = (context, page_size)
+        if st.session_state.get(key + "_page_context") != page_context:
+            st.session_state[key + "_page"] = 1
+            st.session_state[key + "_page_context"] = page_context
+        current = min(max(1, int(st.session_state.get(key + "_page", 1))), pages)
+        st.session_state[key + "_page"] = current
+        first_col, previous_col, page_col, next_col, last_col = st.columns([1, 1.2, 1.5, 1.2, 1], vertical_alignment="bottom")
+        with first_col:
+            st.button("First", key=key + "_first", disabled=current == 1, width="stretch",
+                      on_click=set_table_page, args=(key, 1))
+        with previous_col:
+            st.button("Previous", key=key + "_previous", disabled=current == 1, width="stretch",
+                      on_click=set_table_page, args=(key, current - 1))
+        with page_col:
+            page = st.selectbox("Page", range(1, pages + 1), key=key + "_page",
+                                format_func=lambda value: f"{value:,} of {pages:,}", disabled=pages == 1)
+        with next_col:
+            st.button("Next", key=key + "_next", disabled=page == pages, width="stretch",
+                      on_click=set_table_page, args=(key, page + 1))
+        with last_col:
+            st.button("Last", key=key + "_last", disabled=page == pages, width="stretch",
+                      on_click=set_table_page, args=(key, pages))
+        start = (page - 1) * page_size + 1
+        st.caption(f"Showing {start:,}–{min(page * page_size, total):,} of {total:,} {noun}")
+        return page, page_size, tall
+
+
+@st.dialog("Large table viewer", width="large")
+def render_large_table(table, key, label_column=None, column_config=None):
+    """Read-only larger view of the same scoped data, with bounded rendering."""
+    st.caption("Same report selection · read-only. Close this window to return to the dashboard.")
+    if table.empty:
+        st.info("No rows match this selection.")
+        return
+    total_mask = table[label_column].astype(str).eq("Total") if label_column in table else pd.Series(False, index=table.index)
+    total_rows, detail_rows = table.loc[total_mask], table.loc[~total_mask]
+    context = hashlib.sha256(table.to_json(date_format="iso").encode()).hexdigest()[:12]
+    page, size, tall = table_page_controls(len(detail_rows), key, context)
+    start = (page - 1) * size
+    view = pd.concat([detail_rows.iloc[start:start + size], total_rows], ignore_index=True)
+    if not total_rows.empty:
+        st.caption("Total covers all rows in this table, not only the current page.")
+    height = 900 if tall else 720
+    if label_column is not None:
+        render_wrapped_table(view, label_column=label_column, max_height=height)
+    else:
+        st.dataframe(view, width="stretch", hide_index=True, column_config=column_config,
+                     height=min(height, 38 + 38 * max(1, len(view))), row_height=38)
+
+
 def render_dashboard_table(table, label_column=None, max_height=560, selection_column=None, compact_panel=False, enable_details=True):
     """Show all summary rows for the report filters, with accessible drilldowns."""
     if table.empty:
@@ -4262,13 +4329,20 @@ def render_dashboard_table(table, label_column=None, max_height=560, selection_c
     long_text = label_column in table and table[label_column].astype(str).str.len().max() > 55
     view = table.reset_index(drop=True)
     if len(view) > 25:
-        pages = (len(view) + 24) // 25
+        if st.button("Open large table", key=key + "_expand"):
+            expanded = view.drop(columns=[selection_column], errors="ignore") if selection_column else view
+            render_large_table(expanded, key + "_viewer", label_column=label_column)
+        # The report total is not another category and must not disappear on page 1.
+        total_mask = view[label_column].astype(str).eq("Total") if label_column in view else pd.Series(False, index=view.index)
+        total_rows, detail_rows = view.loc[total_mask], view.loc[~total_mask]
         page_context = hashlib.sha256(view.to_json(date_format="iso").encode()).hexdigest()[:12]
-        page = int(st.number_input("Table page", min_value=1, max_value=pages, value=1, step=1,
-                                   key=key + "_page_" + page_context))
-        start = (page - 1) * 25
-        st.caption(f"Rows {start + 1}–{min(start + 25, len(view))} of {len(view):,} · page {page} of {pages}")
-        view = view.iloc[start:start + 25].reset_index(drop=True)
+        page, page_size, tall = table_page_controls(len(detail_rows), key, page_context)
+        start = (page - 1) * page_size
+        view = pd.concat([detail_rows.iloc[start:start + page_size], total_rows], ignore_index=True)
+        if not total_rows.empty:
+            st.caption("Total covers all rows in this table, not only the current page.")
+        if tall:
+            max_height = max(max_height, 900)
     visible = view.drop(columns=[selection_column], errors="ignore") if selection_column else view
     row_signature = hashlib.sha256(view.to_json(date_format="iso").encode()).hexdigest()[:12]
     base_key = key + row_signature
@@ -4369,35 +4443,34 @@ def render_record_browser(frame, key):
             if not columns:
                 st.info("Choose at least one column to display.")
                 return
-        sort_col, direction_col, size_col = st.columns([2, 1.4, 1])
+        sort_col, direction_col = st.columns([2, 1.4])
         sort_options = [c for c in ["reporting_date", "staff_name", "helpdesk_location", "record_id"] if c in approved]
         with sort_col:
             sort_column = st.selectbox("Sort records by", sort_options, format_func=record_column_label, key=key + "_sort")
         with direction_col:
             direction = st.selectbox("Order", ["Newest / Z–A", "Oldest / A–Z"], key=key + "_order")
-        with size_col:
-            page_size = st.selectbox("Rows per page", [25, 50, 100], key=key + "_size")
-    context = (query, sort_column, direction, page_size, st.session_state.get("interaction_context"))
-    if st.session_state.get(key + "_page_context") != context:
-        st.session_state[key + "_page"] = 1
-        st.session_state[key + "_page_context"] = context
-    page_frame, total, pages, current = paged_records(approved, query, sort_column, direction == "Oldest / A–Z",
-                                           st.session_state.get(key + "_page", 1), page_size)
-    st.session_state[key + "_page"] = current
-    page = st.number_input("Page", min_value=1, max_value=pages, step=1, key=key + "_page")
-    if page != current:
-        page_frame, total, pages, page = paged_records(approved, query, sort_column, direction == "Oldest / A–Z", page, page_size)
-    first = (page - 1) * page_size + 1 if total else 0
-    last = (page - 1) * page_size + len(page_frame) if total else 0
-    st.caption(f"Showing {first:,}–{last:,} of {total:,} submissions · page {page:,} of {pages:,} · read-only")
+    context = (query, sort_column, direction, st.session_state.get("interaction_context"))
+    page_frame, total, _, _ = paged_records(approved, query, sort_column, direction == "Oldest / A–Z", 1, 25)
+    page, page_size, tall = table_page_controls(total, key, context, noun="submissions")
+    if page != 1 or page_size != 25:
+        page_frame, _, _, _ = paged_records(approved, query, sort_column, direction == "Oldest / A–Z", page, page_size)
+    if total <= 25:
+        st.caption(f"Showing {total:,} of {total:,} submissions · read-only")
+    else:
+        st.caption("Read-only · use the table's fullscreen control for more horizontal space.")
     config = {c: st.column_config.TextColumn(record_column_label(c)) for c in columns}
     for c in columns:
         if pd.api.types.is_datetime64_any_dtype(page_frame[c]):
             config[c] = st.column_config.DateColumn(record_column_label(c), format="DD MMM YYYY")
         elif pd.api.types.is_numeric_dtype(page_frame[c]):
             config[c] = st.column_config.NumberColumn(record_column_label(c))
+    if total > 25 and st.button("Open large table", key=key + "_expand"):
+        # Search, ordering and public allowlist apply before opening the viewer.
+        # The viewer paginates this full result; it is not limited to the current page.
+        all_matches, _, _, _ = paged_records(approved, query, sort_column, direction == "Oldest / A–Z", 1, total)
+        render_large_table(all_matches[columns], key + "_viewer", column_config=config)
     st.dataframe(page_frame[columns], width="stretch", hide_index=True, column_config=config,
-                 height=min(560, 38 + 38 * max(1, len(page_frame))), row_height=38)
+                 height=min(900 if tall else 560, 38 + 38 * max(1, len(page_frame))), row_height=38)
 
 
 def show_selection_details(frame, category_column, values, key, selection_key=None):
