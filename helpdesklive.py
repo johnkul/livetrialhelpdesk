@@ -21,6 +21,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from cpv_matching import CPVMatcher
 from protected_exports import beneficiary_register, encrypted_excel_bytes, file_password_error
+from unique_beneficiaries import unique_beneficiary_register
 
 # -----------------------------------------------------------------------------
 # Page configuration
@@ -5888,6 +5889,36 @@ def render_protected_beneficiary_register(secure_frame, filters, key):
         render_encrypted_download(table, key + "_export", gate_key, "protected_beneficiary_register.xlsx")
 
 
+def render_protected_unique_beneficiaries(secure_frame, filters, key):
+    with st.expander("Protected unique beneficiaries", expanded=False, on_change="rerun", key=key) as panel:
+        if not panel.open:
+            return
+        gate_key = key + "_password"
+        if not pii_access_granted(gate_key):
+            st.session_state.pop(key + "_export_payload", None)
+            return
+        # Resolve across the eligible snapshot so filters cannot hide identity conflicts.
+        source = secure_frame.reset_index(drop=True)
+        scoped = apply_filters(source, filters)
+        with st.spinner("Checking beneficiary matches…"):
+            table, evidence, summary = unique_beneficiary_register(source, reporting_age_group, scoped.index)
+        st.caption("One row per estimated beneficiary group in your selected filters. Matching uses individual number, name, original source age, gender and corroborating contact/location details. Uncertain entries stay separate, so this is not a verified unique-person count.")
+        st.caption(f"Selected entries: {summary['entries']:,} · Estimated beneficiaries: {summary['groups']:,} · Additional linked entries: {summary['linked_entries']:,} · Groups needing review: {summary['review_groups']:,}")
+        st.caption("Each row shows the latest whole interview/entry within the selected filters; missing values are not filled from other visits. Display ages retain the agreed dashboard categories. The original beneficiary register and dashboard totals are unchanged.")
+        if table.empty:
+            st.info("No beneficiary entries match the selected filters.")
+        else:
+            page, size, tall = table_page_controls(len(table), key + "_table", protected_export_fingerprint(table), noun="beneficiaries")
+            preview = table.iloc[(page - 1) * size:page * size]
+            st.dataframe(preview, hide_index=True, width="stretch",
+                         height=min(900 if tall else 560, 38 + 38 * max(1, len(preview))),
+                         column_config={"Date of Interview/entry": st.column_config.DateColumn(format="DD MMM YYYY")})
+            if st.checkbox("Show matching and visit history", key=key + "_evidence"):
+                st.caption("Evidence follows the same page as the register above. Counts refer to recorded submissions in the selected filters, not independently verified visits; repeated source references count once. Additional submissions after first shows the observed repeat-entry frequency within those filters, not lifetime visits. Group numbers apply to this view only. Matching checks the full eligible snapshot; evidence displays only selected entries. Shared phones, household/ration numbers, staff, GPS and similar names alone never establish identity. Disability and intervention can change and are not identity keys.")
+                st.dataframe(evidence.iloc[(page - 1) * size:page * size], hide_index=True, width="stretch")
+        render_encrypted_download(table, key + "_export", gate_key, "protected_unique_beneficiaries.xlsx")
+
+
 def render_cpv_name_review(secure_frame, key):
     """Protected, explicit alias approvals; no automatic training or source writes."""
     with st.expander("CPV name matching · review and approve", expanded=False, on_change="rerun", key=key) as panel:
@@ -7369,6 +7400,7 @@ if selected_tab == "DQA":
                                           "protected_education_concern_followup_table.xlsx")
 
     render_protected_beneficiary_register(secure_records, filters, "dqa_beneficiary")
+    render_protected_unique_beneficiaries(secure_records, filters, "dqa_unique_beneficiary")
 
 if selected_tab == "Records":
     with report_panel("records", "Filtered Records"):
@@ -7403,6 +7435,7 @@ if selected_tab == "Records":
                                           "protected_education_concern_followup_table.xlsx")
 
     render_protected_beneficiary_register(secure_records, filters, "records_beneficiary")
+    render_protected_unique_beneficiaries(secure_records, filters, "records_unique_beneficiary")
 
     with st.expander("Source KPI summary"): 
         st.dataframe(style_records_table(kpis), use_container_width=True, hide_index=True)
